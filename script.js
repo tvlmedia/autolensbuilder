@@ -85,6 +85,10 @@ setTimeout(() => document.querySelector(".leftScroll")?.scrollTo(0, 0), 0);
     raysPane: $("#raysPane"),
 
     toastHost: $("#toastHost"),
+
+     merit: $("#badgeMerit"),
+meritTop: $("#badgeMeritTop"),
+     
   };
 
   function toast(msg, ms = 2200) {
