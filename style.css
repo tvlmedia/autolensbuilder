@@ -21,6 +21,9 @@
   --r2:22px;
 
   --topbarH:72px;
+
+  /* ✅ NEW: drawer width (was fixed 520px) */
+  --leftW: clamp(640px, 44vw, 920px);
 }
 
 *{ box-sizing:border-box; }
@@ -57,9 +60,6 @@ body{
    =========================== */
 
 .topbar{
-  position:relative; /* of gewoon weglaten */
-  top:auto;
-
   display:flex;
   align-items:center;
   justify-content:space-between;
@@ -160,7 +160,7 @@ body{
   min-height:0;
 
   display:grid;
-  grid-template-columns: 520px 1fr;
+  grid-template-columns: var(--leftW) 1fr; /* ✅ wider drawer */
   gap:12px;
   padding:12px;
 }
@@ -241,6 +241,7 @@ body{
   border-spacing:0;
   font-size:12px;
 }
+
 .tbl thead th{
   position:sticky; top:0;
   background:rgba(0,0,0,.35);
@@ -250,10 +251,12 @@ body{
   text-align:left;
   font-weight:700;
 }
+
 .tbl tbody td{
   border-bottom:1px solid rgba(255,255,255,.06);
   padding:6px 8px;
 }
+
 .tbl tbody tr.selected{ background:rgba(42,110,242,.10); }
 
 .cellInput, .cellSelect{
@@ -359,11 +362,12 @@ body{
   padding:12px;
 }
 
+/* ✅ FIX: you only have 1 pane now */
 .canvasSplit{
   height:100%;
   min-height:0;
   display:grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr; /* was 1fr 1fr */
   gap:12px;
 }
 
@@ -540,7 +544,7 @@ canvas{
 }
 
 /* ===========================
-   PREVIEW PROGRESS
+   PREVIEW PROGRESS (safe to keep)
    =========================== */
 
 #previewProgress{
@@ -583,6 +587,7 @@ canvas{
   .topbar{ height:auto; flex:0 0 auto; }
   .toolbar{ gap:8px; }
 }
+
 input:disabled {
   opacity: 0.45;
   cursor: not-allowed;
