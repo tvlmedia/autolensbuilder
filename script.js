@@ -940,6 +940,90 @@ meritTop: $("#badgeMeritTop"),
     return { ok, req };
   }
 
+
+// -------------------- merit (v1) --------------------
+// Lower = better. Tunable weights.
+const MERIT_CFG = {
+  rmsNorm: 0.05,       // 0.05mm RMS = "ok" baseline (tune later)
+  vigWeight: 6.0,      // vignette fraction penalty
+  covPenalty: 60.0,    // if not covering sensor
+  intrusionWeight: 8.0,// rear intrusion penalty scaling
+  fieldWeights: [1.0, 1.5, 2.0], // center -> edge weights
+};
+
+function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
+  const rays = buildRays(surfaces, fieldDeg, rayCount);
+  const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
+  const vCount = traces.filter((t) => t.vignetted).length;
+  const tirCount = traces.filter((t) => t.tir).length;
+  const vigFrac = traces.length ? (vCount / traces.length) : 1;
+  const { rms, n } = spotRmsAtSensorX(traces, sensorX);
+  return { traces, rms, n, vigFrac, vCount, tirCount };
+}
+
+function computeMeritV1({
+  surfaces,
+  wavePreset,
+  sensorX,
+  rayCount,
+  fov, maxField, covers, req,
+  intrusion
+}){
+  // Sample 3 field points: center, mid, near required edge (or maxField)
+  const edge = Number.isFinite(req) ? Math.min(maxField, req) : maxField;
+  const f0 = 0;
+  const f1 = edge * 0.65;
+  const f2 = edge * 0.95;
+
+  const fields = [f0, f1, f2];
+  const fieldWeights = MERIT_CFG.fieldWeights;
+
+  let merit = 0;
+  let rmsCenter = null, rmsEdge = null;
+  let vigAvg = 0;
+  let validMin = 999;
+
+  for (let k = 0; k < fields.length; k++){
+    const fa = fields[k];
+    const pack = traceBundleAtField(surfaces, fa, rayCount, wavePreset, sensorX);
+
+    validMin = Math.min(validMin, pack.n || 0);
+    vigAvg += pack.vigFrac / fields.length;
+
+    const rms = Number.isFinite(pack.rms) ? pack.rms : 999;
+    if (k === 0) rmsCenter = rms;
+    if (k === fields.length - 1) rmsEdge = rms;
+
+    const rn = rms / MERIT_CFG.rmsNorm;      // normalized RMS
+    merit += fieldWeights[k] * (rn * rn);    // squared penalty
+  }
+
+  // Vignetting penalty (0..1)
+  merit += MERIT_CFG.vigWeight * (vigAvg * vigAvg);
+
+  // Coverage penalty
+  if (!covers) merit += MERIT_CFG.covPenalty;
+
+  // Rear intrusion penalty (only if intrusion > 0)
+  if (Number.isFinite(intrusion) && intrusion > 0){
+    const x = intrusion / 1.0; // 1mm units
+    merit += MERIT_CFG.intrusionWeight * (x * x);
+  }
+
+  // If too few valid rays → basically unusable, slam it
+  if (validMin < 7) merit += 200;
+
+  const breakdown = {
+    rmsCenter, rmsEdge,
+    vigPct: Math.round(vigAvg * 100),
+    covers,
+    intrusion: Number.isFinite(intrusion) ? intrusion : null,
+    fields: fields.map(v => Number.isFinite(v) ? v : 0),
+  };
+
+  return { merit, breakdown };
+}
+   
   // -------------------- autofocus --------------------
   function spotRmsAtSensorX(traces, sensorX) {
     const ys = [];
@@ -1575,6 +1659,33 @@ meritTop: $("#badgeMeritTop"),
     ]);
   }
 
+// ---- MERIT ----
+const meritRes = computeMeritV1({
+  surfaces: lens.surfaces,
+  wavePreset,
+  sensorX,
+  rayCount,
+  fov, maxField, covers, req,
+  intrusion
+});
+
+const m = meritRes.merit;
+const bd = meritRes.breakdown;
+
+const meritTxt =
+  `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} ` +
+  `(RMS0 ${bd.rmsCenter?.toFixed?.(3) ?? "—"}mm • RMSedge ${bd.rmsEdge?.toFixed?.(3) ?? "—"}mm • Vig ${bd.vigPct}%` +
+  `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""})`;
+
+if (ui.merit) ui.merit.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
+if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
+
+// optioneel: zet breakdown in statusText (super handig)
+if (ui.status) {
+  ui.status.textContent =
+    `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${covTxt} • ${meritTxt}`;
+}
+   
   // -------------------- view controls (RAYS canvas) --------------------
   function bindViewControls() {
     if (!canvas) return;
