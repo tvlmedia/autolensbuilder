@@ -57,8 +57,8 @@ body{
    =========================== */
 
 .topbar{
-  height:var(--topbarH);
-  flex:0 0 var(--topbarH);
+  position:relative; /* of gewoon weglaten */
+  top:auto;
 
   display:flex;
   align-items:center;
