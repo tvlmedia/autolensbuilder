@@ -1,21 +1,15 @@
 /* Meridional Raytracer (2D) — TVL Lens Builder (RAYS ONLY)
-   - Based on your split-view build, but ALL preview rendering removed.
-   - Keeps: surface table, edit actions, raytracing, PL overlay, autofocus, element modal, save/load.
-   - Removes: previewCanvas + LUT/DOF/CA + progress overlay + preview UI + scheduleRenderPreview
+   - Rays canvas + surface editor + merit score + simple optimizer.
+   - No preview/LUT/DOF/CA pipeline.
 */
 
 (() => {
-
-     // -------------------- kill scroll restoration (prevents "auto scrolled down" on reload) --------------------
+  // -------------------- kill scroll restoration --------------------
   try { if ("scrollRestoration" in history) history.scrollRestoration = "manual"; } catch(_) {}
-// Force top on load (some browsers restore scroll even if body overflow is hidden)
-window.scrollTo(0, 0);
-document.querySelector(".leftScroll")?.scrollTo(0, 0);
-setTimeout(() => document.querySelector(".leftScroll")?.scrollTo(0, 0), 0);
 
-   
   // -------------------- tiny helpers --------------------
   const $ = (sel) => document.querySelector(sel);
+  const clamp = (x,a,b)=> x<a?a:(x>b?b:x);
   const clone = (obj) =>
     typeof structuredClone === "function" ? structuredClone(obj) : JSON.parse(JSON.stringify(obj));
 
@@ -24,7 +18,6 @@ setTimeout(() => document.querySelector(".leftScroll")?.scrollTo(0, 0), 0);
     const x = parseFloat(s);
     return Number.isFinite(x) ? x : fallback;
   }
-  function clamp01(x){ return x < 0 ? 0 : (x > 1 ? 1 : x); }
 
   // -------------------- canvas (RAYS) --------------------
   const canvas = $("#canvas");
@@ -41,6 +34,7 @@ setTimeout(() => document.querySelector(".leftScroll")?.scrollTo(0, 0), 0);
     vig: $("#badgeVig"),
     fov: $("#badgeFov"),
     cov: $("#badgeCov"),
+    merit: $("#badgeMerit"),
 
     footerWarn: $("#footerWarn"),
     metaInfo: $("#metaInfo"),
@@ -50,6 +44,7 @@ setTimeout(() => document.querySelector(".leftScroll")?.scrollTo(0, 0), 0);
     tstopTop: $("#badgeTTop"),
     fovTop: $("#badgeFovTop"),
     covTop: $("#badgeCovTop"),
+    meritTop: $("#badgeMeritTop"),
 
     sensorPreset: $("#sensorPreset"),
     sensorW: $("#sensorW"),
@@ -78,17 +73,24 @@ setTimeout(() => document.querySelector(".leftScroll")?.scrollTo(0, 0), 0);
     fileLoad: $("#fileLoad"),
     btnAutoFocus: $("#btnAutoFocus"),
 
-    newLensModal: $("#newLensModal"),
-    elementModal: $("#elementModal"),
-
     btnRaysFS: $("#btnRaysFS"),
     raysPane: $("#raysPane"),
 
     toastHost: $("#toastHost"),
 
-     merit: $("#badgeMerit"),
-meritTop: $("#badgeMeritTop"),
-     
+    // Optimizer
+    optTargetFL: $("#optTargetFL"),
+    optTargetT: $("#optTargetT"),
+    optIters: $("#optIters"),
+    optPop: $("#optPop"),
+    optLog: $("#optLog"),
+
+    btnOptStart: $("#btnOptStart"),
+    btnOptStop: $("#btnOptStop"),
+    btnOptApply: $("#btnOptApply"),
+    btnOptBench: $("#btnOptBench"),
+
+    elementModal: $("#elementModal"),
   };
 
   function toast(msg, ms = 2200) {
@@ -103,8 +105,6 @@ meritTop: $("#badgeMeritTop"),
       setTimeout(() => d.remove(), 250);
     }, ms);
   }
-
-  let selectedIndex = 0;
 
   // -------------------- sensor presets --------------------
   const SENSOR_PRESETS = {
@@ -130,81 +130,69 @@ meritTop: $("#badgeMeritTop"),
   // -------------------- glass db --------------------
   const GLASS_DB = {
     AIR: { nd: 1.0, Vd: 999.0 },
-
-    "N-BK7HT":   { nd: 1.5168,  Vd: 64.17 },
-    "N-BK10":    { nd: 1.49782, Vd: 66.95 },
-
-    "N-K5":      { nd: 1.52249, Vd: 59.48 },
-    "N-KF9":     { nd: 1.52346, Vd: 51.54 },
-    "N-PK52A":   { nd: 1.49700, Vd: 81.61 },
-    "N-ZK7A":    { nd: 1.508054, Vd: 61.04 },
-
-    "N-BAK1":    { nd: 1.5725,  Vd: 57.55 },
-    "N-BAK2":    { nd: 1.53996, Vd: 59.71 },
-    "N-BAK4":    { nd: 1.56883, Vd: 55.98 },
-
-    "N-BALF4":   { nd: 1.57956, Vd: 53.87 },
-    "N-BALF5":   { nd: 1.54739, Vd: 53.63 },
-
-    "N-BAF4":    { nd: 1.60568, Vd: 43.72 },
-    "N-BAF10":   { nd: 1.67003, Vd: 47.11 },
-    "N-BAF51":   { nd: 1.65224, Vd: 44.96 },
-    "N-BAF52":   { nd: 1.60863, Vd: 46.6 },
-    "N-BASF2":   { nd: 1.66446, Vd: 36.0 },
-
-    "N-SK2":     { nd: 1.60738, Vd: 56.65 },
-    "N-SK4":     { nd: 1.61272, Vd: 58.63 },
-    "N-SK5":     { nd: 1.58913, Vd: 61.27 },
-    "N-SK11":    { nd: 1.56384, Vd: 60.8 },
-    "N-SK14":    { nd: 1.60311, Vd: 60.6 },
-    "N-SK16":    { nd: 1.62041, Vd: 60.32 },
-
-    "N-SSK2":    { nd: 1.62229, Vd: 53.27 },
-    "N-SSK5":    { nd: 1.65844, Vd: 50.88 },
-    "N-SSK8":    { nd: 1.61773, Vd: 49.83 },
-
-    "N-PSK3":    { nd: 1.55232, Vd: 63.46 },
-    "N-PSK53A":  { nd: 1.61800, Vd: 63.39 },
-
-    "N-KZFS2":   { nd: 1.55836, Vd: 54.01 },
-    "N-KZFS4":   { nd: 1.61336, Vd: 44.49 },
-    "N-KZFS5":   { nd: 1.65412, Vd: 39.7 },
-    "N-KZFS8":   { nd: 1.72047, Vd: 34.7 },
-
-    "N-LAK9":    { nd: 1.69100, Vd: 54.71 },
-    "N-LAK10":   { nd: 1.72003, Vd: 50.62 },
-    "N-LAK22":   { nd: 1.65113, Vd: 55.89 },
-    "N-LAK28":   { nd: 1.74429, Vd: 50.77 },
-    "N-LAK34":   { nd: 1.72916, Vd: 54.5 },
-
-    "N-LAF2":    { nd: 1.74397, Vd: 44.85 },
-    "N-LAF7":    { nd: 1.7495,  Vd: 34.82 },
-    "N-LAF21":   { nd: 1.7880,  Vd: 47.49 },
-    "N-LAF34":   { nd: 1.7725,  Vd: 49.62 },
-
-    "N-LASF9":   { nd: 1.85025, Vd: 32.17 },
-    "N-LASF40":  { nd: 1.83404, Vd: 37.3 },
-    "N-LASF41":  { nd: 1.83501, Vd: 43.13 },
-    "N-LASF43":  { nd: 1.8061,  Vd: 40.61 },
-    "N-LASF44":  { nd: 1.8042,  Vd: 46.5 },
-    "N-LASF45":  { nd: 1.80107, Vd: 34.97 },
-
-    "N-F2":      { nd: 1.62005, Vd: 36.43 },
-    "N-FK5":     { nd: 1.48749, Vd: 70.41 },
-    "N-FK58":    { nd: 1.45600, Vd: 90.9 },
-
-    "N-SF1":     { nd: 1.71736, Vd: 29.62 },
-    "N-SF2":     { nd: 1.64769, Vd: 33.82 },
-    "N-SF4":     { nd: 1.75513, Vd: 27.38 },
-    "N-SF5":     { nd: 1.67271, Vd: 32.25 },
-    "N-SF6":     { nd: 1.80518, Vd: 25.36 },
-    "N-SF8":     { nd: 1.68894, Vd: 31.31 },
-    "N-SF10":    { nd: 1.72828, Vd: 28.53 },
-    "N-SF11":    { nd: 1.78472, Vd: 25.68 },
-    "N-SF15":    { nd: 1.69892, Vd: 30.2 },
-    "N-SF57":    { nd: 1.84666, Vd: 23.78 },
-    "N-SF66":    { nd: 1.92286, Vd: 20.88 },
+    "N-BK7HT": { nd: 1.5168, Vd: 64.17 },
+    "N-BK10": { nd: 1.49782, Vd: 66.95 },
+    "N-K5": { nd: 1.52249, Vd: 59.48 },
+    "N-KF9": { nd: 1.52346, Vd: 51.54 },
+    "N-PK52A": { nd: 1.497, Vd: 81.61 },
+    "N-ZK7A": { nd: 1.508054, Vd: 61.04 },
+    "N-BAK1": { nd: 1.5725, Vd: 57.55 },
+    "N-BAK2": { nd: 1.53996, Vd: 59.71 },
+    "N-BAK4": { nd: 1.56883, Vd: 55.98 },
+    "N-BALF4": { nd: 1.57956, Vd: 53.87 },
+    "N-BALF5": { nd: 1.54739, Vd: 53.63 },
+    "N-BAF4": { nd: 1.60568, Vd: 43.72 },
+    "N-BAF10": { nd: 1.67003, Vd: 47.11 },
+    "N-BAF51": { nd: 1.65224, Vd: 44.96 },
+    "N-BAF52": { nd: 1.60863, Vd: 46.6 },
+    "N-BASF2": { nd: 1.66446, Vd: 36.0 },
+    "N-SK2": { nd: 1.60738, Vd: 56.65 },
+    "N-SK4": { nd: 1.61272, Vd: 58.63 },
+    "N-SK5": { nd: 1.58913, Vd: 61.27 },
+    "N-SK11": { nd: 1.56384, Vd: 60.8 },
+    "N-SK14": { nd: 1.60311, Vd: 60.6 },
+    "N-SK16": { nd: 1.62041, Vd: 60.32 },
+    "N-SSK2": { nd: 1.62229, Vd: 53.27 },
+    "N-SSK5": { nd: 1.65844, Vd: 50.88 },
+    "N-SSK8": { nd: 1.61773, Vd: 49.83 },
+    "N-PSK3": { nd: 1.55232, Vd: 63.46 },
+    "N-PSK53A": { nd: 1.618, Vd: 63.39 },
+    "N-KZFS2": { nd: 1.55836, Vd: 54.01 },
+    "N-KZFS4": { nd: 1.61336, Vd: 44.49 },
+    "N-KZFS5": { nd: 1.65412, Vd: 39.7 },
+    "N-KZFS8": { nd: 1.72047, Vd: 34.7 },
+    "N-LAK9": { nd: 1.691, Vd: 54.71 },
+    "N-LAK10": { nd: 1.72003, Vd: 50.62 },
+    "N-LAK22": { nd: 1.65113, Vd: 55.89 },
+    "N-LAK28": { nd: 1.74429, Vd: 50.77 },
+    "N-LAK34": { nd: 1.72916, Vd: 54.5 },
+    "N-LAF2": { nd: 1.74397, Vd: 44.85 },
+    "N-LAF7": { nd: 1.7495, Vd: 34.82 },
+    "N-LAF21": { nd: 1.788, Vd: 47.49 },
+    "N-LAF34": { nd: 1.7725, Vd: 49.62 },
+    "N-LASF9": { nd: 1.85025, Vd: 32.17 },
+    "N-LASF40": { nd: 1.83404, Vd: 37.3 },
+    "N-LASF41": { nd: 1.83501, Vd: 43.13 },
+    "N-LASF43": { nd: 1.8061, Vd: 40.61 },
+    "N-LASF44": { nd: 1.8042, Vd: 46.5 },
+    "N-LASF45": { nd: 1.80107, Vd: 34.97 },
+    "N-F2": { nd: 1.62005, Vd: 36.43 },
+    "N-FK5": { nd: 1.48749, Vd: 70.41 },
+    "N-FK58": { nd: 1.456, Vd: 90.9 },
+    "N-SF1": { nd: 1.71736, Vd: 29.62 },
+    "N-SF2": { nd: 1.64769, Vd: 33.82 },
+    "N-SF4": { nd: 1.75513, Vd: 27.38 },
+    "N-SF5": { nd: 1.67271, Vd: 32.25 },
+    "N-SF6": { nd: 1.80518, Vd: 25.36 },
+    "N-SF8": { nd: 1.68894, Vd: 31.31 },
+    "N-SF10": { nd: 1.72828, Vd: 28.53 },
+    "N-SF11": { nd: 1.78472, Vd: 25.68 },
+    "N-SF15": { nd: 1.69892, Vd: 30.2 },
+    "N-SF57": { nd: 1.84666, Vd: 23.78 },
+    "N-SF66": { nd: 1.92286, Vd: 20.88 },
   };
+
+  const GLASS_LIST = Object.keys(GLASS_DB).filter(k => k !== "AIR");
 
   // Wavelengths (nm)
   const WL = { C: 656.2725, d: 587.5618, F: 486.1327, g: 435.8343 };
@@ -286,7 +274,6 @@ meritTop: $("#badgeMeritTop"),
 
     const key = resolveGlassName(glassName);
     if (key === "AIR" && glassName !== "AIR") warnMissingGlass(glassName);
-
     if (key === "AIR") return 1.0;
 
     const g = GLASS_DB[key];
@@ -305,20 +292,20 @@ meritTop: $("#badgeMeritTop"),
     return cauchyN_um(fit, lambdaNm / 1000);
   }
 
-  // -------------------- built-in lenses --------------------
+  // -------------------- demo lenses --------------------
   function demoLensSimple() {
     return {
       name: "Demo (simple)",
       surfaces: [
         { type: "OBJ", R: 0.0, t: 0.0, ap: 22.0, glass: "AIR", stop: false },
-        { type: "1", R: 42.0, t: 10.0, ap: 22.0, glass: "LASF35", stop: false },
+        { type: "1", R: 42.0, t: 10.0, ap: 22.0, glass: "N-LASF43", stop: false },
         { type: "2", R: -140.0, t: 10.0, ap: 21.0, glass: "AIR", stop: false },
-        { type: "3", R: -30.0, t: 10.0, ap: 19.0, glass: "LASFN31", stop: false },
+        { type: "3", R: -30.0, t: 10.0, ap: 19.0, glass: "N-LASF43", stop: false },
         { type: "STOP", R: 0.0, t: 10.0, ap: 14.0, glass: "AIR", stop: true },
         { type: "5", R: 12.42, t: 10.0, ap: 8.5, glass: "AIR", stop: false },
         { type: "AST", R: 0.0, t: 6.4, ap: 8.5, glass: "AIR", stop: false },
-        { type: "7", R: -18.93, t: 10.0, ap: 11.0, glass: "LF5", stop: false },
-        { type: "8", R: 59.6, t: 10.0, ap: 13.0, glass: "LASFN31", stop: false },
+        { type: "7", R: -18.93, t: 10.0, ap: 11.0, glass: "N-SF5", stop: false },
+        { type: "8", R: 59.6, t: 10.0, ap: 13.0, glass: "N-LASF43", stop: false },
         { type: "9", R: -40.49, t: 10.0, ap: 13.0, glass: "AIR", stop: false },
         { type: "IMS", R: 0.0, t: 0.0, ap: 12.0, glass: "AIR", stop: false },
       ],
@@ -334,24 +321,17 @@ meritTop: $("#badgeMeritTop"),
       ],
       surfaces: [
         { type: "OBJ", R: 0.0, t: 0.0, ap: 60.0, glass: "AIR", stop: false },
-
-        { type: "1", R: 37.4501, t: 4.49102, ap: 16.46707, glass: "S-LAM3", stop: false },
+        { type: "1", R: 37.4501, t: 4.49102, ap: 16.46707, glass: "N-LAK9", stop: false },
         { type: "2", R: 135.07984, t: 0.0499, ap: 16.46707, glass: "AIR", stop: false },
-
-        { type: "3", R: 19.59581, t: 8.23852, ap: 13.72255, glass: "S-BAH11", stop: false },
+        { type: "3", R: 19.59581, t: 8.23852, ap: 13.72255, glass: "N-BAK4", stop: false },
         { type: "4", R: 0.0, t: 0.998, ap: 12.22555, glass: "N-SF5", stop: false },
-
         { type: "5", R: 12.7994, t: 5.48403, ap: 9.73054, glass: "AIR", stop: false },
-
         { type: "STOP", R: 0.0, t: 6.48703, ap: 9.28144, glass: "AIR", stop: true },
-
         { type: "7", R: -15.90319, t: 3.50798, ap: 9.23154, glass: "N-SF5", stop: false },
-        { type: "8", R: 0.0, t: 4.48104, ap: 10.47904, glass: "S-LAM3", stop: false },
+        { type: "8", R: 0.0, t: 4.48104, ap: 10.47904, glass: "N-LAK9", stop: false },
         { type: "9", R: -21.71158, t: 0.0499, ap: 10.47904, glass: "AIR", stop: false },
-
-        { type: "10", R: 110.3493, t: 3.98204, ap: 11.47705, glass: "S-BAH11", stop: false },
+        { type: "10", R: 110.3493, t: 3.98204, ap: 11.47705, glass: "N-BAK4", stop: false },
         { type: "11", R: -44.30639, t: 30.6477, ap: 11.47705, glass: "AIR", stop: false },
-
         { type: "IMS", R: 0.0, t: 0.0, ap: 12.77, glass: "AIR", stop: false },
       ],
     };
@@ -381,14 +361,18 @@ meritTop: $("#badgeMeritTop"),
 
     if (safe.surfaces.length >= 1) {
       safe.surfaces[0].type = "OBJ";
-      safe.surfaces[0].t = 0.0; // hard lock
+      safe.surfaces[0].t = 0.0;
     }
     if (safe.surfaces.length >= 1) safe.surfaces[safe.surfaces.length - 1].type = "IMS";
+
+    // resolve glass names
+    safe.surfaces.forEach((s) => { s.glass = resolveGlassName(s.glass); });
 
     return safe;
   }
 
   let lens = sanitizeLens(omit50ConceptV1());
+  let selectedIndex = 0;
 
   function applySensorToIMS() {
     const { halfH } = getSensorWH();
@@ -469,6 +453,7 @@ meritTop: $("#badgeMeritTop"),
       });
 
       const isOBJ = String(s.type || "").toUpperCase() === "OBJ";
+      const isIMS = String(s.type || "").toUpperCase() === "IMS";
 
       tr.innerHTML = `
         <td style="width:34px; font-family:var(--mono)">${idx}</td>
@@ -476,7 +461,7 @@ meritTop: $("#badgeMeritTop"),
         <td style="width:92px"><input class="cellInput" data-k="R" data-i="${idx}" type="number" step="0.01" value="${s.R}"></td>
         <td style="width:92px">
           <input class="cellInput" data-k="t" data-i="${idx}" type="number" step="0.01"
-            value="${isOBJ ? 0 : s.t}" ${isOBJ ? "disabled" : ""}>
+            value="${isOBJ ? 0 : s.t}" ${isOBJ || isIMS ? "disabled" : ""}>
         </td>
         <td style="width:92px"><input class="cellInput" data-k="ap" data-i="${idx}" type="number" step="0.01" value="${s.ap}"></td>
         <td style="width:110px">
@@ -553,7 +538,7 @@ meritTop: $("#badgeMeritTop"),
       s.stop = !!el.checked;
       enforceSingleStop(i);
     } else if (k === "glass") {
-      s.glass = String(el.value || "AIR");
+      s.glass = resolveGlassName(String(el.value || "AIR"));
     } else if (k === "type") {
       s.type = String(el.value || "");
     } else if (k === "R" || k === "t" || k === "ap") {
@@ -768,13 +753,6 @@ meritTop: $("#badgeMeritTop"),
     return { pts, vignetted, tir, endRay: ray };
   }
 
-  function intersectPlaneX(ray, xPlane) {
-    if (Math.abs(ray.d.x) < 1e-12) return null;
-    const t = (xPlane - ray.p.x) / ray.d.x;
-    if (!Number.isFinite(t) || t <= 1e-9) return null;
-    return add(ray.p, mul(ray.d, t));
-  }
-
   // -------------------- ray bundles --------------------
   function getRayReferencePlane(surfaces) {
     const stopIdx = findStopSurfaceIndex(surfaces);
@@ -940,91 +918,7 @@ meritTop: $("#badgeMeritTop"),
     return { ok, req };
   }
 
-
-// -------------------- merit (v1) --------------------
-// Lower = better. Tunable weights.
-const MERIT_CFG = {
-  rmsNorm: 0.05,       // 0.05mm RMS = "ok" baseline (tune later)
-  vigWeight: 6.0,      // vignette fraction penalty
-  covPenalty: 60.0,    // if not covering sensor
-  intrusionWeight: 8.0,// rear intrusion penalty scaling
-  fieldWeights: [1.0, 1.5, 2.0], // center -> edge weights
-};
-
-function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
-  const rays = buildRays(surfaces, fieldDeg, rayCount);
-  const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
-  const vCount = traces.filter((t) => t.vignetted).length;
-  const tirCount = traces.filter((t) => t.tir).length;
-  const vigFrac = traces.length ? (vCount / traces.length) : 1;
-  const { rms, n } = spotRmsAtSensorX(traces, sensorX);
-  return { traces, rms, n, vigFrac, vCount, tirCount };
-}
-
-function computeMeritV1({
-  surfaces,
-  wavePreset,
-  sensorX,
-  rayCount,
-  fov, maxField, covers, req,
-  intrusion
-}){
-  // Sample 3 field points: center, mid, near required edge (or maxField)
-  const edge = Number.isFinite(req) ? Math.min(maxField, req) : maxField;
-  const f0 = 0;
-  const f1 = edge * 0.65;
-  const f2 = edge * 0.95;
-
-  const fields = [f0, f1, f2];
-  const fieldWeights = MERIT_CFG.fieldWeights;
-
-  let merit = 0;
-  let rmsCenter = null, rmsEdge = null;
-  let vigAvg = 0;
-  let validMin = 999;
-
-  for (let k = 0; k < fields.length; k++){
-    const fa = fields[k];
-    const pack = traceBundleAtField(surfaces, fa, rayCount, wavePreset, sensorX);
-
-    validMin = Math.min(validMin, pack.n || 0);
-    vigAvg += pack.vigFrac / fields.length;
-
-    const rms = Number.isFinite(pack.rms) ? pack.rms : 999;
-    if (k === 0) rmsCenter = rms;
-    if (k === fields.length - 1) rmsEdge = rms;
-
-    const rn = rms / MERIT_CFG.rmsNorm;      // normalized RMS
-    merit += fieldWeights[k] * (rn * rn);    // squared penalty
-  }
-
-  // Vignetting penalty (0..1)
-  merit += MERIT_CFG.vigWeight * (vigAvg * vigAvg);
-
-  // Coverage penalty
-  if (!covers) merit += MERIT_CFG.covPenalty;
-
-  // Rear intrusion penalty (only if intrusion > 0)
-  if (Number.isFinite(intrusion) && intrusion > 0){
-    const x = intrusion / 1.0; // 1mm units
-    merit += MERIT_CFG.intrusionWeight * (x * x);
-  }
-
-  // If too few valid rays → basically unusable, slam it
-  if (validMin < 7) merit += 200;
-
-  const breakdown = {
-    rmsCenter, rmsEdge,
-    vigPct: Math.round(vigAvg * 100),
-    covers,
-    intrusion: Number.isFinite(intrusion) ? intrusion : null,
-    fields: fields.map(v => Number.isFinite(v) ? v : 0),
-  };
-
-  return { merit, breakdown };
-}
-   
-  // -------------------- autofocus --------------------
+  // -------------------- spot RMS + autofocus core --------------------
   function spotRmsAtSensorX(traces, sensorX) {
     const ys = [];
     for (const tr of traces) {
@@ -1039,27 +933,19 @@ function computeMeritV1({
     return { rms, n: ys.length };
   }
 
-  function autoFocus() {
-    if (ui.focusMode) ui.focusMode.value = "lens";
-    if (ui.sensorOffset) ui.sensorOffset.value = "0";
-
-    const fieldAngle = Number(ui.fieldAngle?.value || 0);
-    const rayCount = Number(ui.rayCount?.value || 31);
-    const wavePreset = ui.wavePreset?.value || "d";
-
-    const currentLensShift = Number(ui.lensFocus?.value || 0);
+  function bestLensShiftForDesign(surfaces, fieldAngle, rayCount, wavePreset) {
     const sensorX = 0.0;
+    const x0 = 0;
+    const range = 22;
+    const coarseStep = 0.35;
+    const fineStep = 0.07;
 
-    const range = 20;
-    const coarseStep = 0.25;
-    const fineStep = 0.05;
-
-    let best = { shift: currentLensShift, rms: Infinity, n: 0 };
+    let best = { shift: x0, rms: Infinity, n: 0 };
 
     function evalShift(shift) {
-      computeVertices(lens.surfaces, shift, sensorX);
-      const rays = buildRays(lens.surfaces, fieldAngle, rayCount);
-      const traces = rays.map((r) => traceRayForward(clone(r), lens.surfaces, wavePreset));
+      computeVertices(surfaces, shift, sensorX);
+      const rays = buildRays(surfaces, fieldAngle, rayCount);
+      const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
       return spotRmsAtSensorX(traces, sensorX);
     }
 
@@ -1073,22 +959,135 @@ function computeMeritV1({
       }
     }
 
-    scan(currentLensShift, range, coarseStep);
-    if (Number.isFinite(best.rms)) scan(best.shift, 2.0, fineStep);
+    scan(x0, range, coarseStep);
+    if (Number.isFinite(best.rms)) scan(best.shift, 2.4, fineStep);
+    if (!Number.isFinite(best.rms) || best.n < 5) return { shift: 0, ok: false, rms: null };
+    return { shift: best.shift, ok: true, rms: best.rms };
+  }
 
-    if (!Number.isFinite(best.rms) || best.n < 5) {
+  function autoFocus() {
+    if (ui.focusMode) ui.focusMode.value = "lens";
+    if (ui.sensorOffset) ui.sensorOffset.value = "0";
+
+    const fieldAngle = Number(ui.fieldAngle?.value || 0);
+    const rayCount = Number(ui.rayCount?.value || 31);
+    const wavePreset = ui.wavePreset?.value || "d";
+
+    const res = bestLensShiftForDesign(lens.surfaces, fieldAngle, rayCount, wavePreset);
+
+    if (!res.ok) {
       if (ui.footerWarn) ui.footerWarn.textContent =
         "Auto focus (lens) failed (too few valid rays). Try more rays / larger apertures.";
-      computeVertices(lens.surfaces, currentLensShift, sensorX);
       renderAll();
       return;
     }
 
-    if (ui.lensFocus) ui.lensFocus.value = best.shift.toFixed(2);
+    if (ui.lensFocus) ui.lensFocus.value = res.shift.toFixed(2);
     if (ui.footerWarn) ui.footerWarn.textContent =
-      `Auto focus (LENS): lensFocus=${best.shift.toFixed(2)}mm • RMS=${best.rms.toFixed(3)}mm • rays=${best.n}`;
+      `Auto focus (LENS): lensFocus=${res.shift.toFixed(2)}mm • RMS=${res.rms.toFixed(3)}mm`;
 
     renderAll();
+  }
+
+  // -------------------- merit (v1) --------------------
+  // Lower = better.
+  const MERIT_CFG = {
+    rmsNorm: 0.05,            // 0.05mm RMS = "ok" baseline
+    vigWeight: 6.0,
+    covPenalty: 60.0,
+    intrusionWeight: 8.0,
+    fieldWeights: [1.0, 1.5, 2.0],
+
+    // target terms (optimizer uses these)
+    eflWeight: 0.35,          // penalty per mm error (squared)
+    tWeight: 10.0,            // penalty per T error (squared)
+    bflMin: 52.0,             // for PL: discourage too-short backfocus
+    bflWeight: 6.0,
+  };
+
+  function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
+    const rays = buildRays(surfaces, fieldDeg, rayCount);
+    const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
+    const vCount = traces.filter((t) => t.vignetted).length;
+    const vigFrac = traces.length ? (vCount / traces.length) : 1;
+    const { rms, n } = spotRmsAtSensorX(traces, sensorX);
+    return { traces, rms, n, vigFrac, vCount };
+  }
+
+  function computeMeritV1({
+    surfaces,
+    wavePreset,
+    sensorX,
+    rayCount,
+    fov, maxField, covers, req,
+    intrusion,
+    efl, T, bfl,
+    targetEfl = null,
+    targetT = null,
+  }){
+    const edge = Number.isFinite(req) ? Math.min(maxField, req) : maxField;
+    const f0 = 0;
+    const f1 = edge * 0.65;
+    const f2 = edge * 0.95;
+
+    const fields = [f0, f1, f2];
+    const fieldWeights = MERIT_CFG.fieldWeights;
+
+    let merit = 0;
+    let rmsCenter = null, rmsEdge = null;
+    let vigAvg = 0;
+    let validMin = 999;
+
+    for (let k = 0; k < fields.length; k++){
+      const fa = fields[k];
+      const pack = traceBundleAtField(surfaces, fa, rayCount, wavePreset, sensorX);
+
+      validMin = Math.min(validMin, pack.n || 0);
+      vigAvg += pack.vigFrac / fields.length;
+
+      const rms = Number.isFinite(pack.rms) ? pack.rms : 999;
+      if (k === 0) rmsCenter = rms;
+      if (k === fields.length - 1) rmsEdge = rms;
+
+      const rn = rms / MERIT_CFG.rmsNorm;
+      merit += fieldWeights[k] * (rn * rn);
+    }
+
+    merit += MERIT_CFG.vigWeight * (vigAvg * vigAvg);
+    if (!covers) merit += MERIT_CFG.covPenalty;
+
+    if (Number.isFinite(intrusion) && intrusion > 0){
+      const x = intrusion / 1.0;
+      merit += MERIT_CFG.intrusionWeight * (x * x);
+    }
+
+    // BFL soft-constraint (paraxial) – helps keep designs physically plausible
+    if (Number.isFinite(bfl) && bfl < MERIT_CFG.bflMin){
+      const d = (MERIT_CFG.bflMin - bfl);
+      merit += MERIT_CFG.bflWeight * (d * d);
+    }
+
+    // Targets (optional)
+    if (Number.isFinite(targetEfl) && Number.isFinite(efl)){
+      const d = (efl - targetEfl);
+      merit += MERIT_CFG.eflWeight * (d * d);
+    }
+    if (Number.isFinite(targetT) && Number.isFinite(T)){
+      const d = (T - targetT);
+      merit += MERIT_CFG.tWeight * (d * d);
+    }
+
+    if (validMin < 7) merit += 200;
+
+    const breakdown = {
+      rmsCenter, rmsEdge,
+      vigPct: Math.round(vigAvg * 100),
+      covers,
+      intrusion: Number.isFinite(intrusion) ? intrusion : null,
+      fields: fields.map(v => Number.isFinite(v) ? v : 0),
+    };
+
+    return { merit, breakdown };
   }
 
   // -------------------- drawing --------------------
@@ -1538,7 +1537,7 @@ function computeMeritV1({
     ctx.restore();
   }
 
-  // -------------------- render scheduler (RAF throttle) --------------------
+  // -------------------- render scheduler --------------------
   let _rafAll = 0;
   function scheduleRenderAll() {
     if (_rafAll) return;
@@ -1549,7 +1548,7 @@ function computeMeritV1({
   }
 
   // ===========================
-  // RENDER ALL (RAYS pane)
+  // RENDER ALL
   // ===========================
   function renderAll() {
     if (!canvas || !ctx) return;
@@ -1595,28 +1594,29 @@ function computeMeritV1({
     const rearVx = lastPhysicalVertexX(lens.surfaces);
     const intrusion = rearVx - plX;
 
+    const meritRes = computeMeritV1({
+      surfaces: lens.surfaces,
+      wavePreset,
+      sensorX,
+      rayCount,
+      fov, maxField, covers, req,
+      intrusion,
+      efl, T, bfl,
+      targetEfl: Number(ui.optTargetFL?.value || NaN),
+      targetT: Number(ui.optTargetT?.value || NaN),
+    });
 
-// ---- MERIT ----
-const meritRes = computeMeritV1({
-  surfaces: lens.surfaces,
-  wavePreset,
-  sensorX,
-  rayCount,
-  fov, maxField, covers, req,
-  intrusion
-});
+    const m = meritRes.merit;
+    const bd = meritRes.breakdown;
 
-const m = meritRes.merit;
-const bd = meritRes.breakdown;
+    const meritTxt =
+      `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} ` +
+      `(RMS0 ${bd.rmsCenter?.toFixed?.(3) ?? "—"}mm • RMSedge ${bd.rmsEdge?.toFixed?.(3) ?? "—"}mm • Vig ${bd.vigPct}%` +
+      `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""})`;
 
-const meritTxt =
-  `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} ` +
-  `(RMS0 ${bd.rmsCenter?.toFixed?.(3) ?? "—"}mm • RMSedge ${bd.rmsEdge?.toFixed?.(3) ?? "—"}mm • Vig ${bd.vigPct}%` +
-  `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""})`;
+    if (ui.merit) ui.merit.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
+    if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
 
-if (ui.merit) ui.merit.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
-if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
-     
     const rearTxt = (intrusion > 0)
       ? `REAR INTRUSION: +${intrusion.toFixed(2)}mm ❌`
       : `REAR CLEAR: ${Math.abs(intrusion).toFixed(2)}mm ✅`;
@@ -1643,12 +1643,10 @@ if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFi
 
     if (tirCount > 0 && ui.footerWarn) ui.footerWarn.textContent = `TIR on ${tirCount} rays (check glass / curvature).`;
 
-   
-
-   if (ui.status) {
-  ui.status.textContent =
-    `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${covTxt} • ${meritTxt}`;
-}
+    if (ui.status) {
+      ui.status.textContent =
+        `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${covTxt} • ${meritTxt}`;
+    }
     if (ui.metaInfo) ui.metaInfo.textContent = `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm`;
 
     resizeCanvasToCSS();
@@ -1684,8 +1682,6 @@ if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFi
     ]);
   }
 
-
-   
   // -------------------- view controls (RAYS canvas) --------------------
   function bindViewControls() {
     if (!canvas) return;
@@ -1744,6 +1740,8 @@ if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFi
   function insertSurface(atIndex, surfaceObj) {
     lens.surfaces.splice(atIndex, 0, surfaceObj);
     selectedIndex = atIndex;
+    lens = sanitizeLens(lens);
+    clampAllApertures(lens.surfaces);
     buildTable();
     applySensorToIMS();
     renderAll();
@@ -1807,6 +1805,154 @@ if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFi
     toast("New / Clear");
   }
 
+  // -------------------- element modal (+Element) --------------------
+  function openElementModal() {
+    if (!ui.elementModal) return;
+
+    const opts = Object.keys(GLASS_DB)
+      .filter(k => k !== "AIR")
+      .map(k => `<option value="${k}">${k}</option>`)
+      .join("");
+
+    ui.elementModal.innerHTML = `
+      <div class="modalCard" role="dialog" aria-modal="true" aria-label="Add Element">
+        <div class="modalTop">
+          <div>
+            <div class="modalTitle">Add Element (2 surfaces)</div>
+            <div class="modalSub">Front surface krijgt GLASS, back surface = AIR. Dikte = glasdikte (t) op de front surface.</div>
+          </div>
+          <button class="modalX" id="elClose" type="button">✕</button>
+        </div>
+        <div class="modalScroll">
+          <div class="modalGrid">
+            <div class="field">
+              <label>Front R</label>
+              <input id="elR1" type="number" step="0.01" value="40" />
+            </div>
+            <div class="field">
+              <label>Back R</label>
+              <input id="elR2" type="number" step="0.01" value="-60" />
+            </div>
+            <div class="field">
+              <label>Glass thickness (t)</label>
+              <input id="elT" type="number" step="0.01" value="6" />
+            </div>
+            <div class="field">
+              <label>Air gap after element</label>
+              <input id="elAir" type="number" step="0.01" value="2" />
+            </div>
+            <div class="field">
+              <label>Aperture (semi-diam)</label>
+              <input id="elAp" type="number" step="0.01" value="18" />
+            </div>
+            <div class="field">
+              <label>Glass</label>
+              <select id="elGlass">${opts}</select>
+            </div>
+            <div class="fieldFull">
+              <div class="hint">Tip: wil je een achromaat? Zet 2 elementen achter elkaar met verschillende glassoorten (crown + flint) en speel met R.</div>
+            </div>
+          </div>
+        </div>
+        <div class="modalBottom">
+          <button class="btn" id="elCancel" type="button">Cancel</button>
+          <button class="btn btnPrimary" id="elAdd" type="button">Insert</button>
+        </div>
+      </div>
+    `;
+
+    ui.elementModal.classList.remove("hidden");
+    ui.elementModal.setAttribute("aria-hidden","false");
+
+    const close = () => {
+      ui.elementModal.classList.add("hidden");
+      ui.elementModal.setAttribute("aria-hidden","true");
+      ui.elementModal.innerHTML = "";
+    };
+
+    ui.elementModal.querySelector("#elClose")?.addEventListener("click", close);
+    ui.elementModal.querySelector("#elCancel")?.addEventListener("click", close);
+    ui.elementModal.addEventListener("click", (e) => {
+      if (e.target === ui.elementModal) close();
+    });
+
+    ui.elementModal.querySelector("#elAdd")?.addEventListener("click", () => {
+      const R1 = num($("#elR1")?.value, 0);
+      const R2 = num($("#elR2")?.value, 0);
+      const tG = Math.max(0.01, num($("#elT")?.value, 4));
+      const tAir = Math.max(0.01, num($("#elAir")?.value, 2));
+      const ap = Math.max(0.5, num($("#elAp")?.value, 18));
+      const g = resolveGlassName($("#elGlass")?.value || "N-BK7HT");
+
+      const at = safeInsertAtAfterSelected();
+      // front surface: after it is GLASS
+      lens.surfaces.splice(at, 0, { type: "", R: R1, t: tG, ap, glass: g, stop: false });
+      // back surface: after it is AIR
+      lens.surfaces.splice(at + 1, 0, { type: "", R: R2, t: tAir, ap, glass: "AIR", stop: false });
+
+      lens = sanitizeLens(lens);
+      clampAllApertures(lens.surfaces);
+      selectedIndex = at;
+      buildTable();
+      applySensorToIMS();
+      renderAll();
+      close();
+      toast("Element inserted");
+    });
+  }
+
+  // -------------------- Scale → FL + Set T --------------------
+  function scaleToFocal() {
+    const target = num(prompt("Target focal length (mm)?", String(ui.optTargetFL?.value || "75")), NaN);
+    if (!Number.isFinite(target) || target <= 1) return;
+
+    const wave = ui.wavePreset?.value || "d";
+    computeVertices(lens.surfaces, 0, 0);
+    const { efl } = estimateEflBflParaxial(lens.surfaces, wave);
+    if (!Number.isFinite(efl) || efl <= 1) return toast("Scale failed (EFL not solvable)");
+
+    const k = target / efl;
+
+    for (let i = 0; i < lens.surfaces.length; i++) {
+      const s = lens.surfaces[i];
+      const t = String(s.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+
+      // scale geometry
+      s.R = Number(s.R) * k;
+      s.t = Number(s.t) * k;
+      s.ap = Number(s.ap) * k;
+    }
+
+    // keep sensor half-height (IMS ap)
+    applySensorToIMS();
+    clampAllApertures(lens.surfaces);
+    buildTable();
+    renderAll();
+    toast(`Scaled ×${k.toFixed(3)} → ${target.toFixed(1)}mm`);
+  }
+
+  function setTStop() {
+    const targetT = num(prompt("Target T-stop?", String(ui.optTargetT?.value || "2.0")), NaN);
+    if (!Number.isFinite(targetT) || targetT <= 0.2) return;
+
+    const stopIdx = findStopSurfaceIndex(lens.surfaces);
+    if (stopIdx < 0) return toast("No STOP surface selected");
+
+    const wave = ui.wavePreset?.value || "d";
+    computeVertices(lens.surfaces, 0, 0);
+    const { efl } = estimateEflBflParaxial(lens.surfaces, wave);
+    if (!Number.isFinite(efl) || efl <= 1) return toast("Set T failed (EFL not solvable)");
+
+    const desiredStopAp = efl / (2 * targetT);
+    lens.surfaces[stopIdx].ap = clamp(desiredStopAp, 0.2, maxApForSurface(lens.surfaces[stopIdx]));
+
+    clampAllApertures(lens.surfaces);
+    buildTable();
+    renderAll();
+    toast(`STOP ap → ${lens.surfaces[stopIdx].ap.toFixed(2)} (T≈${targetT.toFixed(2)})`);
+  }
+
   // -------------------- save/load JSON --------------------
   function saveJSON() {
     const data = JSON.stringify(lens, null, 2);
@@ -1836,6 +1982,336 @@ if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFi
     else document.exitFullscreen?.();
   }
 
+  // ===========================
+  // OPTIMIZER
+  // ===========================
+  let optRunning = false;
+  let optBest = null; // {lens, score, meta}
+
+  function setOptLog(lines){
+    if (!ui.optLog) return;
+    ui.optLog.value = String(lines || "");
+  }
+
+  function randn(){
+    // Box–Muller
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+  }
+
+  function pick(arr){ return arr[(Math.random() * arr.length) | 0]; }
+
+  function surfaceIsLocked(s){
+    const t = String(s?.type || "").toUpperCase();
+    return t === "OBJ" || t === "IMS";
+  }
+
+  function lensHasStop(surfaces){
+    return findStopSurfaceIndex(surfaces) >= 0;
+  }
+
+  function ensureStopExists(surfaces){
+    if (lensHasStop(surfaces)) return;
+    // set first non-OBJ non-IMS surface as stop
+    for (let i=0;i<surfaces.length;i++){
+      const t = String(surfaces[i]?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      surfaces[i].stop = true;
+      surfaces[i].type = "STOP";
+      break;
+    }
+  }
+
+  function quickSanity(surfaces){
+    // avoid negative thickness & crazy apertures
+    for (const s of surfaces){
+      const t = String(s.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      s.t = Math.max(0.01, Number(s.t || 0));
+      s.ap = Math.max(0.2, Number(s.ap || 0));
+      s.glass = resolveGlassName(s.glass);
+      clampSurfaceAp(s);
+    }
+  }
+
+  function mutateLens(baseLens, mode){
+    const L = clone(baseLens);
+    L.name = baseLens.name;
+
+    const s = L.surfaces;
+
+    // occasionally: add/remove a surface (wild mode)
+    if (mode === "wild" && Math.random() < 0.05){
+      const imsIdx = s.findIndex(x => String(x.type).toUpperCase()==="IMS");
+      const canRemove = s.length > 6;
+
+      if (canRemove && Math.random() < 0.5){
+        // remove a random non-locked surface
+        const idxs = s.map((x,i)=>({x,i})).filter(o=>!surfaceIsLocked(o.x));
+        if (idxs.length){
+          const ri = pick(idxs).i;
+          s.splice(ri,1);
+        }
+      } else {
+        // insert a random surface before IMS
+        const at = Math.max(1, Math.min(imsIdx >= 0 ? imsIdx : s.length-1, 1 + ((Math.random()*Math.max(1,(s.length-2)))|0)));
+        s.splice(at,0,{ type:"", R: (Math.random()<0.5?1:-1)*(20+Math.random()*120), t: 1+Math.random()*10, ap: 10+Math.random()*18, glass: (Math.random()<0.5?"AIR":pick(GLASS_LIST)), stop:false });
+      }
+    }
+
+    // main: perturb a few parameters
+    const kChanges = mode === "wild" ? 6 : 3;
+    for (let c=0;c<kChanges;c++){
+      const idxs = s.map((x,i)=>({x,i})).filter(o=>!surfaceIsLocked(o.x));
+      if (!idxs.length) break;
+      const o = pick(idxs);
+      const ss = o.x;
+
+      const choice = Math.random();
+      if (choice < 0.45){
+        // radius tweak
+        const scale = mode === "wild" ? 0.35 : 0.18;
+        const d = randn() * scale;
+        const R = Number(ss.R || 0);
+        const absR = Math.max(6, Math.abs(R));
+        const newAbs = absR * (1 + d);
+        ss.R = (R >= 0 ? 1 : -1) * clamp(newAbs, 6, 800);
+      } else if (choice < 0.70){
+        // thickness tweak
+        const scale = mode === "wild" ? 0.55 : 0.25;
+        const d = randn() * scale;
+        ss.t = clamp(Number(ss.t||0) * (1 + d), 0.01, 50);
+      } else if (choice < 0.88){
+        // aperture tweak
+        const scale = mode === "wild" ? 0.45 : 0.20;
+        const d = randn() * scale;
+        ss.ap = clamp(Number(ss.ap||0) * (1 + d), 0.2, 35);
+      } else {
+        // glass swap
+        if (Math.random() < 0.20) ss.glass = "AIR";
+        else ss.glass = pick(GLASS_LIST);
+      }
+
+      // sometimes toggle stop
+      if (mode === "wild" && Math.random() < 0.06){
+        ss.stop = !ss.stop;
+        if (ss.stop) ss.type = "STOP";
+      }
+    }
+
+    ensureStopExists(s);
+    // enforce single stop
+    const firstStop = s.findIndex(x => !!x.stop);
+    if (firstStop >= 0) s.forEach((x,i)=>{ if (i!==firstStop) x.stop=false; });
+
+    // keep OBJ/IMS types correct
+    if (s.length) s[0].type = "OBJ";
+    if (s.length) s[s.length-1].type = "IMS";
+
+    quickSanity(s);
+    return sanitizeLens(L);
+  }
+
+  function evalLensMerit(lensObj, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH}){
+    const tmp = clone(lensObj);
+    const surfaces = tmp.surfaces;
+
+    // IMS ap = half height
+    const halfH = Math.max(0.1, sensorH*0.5);
+    const ims = surfaces[surfaces.length-1];
+    if (ims && String(ims.type).toUpperCase()==="IMS") ims.ap = halfH;
+
+    // autofocus (lens shift)
+    const af = bestLensShiftForDesign(surfaces, fieldAngle, rayCount, wavePreset);
+    const lensShift = af.ok ? af.shift : 0;
+
+    const sensorX = 0.0;
+    computeVertices(surfaces, lensShift, sensorX);
+
+    const rays = buildRays(surfaces, fieldAngle, rayCount);
+    const traces = rays.map(r => traceRayForward(clone(r), surfaces, wavePreset));
+
+    const vCount = traces.filter(t=>t.vignetted).length;
+    const vigFrac = traces.length ? (vCount / traces.length) : 1;
+
+    const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
+    const T = estimateTStopApprox(efl, surfaces);
+
+    const fov = computeFovDeg(efl, sensorW, sensorH);
+    const maxField = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, halfH);
+    const { ok: covers, req } = coversSensorYesNo({ fov, maxField, mode: "v", marginDeg: 0.5 });
+
+    const rearVx = lastPhysicalVertexX(surfaces);
+    const intrusion = rearVx - (-PL_FFD);
+
+    const meritRes = computeMeritV1({
+      surfaces,
+      wavePreset,
+      sensorX,
+      rayCount,
+      fov, maxField, covers, req,
+      intrusion,
+      efl, T, bfl,
+      targetEfl,
+      targetT,
+    });
+
+    // tiny extra: hard fail if NaNs
+    const score = Number.isFinite(meritRes.merit) ? meritRes.merit : 1e9;
+
+    return {
+      score,
+      efl,
+      T,
+      bfl,
+      covers,
+      intrusion,
+      vigFrac,
+      lensShift,
+      rms0: meritRes.breakdown.rmsCenter,
+      rmsE: meritRes.breakdown.rmsEdge,
+      breakdown: meritRes.breakdown,
+    };
+  }
+
+  async function runOptimizer(){
+    if (optRunning) return;
+    optRunning = true;
+
+    const targetEfl = num(ui.optTargetFL?.value, 75);
+    const targetT = num(ui.optTargetT?.value, 2.0);
+    const iters = Math.max(10, (num(ui.optIters?.value, 2000) | 0));
+    const mode = (ui.optPop?.value || "safe");
+
+    // snapshot sensor settings
+    const { w: sensorW, h: sensorH } = getSensorWH();
+    const fieldAngle = num(ui.fieldAngle?.value, 0);
+    const rayCount = Math.max(9, Math.min(61, (num(ui.rayCount?.value, 31) | 0))); // limit for speed
+    const wavePreset = ui.wavePreset?.value || "d";
+
+    const startLens = sanitizeLens(lens);
+
+    let cur = startLens;
+    let curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+    let best = { lens: clone(cur), eval: curEval, iter: 0 };
+
+    // annealing-ish
+    let temp0 = mode === "wild" ? 3.5 : 1.8;
+    let temp1 = mode === "wild" ? 0.25 : 0.12;
+
+    const tStart = performance.now();
+
+    const BATCH = 60;
+
+    for (let i = 1; i <= iters; i++){
+      if (!optRunning) break;
+
+      const a = i / iters;
+      const temp = temp0 * (1 - a) + temp1 * a;
+
+      const cand = mutateLens(cur, mode);
+      const candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+
+      const d = candEval.score - curEval.score;
+      const accept = (d <= 0) || (Math.random() < Math.exp(-d / Math.max(1e-9, temp)));
+      if (accept){
+        cur = cand;
+        curEval = candEval;
+      }
+
+      if (candEval.score < best.eval.score){
+        best = { lens: clone(cand), eval: candEval, iter: i };
+
+        // UI update (rare)
+        if (ui.optLog){
+          setOptLog(
+            `best @${i}/${iters}\n` +
+            `score ${best.eval.score.toFixed(2)}\n` +
+            `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
+            `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
+            `COV ${best.eval.covers?"YES":"NO"} • INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
+            `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
+          );
+        }
+      }
+
+      if (i % BATCH === 0){
+        const tNow = performance.now();
+        const dt = (tNow - tStart) / 1000;
+        const ips = i / Math.max(1e-6, dt);
+        if (ui.optLog){
+          setOptLog(
+            `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
+            `current ${curEval.score.toFixed(2)} • best ${best.eval.score.toFixed(2)} @${best.iter}\n` +
+            `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • COV ${best.eval.covers?"YES":"NO"} • INTR ${best.eval.intrusion.toFixed(2)}mm\n`
+          );
+        }
+        // yield to UI
+        await new Promise(r => setTimeout(r, 0));
+      }
+    }
+
+    optBest = best;
+    optRunning = false;
+
+    const tEnd = performance.now();
+    const sec = (tEnd - tStart) / 1000;
+    if (ui.optLog){
+      setOptLog(
+        `done ${best.iter}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
+        `BEST score ${best.eval.score.toFixed(2)}\n` +
+        `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
+        `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
+        `COV ${best.eval.covers?"YES":"NO"} • INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
+        `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
+        `Click “Apply best” to load.`
+      );
+    }
+
+    toast(optBest ? `Optimize done. Best merit ${optBest.eval.score.toFixed(2)}` : "Optimize stopped");
+  }
+
+  function stopOptimizer(){
+    if (!optRunning) return;
+    optRunning = false;
+    toast("Stopping…");
+  }
+
+  function applyBest(){
+    if (!optBest?.lens) return toast("No best yet");
+    loadLens(optBest.lens);
+    // set lensFocus from best
+    if (ui.focusMode) ui.focusMode.value = "lens";
+    if (ui.sensorOffset) ui.sensorOffset.value = "0";
+    if (ui.lensFocus) ui.lensFocus.value = Number(optBest.eval.lensShift || 0).toFixed(2);
+    renderAll();
+    toast("Applied best");
+  }
+
+  function benchOptimizer(){
+    const N = 200;
+    const targetEfl = num(ui.optTargetFL?.value, 75);
+    const targetT = num(ui.optTargetT?.value, 2.0);
+    const { w: sensorW, h: sensorH } = getSensorWH();
+    const fieldAngle = num(ui.fieldAngle?.value, 0);
+    const rayCount = Math.max(9, Math.min(61, (num(ui.rayCount?.value, 31) | 0)));
+    const wavePreset = ui.wavePreset?.value || "d";
+
+    const t0 = performance.now();
+    let best = Infinity;
+    for (let i=0;i<N;i++){
+      const res = evalLensMerit(lens, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+      if (res.score < best) best = res.score;
+    }
+    const t1 = performance.now();
+    const sec = (t1 - t0)/1000;
+    const eps = N / Math.max(1e-6, sec);
+    setOptLog(`bench ${N} evals\n${eps.toFixed(1)} eval/s\nbest seen ${best.toFixed(2)}\n(rays=${rayCount}, field=${fieldAngle}°, wave=${wavePreset})`);
+    toast(`Bench: ${eps.toFixed(1)} eval/s`);
+  }
+
   // -------------------- init wiring --------------------
   function wireUI() {
     populateSensorPresetsSelect();
@@ -1859,10 +2335,14 @@ if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFi
     ui.btnLoadDemo?.addEventListener("click", () => loadLens(demoLensSimple()));
 
     ui.btnAdd?.addEventListener("click", addSurface);
+    ui.btnAddElement?.addEventListener("click", openElementModal);
     ui.btnDuplicate?.addEventListener("click", duplicateSelected);
     ui.btnMoveUp?.addEventListener("click", () => moveSelected(-1));
     ui.btnMoveDown?.addEventListener("click", () => moveSelected(+1));
     ui.btnRemove?.addEventListener("click", removeSelected);
+
+    ui.btnScaleToFocal?.addEventListener("click", scaleToFocal);
+    ui.btnSetTStop?.addEventListener("click", setTStop);
 
     ui.btnAutoFocus?.addEventListener("click", autoFocus);
 
@@ -1878,28 +2358,40 @@ if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFi
 
     ui.btnRaysFS?.addEventListener("click", () => toggleFullscreen(ui.raysPane));
 
-    // TODO: btnScaleToFocal / btnSetTStop / element modal:
-    // Als jij jouw onderste helft (waar deze handlers staan) even plakt,
-    // merge ik die 1:1 terug (zonder preview-code).
+    // optimizer
+    ui.btnOptStart?.addEventListener("click", runOptimizer);
+    ui.btnOptStop?.addEventListener("click", stopOptimizer);
+    ui.btnOptApply?.addEventListener("click", applyBest);
+    ui.btnOptBench?.addEventListener("click", benchOptimizer);
+
+    ["optTargetFL","optTargetT","optIters","optPop"].forEach((id)=>{
+      ui[id]?.addEventListener("change", scheduleRenderAll);
+      ui[id]?.addEventListener("input", () => {
+        // don't rerender constantly for iters/preset; but update merit targets
+        if (id === "optTargetFL" || id === "optTargetT") scheduleRenderAll();
+      });
+    });
   }
 
- // -------------------- boot --------------------
-function boot() {
-  wireUI();
+  // -------------------- boot --------------------
+  function boot() {
+    wireUI();
 
-  // Force top on boot (page + internal scroll pane)
-  window.scrollTo(0, 0);
-  document.querySelector(".leftScroll")?.scrollTo(0, 0);
-  setTimeout(() => document.querySelector(".leftScroll")?.scrollTo(0, 0), 0);
+    // Force top on boot
+    try {
+      window.scrollTo(0, 0);
+      document.querySelector(".leftScroll")?.scrollTo(0, 0);
+      setTimeout(() => document.querySelector(".leftScroll")?.scrollTo(0, 0), 0);
+    } catch(_) {}
 
-  buildTable();
-  applySensorToIMS();
-  bindViewControls();
-  renderAll();
+    buildTable();
+    applySensorToIMS();
+    bindViewControls();
+    renderAll();
 
-  window.addEventListener("resize", () => renderAll());
-  document.addEventListener("fullscreenchange", () => renderAll());
-}
+    window.addEventListener("resize", () => renderAll());
+    document.addEventListener("fullscreenchange", () => renderAll());
+  }
 
-boot();
+  boot();
 })();
