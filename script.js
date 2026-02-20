@@ -8,8 +8,10 @@
 
      // -------------------- kill scroll restoration (prevents "auto scrolled down" on reload) --------------------
   try { if ("scrollRestoration" in history) history.scrollRestoration = "manual"; } catch(_) {}
-  // Force top on load (some browsers restore scroll even if body overflow is hidden)
-  window.scrollTo(0, 0);
+// Force top on load (some browsers restore scroll even if body overflow is hidden)
+window.scrollTo(0, 0);
+document.querySelector(".leftScroll")?.scrollTo(0, 0);
+setTimeout(() => document.querySelector(".leftScroll")?.scrollTo(0, 0), 0);
 
    
   // -------------------- tiny helpers --------------------
