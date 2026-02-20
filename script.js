@@ -1643,10 +1643,7 @@ if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFi
 
     if (tirCount > 0 && ui.footerWarn) ui.footerWarn.textContent = `TIR on ${tirCount} rays (check glass / curvature).`;
 
-    if (ui.status) {
-      ui.status.textContent =
-        `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${covTxt}`;
-    }
+   
 
    if (ui.status) {
   ui.status.textContent =
