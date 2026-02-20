@@ -5,6 +5,13 @@
 */
 
 (() => {
+
+     // -------------------- kill scroll restoration (prevents "auto scrolled down" on reload) --------------------
+  try { if ("scrollRestoration" in history) history.scrollRestoration = "manual"; } catch(_) {}
+  // Force top on load (some browsers restore scroll even if body overflow is hidden)
+  window.scrollTo(0, 0);
+
+   
   // -------------------- tiny helpers --------------------
   const $ = (sel) => document.querySelector(sel);
   const clone = (obj) =>
@@ -1759,17 +1766,23 @@
     // merge ik die 1:1 terug (zonder preview-code).
   }
 
-  // -------------------- boot --------------------
-  function boot() {
-    wireUI();
-    buildTable();
-    applySensorToIMS();
-    bindViewControls();
-    renderAll();
+ // -------------------- boot --------------------
+function boot() {
+  wireUI();
 
-    window.addEventListener("resize", () => renderAll());
-    document.addEventListener("fullscreenchange", () => renderAll());
-  }
+  // Force top on boot (page + internal scroll pane)
+  window.scrollTo(0, 0);
+  document.querySelector(".leftScroll")?.scrollTo(0, 0);
+  setTimeout(() => document.querySelector(".leftScroll")?.scrollTo(0, 0), 0);
 
-  boot();
+  buildTable();
+  applySensorToIMS();
+  bindViewControls();
+  renderAll();
+
+  window.addEventListener("resize", () => renderAll());
+  document.addEventListener("fullscreenchange", () => renderAll());
+}
+
+boot();
 })();
