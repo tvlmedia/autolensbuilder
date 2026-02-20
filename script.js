@@ -1594,6 +1594,29 @@ function computeMeritV1({
 
     const rearVx = lastPhysicalVertexX(lens.surfaces);
     const intrusion = rearVx - plX;
+
+
+// ---- MERIT ----
+const meritRes = computeMeritV1({
+  surfaces: lens.surfaces,
+  wavePreset,
+  sensorX,
+  rayCount,
+  fov, maxField, covers, req,
+  intrusion
+});
+
+const m = meritRes.merit;
+const bd = meritRes.breakdown;
+
+const meritTxt =
+  `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} ` +
+  `(RMS0 ${bd.rmsCenter?.toFixed?.(3) ?? "—"}mm • RMSedge ${bd.rmsEdge?.toFixed?.(3) ?? "—"}mm • Vig ${bd.vigPct}%` +
+  `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""})`;
+
+if (ui.merit) ui.merit.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
+if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
+     
     const rearTxt = (intrusion > 0)
       ? `REAR INTRUSION: +${intrusion.toFixed(2)}mm ❌`
       : `REAR CLEAR: ${Math.abs(intrusion).toFixed(2)}mm ✅`;
@@ -1624,6 +1647,11 @@ function computeMeritV1({
       ui.status.textContent =
         `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${covTxt}`;
     }
+
+   if (ui.status) {
+  ui.status.textContent =
+    `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${covTxt} • ${meritTxt}`;
+}
     if (ui.metaInfo) ui.metaInfo.textContent = `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm`;
 
     resizeCanvasToCSS();
@@ -1659,32 +1687,7 @@ function computeMeritV1({
     ]);
   }
 
-// ---- MERIT ----
-const meritRes = computeMeritV1({
-  surfaces: lens.surfaces,
-  wavePreset,
-  sensorX,
-  rayCount,
-  fov, maxField, covers, req,
-  intrusion
-});
 
-const m = meritRes.merit;
-const bd = meritRes.breakdown;
-
-const meritTxt =
-  `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} ` +
-  `(RMS0 ${bd.rmsCenter?.toFixed?.(3) ?? "—"}mm • RMSedge ${bd.rmsEdge?.toFixed?.(3) ?? "—"}mm • Vig ${bd.vigPct}%` +
-  `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""})`;
-
-if (ui.merit) ui.merit.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
-if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
-
-// optioneel: zet breakdown in statusText (super handig)
-if (ui.status) {
-  ui.status.textContent =
-    `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${covTxt} • ${meritTxt}`;
-}
    
   // -------------------- view controls (RAYS canvas) --------------------
   function bindViewControls() {
