@@ -1328,7 +1328,7 @@
     bflMin: 52.0,             // for PL: discourage too-short backfocus
     bflWeight: 14.0,
     lowValidPenalty: 28.0,
-    hardInvalidPenalty: 650.0,
+    hardInvalidPenalty: 220.0,
     covShortfallWeight: 26.0,
     distTargetPct: 2.0,
     distEdgeWeight: 1.2,
@@ -2462,6 +2462,38 @@
     }
   }
 
+  function buildSeedLensForTargets(targetEfl, targetT, sensorH, wavePreset) {
+    const seed = sanitizeLens(omit50ConceptV1());
+    const s = seed.surfaces;
+
+    // scale baseline to requested focal length
+    computeVertices(s, 0, 0);
+    const base = estimateEflBflParaxial(s, wavePreset);
+    const baseEfl = Number(base?.efl);
+    const k = (Number.isFinite(baseEfl) && baseEfl > 1)
+      ? clamp(targetEfl / baseEfl, 0.45, 2.4)
+      : 1.0;
+
+    for (let i = 0; i < s.length; i++) {
+      const t = String(s[i]?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      s[i].R = Number(s[i].R || 0) * k;
+      s[i].t = Math.max(PHYS_CFG.minThickness, Number(s[i].t || 0) * k);
+      s[i].ap = clamp(Number(s[i].ap || 0) * Math.sqrt(k), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+    }
+
+    const stopIdx = findStopSurfaceIndex(s);
+    if (stopIdx >= 0 && Number.isFinite(targetEfl) && targetEfl > 1 && Number.isFinite(targetT) && targetT > 0.4) {
+      s[stopIdx].ap = clamp(targetEfl / (2 * targetT), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+    }
+
+    const ims = s[s.length - 1];
+    if (ims && String(ims.type).toUpperCase() === "IMS") ims.ap = Math.max(0.1, sensorH * 0.5);
+
+    quickSanity(s);
+    return sanitizeLens(seed);
+  }
+
   function captureTopology(lensObj) {
     const s = lensObj?.surfaces || [];
     return {
@@ -2603,35 +2635,9 @@
     const rearVxPre = lastPhysicalVertexX(surfaces);
     const intrusionPre = rearVxPre - (-PL_FFD);
     const hardMountFail = Number.isFinite(intrusionPre) && intrusionPre > MERIT_CFG.intrusionHardMm;
-
-    if (phys.hardFail || hardMountFail) {
-      const mountPenalty = hardMountFail ? (MERIT_CFG.intrusionHardPenalty + 50 * Math.pow(intrusionPre - MERIT_CFG.intrusionHardMm, 2)) : 0;
-      const score = MERIT_CFG.hardInvalidPenalty + MERIT_CFG.physPenaltyScale * Math.max(0, Number(phys.penalty || 0)) + mountPenalty;
-      return {
-        score,
-        efl: null,
-        T: null,
-        bfl: null,
-        covers: false,
-        intrusion: Number.isFinite(intrusionPre) ? intrusionPre : 0,
-        vigFrac: 1,
-        lensShift,
-        rms0: null,
-        rmsE: null,
-        breakdown: {
-          rmsCenter: null,
-          rmsEdge: null,
-          vigPct: 100,
-          covers: false,
-          intrusion: null,
-          fields: [0, 0, 0],
-          distEdgePct: null,
-          distRmsPct: null,
-          physPenalty: Number((phys.penalty || 0) + mountPenalty),
-          hardInvalid: true,
-        },
-      };
-    }
+    const mountPenalty = hardMountFail
+      ? (MERIT_CFG.intrusionHardPenalty + 50 * Math.pow(intrusionPre - MERIT_CFG.intrusionHardMm, 2))
+      : 0;
 
     const rays = buildRays(surfaces, fieldAngle, rayCount);
     const traces = rays.map(r => traceRayForward(clone(r), surfaces, wavePreset));
@@ -2667,8 +2673,8 @@
       distRmsPct: dist.rmsPct,
       targetEfl,
       targetT,
-      physPenalty: phys.penalty,
-      hardInvalid: phys.hardFail,
+      physPenalty: (phys.penalty || 0) + mountPenalty,
+      hardInvalid: phys.hardFail || hardMountFail,
     });
 
     // tiny extra: hard fail if NaNs
@@ -2701,8 +2707,10 @@
 
     const targetEfl = num(ui.optTargetFL?.value, 75);
     const targetT = num(ui.optTargetT?.value, 2.0);
-    const iters = Math.max(10, (num(ui.optIters?.value, 2000) | 0));
+    const itersRaw = Math.max(10, (num(ui.optIters?.value, 2000) | 0));
+    const iters = Math.min(200000, itersRaw);
     const mode = (ui.optPop?.value || "safe");
+    if (itersRaw !== iters) toast(`Iterations capped to ${iters} for stability/performance.`);
 
     // snapshot sensor settings
     const { w: sensorW, h: sensorH } = getSensorWH();
@@ -2711,10 +2719,14 @@
     const wavePreset = ui.wavePreset?.value || "d";
 
     const startLens = sanitizeLens(lens);
-    const topo = captureTopology(startLens);
-
     let cur = startLens;
     let curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+    if (!Number.isFinite(curEval.efl) || curEval.breakdown?.hardInvalid || curEval.score > 800) {
+      cur = buildSeedLensForTargets(targetEfl, targetT, sensorH, wavePreset);
+      curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+      toast("Optimizer reseeded from OMIT baseline.");
+    }
+    const topo = captureTopology(cur);
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
 
     // annealing-ish (adaptive to current score scale)
