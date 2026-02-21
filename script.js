@@ -704,8 +704,10 @@
   }
 
   const PHYS_CFG = {
-    minAirGap: 0.22,
+    minAirGap: 0.12,
+    prefAirGap: 0.60,
     minGlassCT: 0.35,
+    prefGlassCT: 1.20,
     minRadius: 8.0,
     minAperture: 1.2,
     maxAperture: 32.0,
@@ -723,6 +725,8 @@
     stopTooTinyWeight: 200.0,
     minAirGapsPreferred: 3,
     tooFewAirGapsWeight: 260.0,
+    shortAirGapWeight: 190.0,
+    thinGlassWeight: 150.0,
   };
 
   function minGapBetweenSurfaces(sFront, sBack, yMax, samples = 11) {
@@ -830,6 +834,14 @@
         const d = required - minGap;
         const w = (mediumAfterA === "AIR") ? PHYS_CFG.gapWeightAir : PHYS_CFG.gapWeightGlass;
         penalty += w * d * d;
+      }
+      if (mediumAfterA === "AIR" && minGap < PHYS_CFG.prefAirGap) {
+        const d = PHYS_CFG.prefAirGap - minGap;
+        penalty += PHYS_CFG.shortAirGapWeight * d * d;
+      }
+      if (mediumAfterA !== "AIR" && minGap < PHYS_CFG.prefGlassCT) {
+        const d = PHYS_CFG.prefGlassCT - minGap;
+        penalty += PHYS_CFG.thinGlassWeight * d * d;
       }
 
       if (minGap < -PHYS_CFG.maxNegOverlap) hardFail = true;
@@ -2318,14 +2330,55 @@
     }
   }
 
-  function mutateLens(baseLens, mode){
+  function captureTopology(lensObj) {
+    const s = lensObj?.surfaces || [];
+    return {
+      count: s.length,
+      media: s.map((x) => String(resolveGlassName(x?.glass)).toUpperCase() === "AIR" ? "AIR" : "GLASS"),
+      stopIdx: findStopSurfaceIndex(s),
+    };
+  }
+
+  function enforceTopology(surfaces, topo) {
+    if (!Array.isArray(surfaces) || !topo) return false;
+    if (!Number.isFinite(topo.count) || surfaces.length !== topo.count) return false;
+
+    for (let i = 0; i < surfaces.length; i++) {
+      const s = surfaces[i];
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+
+      const want = topo.media?.[i];
+      if (want === "AIR") {
+        s.glass = "AIR";
+      } else if (want === "GLASS") {
+        // keep glass family but never collapse to AIR
+        const g = resolveGlassName(s.glass);
+        s.glass = (String(g).toUpperCase() === "AIR") ? "N-BK7HT" : g;
+      }
+    }
+
+    const lockStop = Number.isFinite(topo.stopIdx) ? topo.stopIdx : -1;
+    surfaces.forEach((s, i) => {
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") {
+        s.stop = false;
+        return;
+      }
+      s.stop = (i === lockStop);
+      if (s.stop) s.type = "STOP";
+    });
+    return true;
+  }
+
+  function mutateLens(baseLens, mode, topo = null){
     const L = clone(baseLens);
     L.name = baseLens.name;
 
     const s = L.surfaces;
 
     // occasionally: add/remove a surface (wild mode)
-    if (mode === "wild" && Math.random() < 0.03){
+    if (!topo && mode === "wild" && Math.random() < 0.03){
       const imsIdx = s.findIndex(x => String(x.type).toUpperCase()==="IMS");
       const canRemove = s.length > 6;
 
@@ -2372,12 +2425,13 @@
         ss.ap = clamp(Number(ss.ap||0) * (1 + d), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
       } else {
         // glass swap
-        if (Math.random() < 0.08) ss.glass = "AIR";
+        const lock = topo?.media?.[o.i];
+        if (lock === "AIR") ss.glass = "AIR";
         else ss.glass = pick(GLASS_LIST);
       }
 
       // sometimes toggle stop
-      if (mode === "wild" && Math.random() < 0.015){
+      if (!topo && mode === "wild" && Math.random() < 0.015){
         ss.stop = !ss.stop;
         if (ss.stop) ss.type = "STOP";
       }
@@ -2392,7 +2446,9 @@
     if (s.length) s[0].type = "OBJ";
     if (s.length) s[s.length-1].type = "IMS";
 
+    if (topo) enforceTopology(s, topo);
     quickSanity(s);
+    if (topo) enforceTopology(s, topo);
     return sanitizeLens(L);
   }
 
@@ -2506,6 +2562,7 @@
     const wavePreset = ui.wavePreset?.value || "d";
 
     const startLens = sanitizeLens(lens);
+    const topo = captureTopology(startLens);
 
     let cur = startLens;
     let curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
@@ -2525,7 +2582,7 @@
       const a = i / iters;
       const temp = temp0 * (1 - a) + temp1 * a;
 
-      const cand = mutateLens(cur, mode);
+      const cand = mutateLens(cur, mode, topo);
       const candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
 
       const d = candEval.score - curEval.score;
