@@ -703,6 +703,151 @@
     return Math.max(0.01, lo);
   }
 
+  const PHYS_CFG = {
+    minAirGap: 0.06,
+    minGlassCT: 0.35,
+    minRadius: 8.0,
+    minAperture: 1.2,
+    maxAperture: 32.0,
+    minThickness: 0.05,
+    maxThickness: 55.0,
+    minStopToApertureRatio: 0.28,
+    maxNegOverlap: 0.05,
+    gapWeightAir: 1200.0,
+    gapWeightGlass: 2600.0,
+    overlapWeight: 3200.0,
+    tinyApWeight: 120.0,
+    tinyRadiusWeight: 80.0,
+    pinchWeight: 220.0,
+  };
+
+  function minGapBetweenSurfaces(sFront, sBack, yMax, samples = 11) {
+    const n = Math.max(3, samples | 0);
+    const ym = Math.max(0.001, Number(yMax || 0));
+    let minGap = Infinity;
+
+    for (let k = 0; k < n; k++) {
+      const a = n === 1 ? 0 : (k / (n - 1));
+      const y = a * ym;
+      const xf = surfaceXatY(sFront, y);
+      const xb = surfaceXatY(sBack, y);
+      if (!Number.isFinite(xf) || !Number.isFinite(xb)) return -Infinity;
+      minGap = Math.min(minGap, xb - xf);
+    }
+    return minGap;
+  }
+
+  function evaluatePhysicalConstraints(surfaces) {
+    let penalty = 0;
+    let hardFail = false;
+    let worstOverlap = 0;
+    let worstPinch = 0;
+
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    const stopAp = stopIdx >= 0 ? Math.max(0.1, Number(surfaces[stopIdx]?.ap || 0)) : null;
+
+    for (let i = 0; i < surfaces.length; i++) {
+      const s = surfaces[i];
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+
+      const ap = Math.max(0, Number(s.ap || 0));
+      const R = Math.abs(Number(s.R || 0));
+      const th = Math.max(0, Number(s.t || 0));
+
+      if (ap < PHYS_CFG.minAperture) {
+        const d = PHYS_CFG.minAperture - ap;
+        penalty += PHYS_CFG.tinyApWeight * d * d;
+      }
+      if (ap > PHYS_CFG.maxAperture) {
+        const d = ap - PHYS_CFG.maxAperture;
+        penalty += 60.0 * d * d;
+      }
+      if (R > 1e-9 && R < PHYS_CFG.minRadius) {
+        const d = PHYS_CFG.minRadius - R;
+        penalty += PHYS_CFG.tinyRadiusWeight * d * d;
+      }
+      if (th < PHYS_CFG.minThickness) {
+        const d = PHYS_CFG.minThickness - th;
+        penalty += 400.0 * d * d;
+      }
+      if (th > PHYS_CFG.maxThickness) {
+        const d = th - PHYS_CFG.maxThickness;
+        penalty += 5.0 * d * d;
+      }
+
+      if (Number.isFinite(stopAp) && ap < stopAp * PHYS_CFG.minStopToApertureRatio) {
+        const d = stopAp * PHYS_CFG.minStopToApertureRatio - ap;
+        penalty += PHYS_CFG.tinyApWeight * d * d;
+      }
+    }
+
+    for (let i = 1; i < surfaces.length - 1; i++) {
+      const prev = surfaces[i - 1];
+      const cur = surfaces[i];
+      const next = surfaces[i + 1];
+      const tp = String(prev?.type || "").toUpperCase();
+      const tc = String(cur?.type || "").toUpperCase();
+      const tn = String(next?.type || "").toUpperCase();
+      if (tp === "OBJ" || tc === "OBJ" || tn === "OBJ") continue;
+      if (tp === "IMS" || tc === "IMS" || tn === "IMS") continue;
+      const apPrev = Number(prev.ap || 0);
+      const apCur = Number(cur.ap || 0);
+      const apNext = Number(next.ap || 0);
+      const ref = Math.min(apPrev, apNext);
+      if (ref > 0.5 && apCur < 0.5 * ref) {
+        const d = 0.5 * ref - apCur;
+        worstPinch = Math.max(worstPinch, d);
+        penalty += PHYS_CFG.pinchWeight * d * d;
+      }
+    }
+
+    for (let i = 0; i < surfaces.length - 1; i++) {
+      const sA = surfaces[i];
+      const sB = surfaces[i + 1];
+      const tA = String(sA?.type || "").toUpperCase();
+      const tB = String(sB?.type || "").toUpperCase();
+      if (tA === "OBJ" || tA === "IMS" || tB === "OBJ" || tB === "IMS") continue;
+
+      const apShared = Math.max(0.1, Math.min(Number(sA.ap || 0), Number(sB.ap || 0), maxApForSurface(sA), maxApForSurface(sB)));
+      const minGap = minGapBetweenSurfaces(sA, sB, apShared, 13);
+      const mediumAfterA = String(sA.glass || "AIR").toUpperCase();
+      const required = mediumAfterA === "AIR" ? PHYS_CFG.minAirGap : PHYS_CFG.minGlassCT;
+
+      if (!Number.isFinite(minGap)) {
+        penalty += 100_000;
+        hardFail = true;
+        continue;
+      }
+
+      if (minGap < required) {
+        const d = required - minGap;
+        const w = (mediumAfterA === "AIR") ? PHYS_CFG.gapWeightAir : PHYS_CFG.gapWeightGlass;
+        penalty += w * d * d;
+      }
+
+      if (minGap < -PHYS_CFG.maxNegOverlap) hardFail = true;
+      if (minGap < 0) worstOverlap = Math.max(worstOverlap, -minGap);
+
+      if (mediumAfterA !== "AIR") {
+        const noAp = maxNonOverlappingSemiDiameter(sA, sB, PHYS_CFG.minGlassCT);
+        if (apShared > noAp + 1e-3) {
+          const d = apShared - noAp;
+          worstOverlap = Math.max(worstOverlap, d);
+          penalty += PHYS_CFG.overlapWeight * d * d;
+          if (d > 0.25) hardFail = true;
+        }
+      }
+    }
+
+    if (stopIdx < 0) {
+      penalty += 1500;
+      hardFail = true;
+    }
+
+    return { penalty, hardFail, worstOverlap, worstPinch };
+  }
+
   // -------------------- tracing --------------------
   function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     const skipIMS = !!opts.skipIMS;
@@ -993,9 +1138,9 @@
   // Lower = better.
   const MERIT_CFG = {
     rmsNorm: 0.05,            // 0.05mm RMS = "ok" baseline
-    vigWeight: 6.0,
-    covPenalty: 60.0,
-    intrusionWeight: 8.0,
+    vigWeight: 16.0,
+    covPenalty: 180.0,
+    intrusionWeight: 16.0,
     fieldWeights: [1.0, 1.5, 2.0],
 
     // target terms (optimizer uses these)
@@ -1003,6 +1148,8 @@
     tWeight: 10.0,            // penalty per T error (squared)
     bflMin: 52.0,             // for PL: discourage too-short backfocus
     bflWeight: 6.0,
+    lowValidPenalty: 450.0,
+    hardInvalidPenalty: 1_000_000.0,
   };
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
@@ -1024,6 +1171,8 @@
     efl, T, bfl,
     targetEfl = null,
     targetT = null,
+    physPenalty = 0,
+    hardInvalid = false,
   }){
     const edge = Number.isFinite(req) ? Math.min(maxField, req) : maxField;
     const f0 = 0;
@@ -1077,7 +1226,14 @@
       merit += MERIT_CFG.tWeight * (d * d);
     }
 
-    if (validMin < 7) merit += 200;
+    const minValidTarget = Math.max(7, Math.floor(rayCount * 0.45));
+    if (validMin < minValidTarget) {
+      const d = (minValidTarget - validMin);
+      merit += MERIT_CFG.lowValidPenalty + 32.0 * d * d;
+    }
+
+    if (Number.isFinite(physPenalty) && physPenalty > 0) merit += physPenalty;
+    if (hardInvalid) merit += MERIT_CFG.hardInvalidPenalty;
 
     const breakdown = {
       rmsCenter, rmsEdge,
@@ -1085,6 +1241,8 @@
       covers,
       intrusion: Number.isFinite(intrusion) ? intrusion : null,
       fields: fields.map(v => Number.isFinite(v) ? v : 0),
+      physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
+      hardInvalid: !!hardInvalid,
     };
 
     return { merit, breakdown };
@@ -1593,6 +1751,7 @@
 
     const rearVx = lastPhysicalVertexX(lens.surfaces);
     const intrusion = rearVx - plX;
+    const phys = evaluatePhysicalConstraints(lens.surfaces);
 
     const meritRes = computeMeritV1({
       surfaces: lens.surfaces,
@@ -1604,6 +1763,8 @@
       efl, T, bfl,
       targetEfl: Number(ui.optTargetFL?.value || NaN),
       targetT: Number(ui.optTargetT?.value || NaN),
+      physPenalty: phys.penalty,
+      hardInvalid: phys.hardFail,
     });
 
     const m = meritRes.merit;
@@ -1612,7 +1773,9 @@
     const meritTxt =
       `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} ` +
       `(RMS0 ${bd.rmsCenter?.toFixed?.(3) ?? "—"}mm • RMSedge ${bd.rmsEdge?.toFixed?.(3) ?? "—"}mm • Vig ${bd.vigPct}%` +
-      `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""})`;
+      `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""}` +
+      `${bd.physPenalty > 0 ? ` • PHYS +${bd.physPenalty.toFixed(1)}` : ""}` +
+      `${bd.hardInvalid ? " • INVALID ❌" : ""})`;
 
     if (ui.merit) ui.merit.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
     if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
@@ -1641,7 +1804,12 @@
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.covTop) ui.covTop.textContent = ui.cov?.textContent || (covers ? "COV: YES" : "COV: NO");
 
-    if (tirCount > 0 && ui.footerWarn) ui.footerWarn.textContent = `TIR on ${tirCount} rays (check glass / curvature).`;
+    if (phys.hardFail && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `INVALID geometry: overlap/clearance issue (overlap ${phys.worstOverlap.toFixed(2)}mm, pinch ${phys.worstPinch.toFixed(2)}mm).`;
+    } else if (tirCount > 0 && ui.footerWarn) {
+      ui.footerWarn.textContent = `TIR on ${tirCount} rays (check glass / curvature).`;
+    }
 
     if (ui.status) {
       ui.status.textContent =
@@ -2029,10 +2197,23 @@
     for (const s of surfaces){
       const t = String(s.type || "").toUpperCase();
       if (t === "OBJ" || t === "IMS") continue;
-      s.t = Math.max(0.01, Number(s.t || 0));
-      s.ap = Math.max(0.2, Number(s.ap || 0));
+      s.t = Math.max(PHYS_CFG.minThickness, Number(s.t || 0));
+      s.ap = Math.max(PHYS_CFG.minAperture, Number(s.ap || 0));
       s.glass = resolveGlassName(s.glass);
       clampSurfaceAp(s);
+    }
+
+    // discourage abrupt aperture pinches (common optimizer failure mode)
+    for (let i = 1; i < surfaces.length - 1; i++) {
+      const a = surfaces[i - 1], b = surfaces[i], c = surfaces[i + 1];
+      const ta = String(a?.type || "").toUpperCase();
+      const tb = String(b?.type || "").toUpperCase();
+      const tc = String(c?.type || "").toUpperCase();
+      if (ta === "OBJ" || tb === "OBJ" || tc === "OBJ") continue;
+      if (ta === "IMS" || tb === "IMS" || tc === "IMS") continue;
+      const ref = Math.min(Number(a.ap || 0), Number(c.ap || 0));
+      if (ref > 0.5 && Number(b.ap || 0) < 0.45 * ref) b.ap = 0.45 * ref;
+      clampSurfaceAp(b);
     }
   }
 
@@ -2043,7 +2224,7 @@
     const s = L.surfaces;
 
     // occasionally: add/remove a surface (wild mode)
-    if (mode === "wild" && Math.random() < 0.05){
+    if (mode === "wild" && Math.random() < 0.03){
       const imsIdx = s.findIndex(x => String(x.type).toUpperCase()==="IMS");
       const canRemove = s.length > 6;
 
@@ -2057,7 +2238,7 @@
       } else {
         // insert a random surface before IMS
         const at = Math.max(1, Math.min(imsIdx >= 0 ? imsIdx : s.length-1, 1 + ((Math.random()*Math.max(1,(s.length-2)))|0)));
-        s.splice(at,0,{ type:"", R: (Math.random()<0.5?1:-1)*(20+Math.random()*120), t: 1+Math.random()*10, ap: 10+Math.random()*18, glass: (Math.random()<0.5?"AIR":pick(GLASS_LIST)), stop:false });
+        s.splice(at,0,{ type:"", R: (Math.random()<0.5?1:-1)*(16+Math.random()*160), t: 0.4+Math.random()*8, ap: 4+Math.random()*20, glass: (Math.random()<0.15?"AIR":pick(GLASS_LIST)), stop:false });
       }
     }
 
@@ -2075,27 +2256,27 @@
         const scale = mode === "wild" ? 0.35 : 0.18;
         const d = randn() * scale;
         const R = Number(ss.R || 0);
-        const absR = Math.max(6, Math.abs(R));
+        const absR = Math.max(PHYS_CFG.minRadius, Math.abs(R));
         const newAbs = absR * (1 + d);
-        ss.R = (R >= 0 ? 1 : -1) * clamp(newAbs, 6, 800);
+        ss.R = (R >= 0 ? 1 : -1) * clamp(newAbs, PHYS_CFG.minRadius, 450);
       } else if (choice < 0.70){
         // thickness tweak
         const scale = mode === "wild" ? 0.55 : 0.25;
         const d = randn() * scale;
-        ss.t = clamp(Number(ss.t||0) * (1 + d), 0.01, 50);
+        ss.t = clamp(Number(ss.t||0) * (1 + d), PHYS_CFG.minThickness, 42);
       } else if (choice < 0.88){
         // aperture tweak
         const scale = mode === "wild" ? 0.45 : 0.20;
         const d = randn() * scale;
-        ss.ap = clamp(Number(ss.ap||0) * (1 + d), 0.2, 35);
+        ss.ap = clamp(Number(ss.ap||0) * (1 + d), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
       } else {
         // glass swap
-        if (Math.random() < 0.20) ss.glass = "AIR";
+        if (Math.random() < 0.08) ss.glass = "AIR";
         else ss.glass = pick(GLASS_LIST);
       }
 
       // sometimes toggle stop
-      if (mode === "wild" && Math.random() < 0.06){
+      if (mode === "wild" && Math.random() < 0.015){
         ss.stop = !ss.stop;
         if (ss.stop) ss.type = "STOP";
       }
@@ -2129,6 +2310,33 @@
 
     const sensorX = 0.0;
     computeVertices(surfaces, lensShift, sensorX);
+    const phys = evaluatePhysicalConstraints(surfaces);
+
+    if (phys.hardFail) {
+      const score = MERIT_CFG.hardInvalidPenalty + Math.max(0, Number(phys.penalty || 0));
+      return {
+        score,
+        efl: null,
+        T: null,
+        bfl: null,
+        covers: false,
+        intrusion: 0,
+        vigFrac: 1,
+        lensShift,
+        rms0: null,
+        rmsE: null,
+        breakdown: {
+          rmsCenter: null,
+          rmsEdge: null,
+          vigPct: 100,
+          covers: false,
+          intrusion: null,
+          fields: [0, 0, 0],
+          physPenalty: Number(phys.penalty || 0),
+          hardInvalid: true,
+        },
+      };
+    }
 
     const rays = buildRays(surfaces, fieldAngle, rayCount);
     const traces = rays.map(r => traceRayForward(clone(r), surfaces, wavePreset));
@@ -2156,6 +2364,8 @@
       efl, T, bfl,
       targetEfl,
       targetT,
+      physPenalty: phys.penalty,
+      hardInvalid: phys.hardFail,
     });
 
     // tiny extra: hard fail if NaNs
