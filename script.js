@@ -727,6 +727,11 @@
     tooFewAirGapsWeight: 260.0,
     shortAirGapWeight: 190.0,
     thinGlassWeight: 150.0,
+    minStopSideAirGap: 0.35,
+    stopAirSideWeight: 1200.0,
+    stopAirGapWeight: 900.0,
+    planeRefractiveWeight: 520.0,
+    planeNearStopExtraWeight: 880.0,
   };
 
   function minGapBetweenSurfaces(sFront, sBack, yMax, samples = 11) {
@@ -763,6 +768,9 @@
       const ap = Math.max(0, Number(s.ap || 0));
       const R = Math.abs(Number(s.R || 0));
       const th = Math.max(0, Number(s.t || 0));
+      const nBefore = i > 0 ? String(resolveGlassName(surfaces[i - 1]?.glass || "AIR")).toUpperCase() : "AIR";
+      const nAfter = String(resolveGlassName(s.glass || "AIR")).toUpperCase();
+      const isRefractive = nBefore !== nAfter;
 
       if (ap < PHYS_CFG.minAperture) {
         const d = PHYS_CFG.minAperture - ap;
@@ -775,6 +783,12 @@
       if (R > 1e-9 && R < PHYS_CFG.minRadius) {
         const d = PHYS_CFG.minRadius - R;
         penalty += PHYS_CFG.tinyRadiusWeight * d * d;
+      }
+      if (isRefractive && R <= 1e-9) {
+        penalty += PHYS_CFG.planeRefractiveWeight;
+        if (stopIdx >= 0 && Math.abs(i - stopIdx) <= 2) {
+          penalty += PHYS_CFG.planeNearStopExtraWeight;
+        }
       }
       if (th < PHYS_CFG.minThickness) {
         const d = PHYS_CFG.minThickness - th;
@@ -862,6 +876,31 @@
       penalty += 1500;
       hardFail = true;
     } else {
+      // Prefer iris in air on both sides.
+      const prevMedium = stopIdx > 0 ? String(resolveGlassName(surfaces[stopIdx - 1]?.glass || "AIR")).toUpperCase() : "AIR";
+      const nextMedium = String(resolveGlassName(surfaces[stopIdx]?.glass || "AIR")).toUpperCase();
+      if (prevMedium !== "AIR") {
+        penalty += PHYS_CFG.stopAirSideWeight;
+        hardFail = true;
+      }
+      if (nextMedium !== "AIR") {
+        penalty += PHYS_CFG.stopAirSideWeight;
+        hardFail = true;
+      }
+
+      const leftGap = stopIdx > 0
+        ? Math.max(0, Number(surfaces[stopIdx - 1]?.t || 0))
+        : 0;
+      const rightGap = Math.max(0, Number(surfaces[stopIdx]?.t || 0));
+      if (leftGap < PHYS_CFG.minStopSideAirGap) {
+        const d = PHYS_CFG.minStopSideAirGap - leftGap;
+        penalty += PHYS_CFG.stopAirGapWeight * d * d;
+      }
+      if (rightGap < PHYS_CFG.minStopSideAirGap) {
+        const d = PHYS_CFG.minStopSideAirGap - rightGap;
+        penalty += PHYS_CFG.stopAirGapWeight * d * d;
+      }
+
       // STOP should be compatible with nearby clear apertures to avoid heavy on-axis clipping.
       const neighbors = [];
       for (let d = 1; d <= 2; d++) {
