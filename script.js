@@ -2179,15 +2179,15 @@
     if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
     if (ui.dist) ui.dist.textContent = `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
     if (ui.fov) ui.fov.textContent = fovTxt;
-    if (ui.cov) ui.cov.textContent = coversStrict ? "COV: YES" : `COV: NO (IC ${icDiagTxt})`;
-    if (ui.ic) ui.ic.textContent = `IC: ${icDiagTxt} / ${icTargetTxt}`;
+    if (ui.cov) ui.cov.textContent = coversStrict ? "COV: YES" : `COV: NO (IC geo ${icDiagTxt})`;
+    if (ui.ic) ui.ic.textContent = `IC: geo ${icDiagTxt} / req ${icTargetTxt}${coversStrict ? " • clean" : " • clipped"}`;
 
     if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
     if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.covTop) ui.covTop.textContent = ui.cov?.textContent || (coversStrict ? "COV: YES" : "COV: NO");
-    if (ui.icTop) ui.icTop.textContent = ui.ic?.textContent || `IC: ${icDiagTxt} / ${icTargetTxt}`;
+    if (ui.icTop) ui.icTop.textContent = ui.ic?.textContent || `IC: geo ${icDiagTxt} / req ${icTargetTxt}`;
     if (ui.distTop) ui.distTop.textContent = ui.dist?.textContent || `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
 
     if (phys.hardFail && ui.footerWarn) {
@@ -2829,8 +2829,9 @@
       hardInvalid: phys.hardFail,
     });
 
-    // tiny extra: hard fail if NaNs
-    const score = Number.isFinite(meritRes.merit) ? meritRes.merit : 1e9;
+    // hard reject non-clean coverage so optimizer prefers truly usable designs
+    let score = Number.isFinite(meritRes.merit) ? meritRes.merit : 1e9;
+    if (!meritRes.breakdown?.coversStrict) score += 50_000_000;
 
     return {
       score,
@@ -2873,7 +2874,8 @@
       const tgt = ev?.breakdown?.imageCircleTarget;
       const icStr = Number.isFinite(ic) ? `${ic.toFixed(1)}mm` : "—";
       const tgtStr = Number.isFinite(tgt) ? `${tgt.toFixed(1)}mm` : "—";
-      return `IC ${icStr}/${tgtStr}`;
+      const clean = ev?.breakdown?.coversStrict ? "clean" : "clipped";
+      return `IC geo ${icStr}/req ${tgtStr} (${clean})`;
     };
 
     // annealing-ish
