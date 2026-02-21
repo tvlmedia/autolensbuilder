@@ -32,6 +32,7 @@
     bfl: $("#badgeBfl"),
     tstop: $("#badgeT"),
     vig: $("#badgeVig"),
+    dist: $("#badgeDist"),
     fov: $("#badgeFov"),
     cov: $("#badgeCov"),
     merit: $("#badgeMerit"),
@@ -44,6 +45,7 @@
     tstopTop: $("#badgeTTop"),
     fovTop: $("#badgeFovTop"),
     covTop: $("#badgeCovTop"),
+    distTop: $("#badgeDistTop"),
     meritTop: $("#badgeMeritTop"),
 
     sensorPreset: $("#sensorPreset"),
@@ -1060,6 +1062,23 @@
     return best;
   }
 
+  function usableCoverageFieldDeg(surfaces, wavePreset, sensorX, halfSizeMm, rayCount) {
+    let lo = 0, hi = 60, best = 0;
+    const nReq = Math.max(6, Math.floor(Math.max(9, rayCount | 0) * 0.78));
+    const maxVigFrac = 0.06;
+    for (let iter = 0; iter < 18; iter++) {
+      const mid = (lo + hi) * 0.5;
+      const pack = traceBundleAtField(surfaces, mid, Math.max(9, rayCount | 0), wavePreset, sensorX);
+      const chief = buildChiefRay(surfaces, mid);
+      const tr = traceRayForward(clone(chief), surfaces, wavePreset);
+      const y = tr?.endRay ? rayHitYAtX(tr.endRay, sensorX) : null;
+      const chiefInside = Number.isFinite(y) && Math.abs(y) <= halfSizeMm;
+      const ok = chiefInside && (pack.n || 0) >= nReq && (pack.vigFrac || 1) <= maxVigFrac;
+      if (ok) { best = mid; lo = mid; } else hi = mid;
+    }
+    return best;
+  }
+
   // -------------------- EFL/BFL (paraxial-ish) --------------------
   function lastPhysicalVertexX(surfaces) {
     let maxX = -Infinity;
@@ -1181,6 +1200,36 @@
     return Math.max(cur, min);
   }
 
+  function traceChiefImageHeight(surfaces, wavePreset, sensorX, fieldDeg) {
+    const chief = buildChiefRay(surfaces, fieldDeg);
+    const tr = traceRayForward(clone(chief), surfaces, wavePreset);
+    if (!tr || tr.vignetted || tr.tir || !tr.endRay) return null;
+    return rayHitYAtX(tr.endRay, sensorX);
+  }
+
+  function computeDistortionMetrics(surfaces, wavePreset, sensorX, efl, reqHalfFieldDeg, maxFieldDeg) {
+    if (!Number.isFinite(efl) || efl <= 0) return { edgePct: null, rmsPct: null, valid: 0 };
+    const lim = Math.max(0, Math.min(
+      Number.isFinite(reqHalfFieldDeg) ? reqHalfFieldDeg : 0,
+      Number.isFinite(maxFieldDeg) ? maxFieldDeg : reqHalfFieldDeg || 0
+    ));
+    if (!Number.isFinite(lim) || lim < 0.4) return { edgePct: null, rmsPct: null, valid: 0 };
+
+    const fields = [0.35 * lim, 0.70 * lim, 0.95 * lim].filter((v) => v > 0.05);
+    const vals = [];
+    for (const fa of fields) {
+      const y = traceChiefImageHeight(surfaces, wavePreset, sensorX, fa);
+      const yIdeal = efl * Math.tan((fa * Math.PI) / 180);
+      if (!Number.isFinite(y) || !Number.isFinite(yIdeal) || Math.abs(yIdeal) < 1e-6) continue;
+      const dPct = ((y - yIdeal) / yIdeal) * 100;
+      vals.push(dPct);
+    }
+    if (!vals.length) return { edgePct: null, rmsPct: null, valid: 0 };
+    const edgePct = vals[vals.length - 1];
+    const rmsPct = Math.sqrt(vals.reduce((a, b) => a + b * b, 0) / vals.length);
+    return { edgePct, rmsPct, valid: vals.length };
+  }
+
   function coversSensorYesNo({ fov, maxField, mode = "diag", marginDeg = 0.5 }) {
     if (!fov || !Number.isFinite(maxField)) return { ok: false, req: null };
     let req = null;
@@ -1281,6 +1330,9 @@
     lowValidPenalty: 450.0,
     hardInvalidPenalty: 1_000_000.0,
     covShortfallWeight: 180.0,
+    distTargetPct: 1.5,
+    distEdgeWeight: 2.1,
+    distRmsWeight: 1.1,
   };
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
@@ -1300,6 +1352,8 @@
     fov, maxField, covers, req,
     intrusion,
     efl, T, bfl,
+    distEdgePct = null,
+    distRmsPct = null,
     targetEfl = null,
     targetT = null,
     physPenalty = 0,
@@ -1351,6 +1405,15 @@
       merit += MERIT_CFG.intrusionWeight * (x * x);
     }
 
+    if (Number.isFinite(distEdgePct)) {
+      const x = Math.abs(distEdgePct) / Math.max(0.25, MERIT_CFG.distTargetPct);
+      merit += MERIT_CFG.distEdgeWeight * (x * x);
+    }
+    if (Number.isFinite(distRmsPct)) {
+      const x = Math.abs(distRmsPct) / Math.max(0.25, MERIT_CFG.distTargetPct);
+      merit += MERIT_CFG.distRmsWeight * (x * x);
+    }
+
     // BFL soft-constraint (paraxial) – helps keep designs physically plausible
     if (Number.isFinite(bfl) && bfl < MERIT_CFG.bflMin){
       const d = (MERIT_CFG.bflMin - bfl);
@@ -1384,6 +1447,8 @@
       fields: fields.map(v => Number.isFinite(v) ? v : 0),
       vigCenterPct: Math.round(vigCenter * 100),
       vigMidPct: Math.round(vigMid * 100),
+      distEdgePct: Number.isFinite(distEdgePct) ? distEdgePct : null,
+      distRmsPct: Number.isFinite(distRmsPct) ? distRmsPct : null,
       physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
       hardInvalid: !!hardInvalid,
     };
@@ -1886,11 +1951,14 @@
 
     const covMode = COVERAGE_CFG.mode;
     const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
-    const maxField = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, covHalfMm);
+    const maxFieldChief = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, covHalfMm);
+    const maxFieldUsable = usableCoverageFieldDeg(lens.surfaces, wavePreset, sensorX, covHalfMm, rayCount);
+    const maxField = Math.min(maxFieldChief, maxFieldUsable);
     const reqFloor = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
     const reqFromFov = coversSensorYesNo({ fov, maxField, mode: covMode, marginDeg: COVERAGE_CFG.marginDeg }).req;
     const req = Number.isFinite(reqFloor) ? reqFloor : reqFromFov;
     const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
+    const dist = computeDistortionMetrics(lens.surfaces, wavePreset, sensorX, efl, req, maxField);
 
     const covTxt = !fov
       ? "COV(D): —"
@@ -1908,6 +1976,8 @@
       fov, maxField, covers, req,
       intrusion,
       efl, T, bfl,
+      distEdgePct: dist.edgePct,
+      distRmsPct: dist.rmsPct,
       targetEfl: Number(ui.optTargetFL?.value || NaN),
       targetT: Number(ui.optTargetT?.value || NaN),
       physPenalty: phys.penalty,
@@ -1922,6 +1992,7 @@
       `(RMS0 ${bd.rmsCenter?.toFixed?.(3) ?? "—"}mm • RMSedge ${bd.rmsEdge?.toFixed?.(3) ?? "—"}mm • Vig ${bd.vigPct}%` +
       `${Number.isFinite(bd.vigCenterPct) ? ` • V0 ${bd.vigCenterPct}%` : ""}` +
       `${Number.isFinite(bd.vigMidPct) ? ` • Vmid ${bd.vigMidPct}%` : ""}` +
+      `${Number.isFinite(bd.distEdgePct) ? ` • DistE ${bd.distEdgePct.toFixed(2)}%` : ""}` +
       `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""}` +
       `${bd.physPenalty > 0 ? ` • PHYS +${bd.physPenalty.toFixed(1)}` : ""}` +
       `${bd.hardInvalid ? " • INVALID ❌" : ""})`;
@@ -1944,6 +2015,7 @@
     if (ui.bfl) ui.bfl.textContent = `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstop) ui.tstop.textContent = `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
     if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
+    if (ui.dist) ui.dist.textContent = `Dist: ${Number.isFinite(dist.edgePct) ? dist.edgePct.toFixed(2) + "%" : "—"}`;
     if (ui.fov) ui.fov.textContent = fovTxt;
     if (ui.cov) ui.cov.textContent = covers ? "COV: YES" : "COV: NO";
 
@@ -1952,6 +2024,7 @@
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.covTop) ui.covTop.textContent = ui.cov?.textContent || (covers ? "COV: YES" : "COV: NO");
+    if (ui.distTop) ui.distTop.textContent = ui.dist?.textContent || `Dist: ${Number.isFinite(dist.edgePct) ? dist.edgePct.toFixed(2) + "%" : "—"}`;
 
     if (phys.hardFail && ui.footerWarn) {
       ui.footerWarn.textContent =
@@ -2528,6 +2601,8 @@
           covers: false,
           intrusion: null,
           fields: [0, 0, 0],
+          distEdgePct: null,
+          distRmsPct: null,
           physPenalty: Number(phys.penalty || 0),
           hardInvalid: true,
         },
@@ -2546,9 +2621,12 @@
     const fov = computeFovDeg(efl, sensorW, sensorH);
     const covMode = COVERAGE_CFG.mode;
     const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
-    const maxField = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfMm);
+    const maxFieldChief = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfMm);
+    const maxFieldUsable = usableCoverageFieldDeg(surfaces, wavePreset, sensorX, covHalfMm, rayCount);
+    const maxField = Math.min(maxFieldChief, maxFieldUsable);
     const req = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
     const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
+    const dist = computeDistortionMetrics(surfaces, wavePreset, sensorX, efl, req, maxField);
 
     const rearVx = lastPhysicalVertexX(surfaces);
     const intrusion = rearVx - (-PL_FFD);
@@ -2561,6 +2639,8 @@
       fov, maxField, covers, req,
       intrusion,
       efl, T, bfl,
+      distEdgePct: dist.edgePct,
+      distRmsPct: dist.rmsPct,
       targetEfl,
       targetT,
       physPenalty: phys.penalty,
