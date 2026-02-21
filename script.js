@@ -1319,14 +1319,14 @@
     centerVigWeight: 20.0,
     midVigWeight: 10.0,
     covPenalty: 55.0,
-    intrusionWeight: 5.0,
+    intrusionWeight: 20.0,
     fieldWeights: [1.0, 1.5, 2.0],
 
     // target terms (optimizer uses these)
     eflWeight: 0.25,          // penalty per mm error (squared)
     tWeight: 18.0,            // penalty per T error (squared)
     bflMin: 52.0,             // for PL: discourage too-short backfocus
-    bflWeight: 2.5,
+    bflWeight: 14.0,
     lowValidPenalty: 28.0,
     hardInvalidPenalty: 650.0,
     covShortfallWeight: 26.0,
@@ -1334,6 +1334,12 @@
     distEdgeWeight: 1.2,
     distRmsWeight: 0.7,
     physPenaltyScale: 0.045,
+    eflBandFrac: 0.22,
+    eflBandWeight: 12.0,
+    tBandAbs: 1.15,
+    tBandWeight: 18.0,
+    intrusionHardMm: 0.75,
+    intrusionHardPenalty: 260.0,
   };
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
@@ -1404,6 +1410,10 @@
     if (Number.isFinite(intrusion) && intrusion > 0){
       const x = intrusion / 1.0;
       merit += MERIT_CFG.intrusionWeight * (x * x);
+      if (intrusion > MERIT_CFG.intrusionHardMm) {
+        const d = intrusion - MERIT_CFG.intrusionHardMm;
+        merit += MERIT_CFG.intrusionHardPenalty + 45.0 * d * d;
+      }
     }
 
     if (Number.isFinite(distEdgePct)) {
@@ -1425,10 +1435,19 @@
     if (Number.isFinite(targetEfl) && Number.isFinite(efl)){
       const d = (efl - targetEfl);
       merit += MERIT_CFG.eflWeight * (d * d);
+      const band = Math.max(3.0, Math.abs(targetEfl) * MERIT_CFG.eflBandFrac);
+      if (Math.abs(d) > band) {
+        const x = Math.abs(d) - band;
+        merit += MERIT_CFG.eflBandWeight * (x * x);
+      }
     }
     if (Number.isFinite(targetT) && Number.isFinite(T)){
       const d = (T - targetT);
       merit += MERIT_CFG.tWeight * (d * d);
+      if (Math.abs(d) > MERIT_CFG.tBandAbs) {
+        const x = Math.abs(d) - MERIT_CFG.tBandAbs;
+        merit += MERIT_CFG.tBandWeight * (x * x);
+      }
     }
 
     const minValidTarget = Math.max(7, Math.floor(rayCount * 0.45));
@@ -2574,23 +2593,27 @@
     const ims = surfaces[surfaces.length-1];
     if (ims && String(ims.type).toUpperCase()==="IMS") ims.ap = halfH;
 
-    // autofocus (lens shift)
-    const af = bestLensShiftForDesign(surfaces, fieldAngle, rayCount, wavePreset);
-    const lensShift = af.ok ? af.shift : 0;
+    // Keep optimizer evaluation in fixed mount geometry.
+    // Lens-shift autofocus can move designs behind the PL flange and break physical ranking.
+    const lensShift = 0;
 
     const sensorX = 0.0;
     computeVertices(surfaces, lensShift, sensorX);
     const phys = evaluatePhysicalConstraints(surfaces);
+    const rearVxPre = lastPhysicalVertexX(surfaces);
+    const intrusionPre = rearVxPre - (-PL_FFD);
+    const hardMountFail = Number.isFinite(intrusionPre) && intrusionPre > MERIT_CFG.intrusionHardMm;
 
-    if (phys.hardFail) {
-      const score = MERIT_CFG.hardInvalidPenalty + MERIT_CFG.physPenaltyScale * Math.max(0, Number(phys.penalty || 0));
+    if (phys.hardFail || hardMountFail) {
+      const mountPenalty = hardMountFail ? (MERIT_CFG.intrusionHardPenalty + 50 * Math.pow(intrusionPre - MERIT_CFG.intrusionHardMm, 2)) : 0;
+      const score = MERIT_CFG.hardInvalidPenalty + MERIT_CFG.physPenaltyScale * Math.max(0, Number(phys.penalty || 0)) + mountPenalty;
       return {
         score,
         efl: null,
         T: null,
         bfl: null,
         covers: false,
-        intrusion: 0,
+        intrusion: Number.isFinite(intrusionPre) ? intrusionPre : 0,
         vigFrac: 1,
         lensShift,
         rms0: null,
@@ -2604,7 +2627,7 @@
           fields: [0, 0, 0],
           distEdgePct: null,
           distRmsPct: null,
-          physPenalty: Number(phys.penalty || 0),
+          physPenalty: Number((phys.penalty || 0) + mountPenalty),
           hardInvalid: true,
         },
       };
@@ -2649,7 +2672,13 @@
     });
 
     // tiny extra: hard fail if NaNs
-    const score = Number.isFinite(meritRes.merit) ? meritRes.merit : 1e9;
+    let score = Number.isFinite(meritRes.merit) ? meritRes.merit : 1e9;
+    if (Number.isFinite(targetEfl) && Number.isFinite(efl) && targetEfl > 1) {
+      const lo = 0.6 * targetEfl;
+      const hi = 1.5 * targetEfl;
+      if (efl < lo) score += 220 + 9 * Math.pow(lo - efl, 2);
+      if (efl > hi) score += 220 + 9 * Math.pow(efl - hi, 2);
+    }
 
     return {
       score,
