@@ -405,6 +405,12 @@
     }
   }
 
+  function applySensorToIMSOnSurfaces(surfaces) {
+    const { halfH } = getSensorWH();
+    const ims = surfaces?.[surfaces.length - 1];
+    if (ims && String(ims.type).toUpperCase() === "IMS") ims.ap = halfH;
+  }
+
   function applyPreset(name) {
     const p = SENSOR_PRESETS[name] || SENSOR_PRESETS["ARRI Alexa Mini LF (LF)"];
     if (ui.sensorW) ui.sensorW.value = p.w.toFixed(2);
@@ -949,7 +955,6 @@
     const ys = [];
     for (const tr of traces) {
       if (!tr || tr.tir) continue;
-      // NOTE: include vignetted rays as "invalid"; we'll handle separately.
       if (tr.vignetted) continue;
       const y = rayHitYAtX(tr.endRay, sensorX);
       if (y == null) continue;
@@ -966,26 +971,23 @@
   const PL_LENS_LIP = 3.0;
 
   const FEAS = {
-    minAir: 0.20,        // mm
-    minGlass: 0.80,      // mm (center thickness)
-    minEdge: 0.20,       // mm (approx via nonOverlap logic)
-    minRadiusAbs: 6.0,   // mm (avoid insane curvature)
-    maxAp: 30.0,         // mm (semi-diameter)
-    maxTotalLen: 240.0,  // mm (front->PL + mount)
+    minAir: 0.20,
+    minGlass: 0.80,
+    minEdge: 0.20,
+    minRadiusAbs: 6.0,
+    maxAp: 30.0,
+    maxTotalLen: 240.0,
     maxSurfaces: 18,
-    // vignetting must be low for "clean cine" (hard threshold):
-    maxVigFracHard: 0.25, // 25% rays vignetted max, else hard fail
+    maxVigFracHard: 0.25,
   };
 
   function isFeasible(surfaces, sensorX, wavePreset, rayCount, halfH) {
     if (!Array.isArray(surfaces) || surfaces.length < 3) return { ok: false, reason: "No surfaces" };
     if (surfaces.length > FEAS.maxSurfaces) return { ok: false, reason: "Too many surfaces" };
 
-    // must have exactly one stop
     const st = findStopSurfaceIndex(surfaces);
     if (st < 0) return { ok: false, reason: "No STOP" };
 
-    // aperture sanity + radius sanity + thickness sanity
     for (let i = 0; i < surfaces.length; i++) {
       const s = surfaces[i];
       const t = String(s.type || "").toUpperCase();
@@ -1004,7 +1006,6 @@
       }
     }
 
-    // check thickness based on medium after surface
     for (let i = 0; i < surfaces.length - 1; i++) {
       const a = surfaces[i];
       const b = surfaces[i + 1];
@@ -1021,8 +1022,6 @@
       } else {
         if (gap < FEAS.minGlass) return { ok: false, reason: "Glass too thin" };
 
-        // rough overlap / edge thickness check for element body (only when next surface exists and is boundary)
-        // This is conservative: if surfaces overlap at apertures, reject.
         const apRegion = Math.max(0.01, Math.min(a.ap || 0, b.ap || 0, maxApForSurface(a), maxApForSurface(b)));
         if (Math.abs(a.R) > 1e-9 && Math.abs(b.R) > 1e-9) {
           const nonOverlap = maxNonOverlappingSemiDiameter(a, b, FEAS.minEdge);
@@ -1031,19 +1030,16 @@
       }
     }
 
-    // PL rear intrusion hard constraint
     const plX = -PL_FFD;
     const rearVx = lastPhysicalVertexX(surfaces);
     const intrusion = rearVx - plX;
     if (Number.isFinite(intrusion) && intrusion > 0) return { ok: false, reason: "Rear intrusion" };
 
-    // total length sanity (front->PL + mount)
     const frontVx = firstPhysicalVertexX(surfaces);
     const lenToFlange = plX - frontVx;
     const totalLen = lenToFlange + PL_LENS_LIP;
     if (Number.isFinite(totalLen) && totalLen > FEAS.maxTotalLen) return { ok: false, reason: "Too long" };
 
-    // vignetting hard threshold measured on center field only (fast)
     computeVertices(surfaces, 0, sensorX);
     const rays = buildRays(surfaces, 0, rayCount);
     const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
@@ -1051,23 +1047,22 @@
     const vigFrac = traces.length ? vCount / traces.length : 1;
     if (vigFrac > FEAS.maxVigFracHard) return { ok: false, reason: `Too much vignette (${Math.round(vigFrac*100)}%)` };
 
-    // coverage sanity (fast-ish)
     const maxField = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, halfH);
     if (!Number.isFinite(maxField) || maxField < 1.0) return { ok: false, reason: "No coverage" };
 
     return { ok: true, reason: "OK" };
   }
 
-  // -------------------- MERIT (soft objective, lower is better) --------------------
+  // -------------------- MERIT --------------------
   const MERIT = {
-    rmsNorm: 0.03,       // mm (tighter than before)
-    vigWeight: 80.0,     // strong (prevents vignette cheating)
-    covPenalty: 200.0,   // big if not covering sensor
-    tirPenalty: 200.0,   // any TIR hurts hard
-    rayDropPenalty: 400.0, // too few valid rays hurts hard
-    lengthWeight: 0.01,  // mild
-    stopApWeight: 0.002, // mild bias (avoid extreme stops)
-    fieldWeights: [1.0, 1.6, 2.3], // center->edge
+    rmsNorm: 0.03,
+    vigWeight: 80.0,
+    covPenalty: 200.0,
+    tirPenalty: 200.0,
+    rayDropPenalty: 400.0,
+    lengthWeight: 0.01,
+    stopApWeight: 0.002,
+    fieldWeights: [1.0, 1.6, 2.3],
   };
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
@@ -1080,13 +1075,7 @@
     return { traces, rms, n, vigFrac, vCount, tirCount };
   }
 
-  function computeMeritV2({
-    surfaces,
-    wavePreset,
-    sensorX,
-    rayCount,
-    sensorW, sensorH
-  }){
+  function computeMeritV2({ surfaces, wavePreset, sensorX, rayCount, sensorW, sensorH }){
     const { halfH } = getSensorWH();
     const { efl } = estimateEflBflParaxial(surfaces, wavePreset);
     const fov = computeFovDeg(efl, sensorW, sensorH);
@@ -1125,7 +1114,6 @@
     if (tirAny) merit += MERIT.tirPenalty;
     if (validMin < 9) merit += MERIT.rayDropPenalty;
 
-    // mild secondary terms: length + stop aperture sanity
     const plX = -PL_FFD;
     const frontVx = firstPhysicalVertexX(surfaces);
     const totalLen = (plX - frontVx) + PL_LENS_LIP;
@@ -1139,16 +1127,7 @@
 
     return {
       merit,
-      breakdown: {
-        efl,
-        maxField,
-        covers,
-        req,
-        rmsCenter,
-        rmsEdge,
-        vigPct: Math.round(vigAvg * 100),
-        fields
-      }
+      breakdown: { efl, maxField, covers, req, rmsCenter, rmsEdge, vigPct: Math.round(vigAvg * 100), fields }
     };
   }
 
@@ -1219,12 +1198,8 @@
     ctx.lineWidth = 1;
 
     const step = 80;
-    for (let x = 0; x <= w; x += step) {
-      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
-    }
-    for (let y = 0; y <= h; y += step) {
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
-    }
+    for (let x = 0; x <= w; x += step) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke(); }
+    for (let y = 0; y <= h; y += step) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
     ctx.restore();
   }
 
@@ -1260,9 +1235,7 @@
     ctx.beginPath();
     const p1 = worldToScreen({ x: -240, y: 0 }, world);
     const p2 = worldToScreen({ x: 800, y: 0 }, world);
-    ctx.moveTo(p1.x, p1.y);
-    ctx.lineTo(p2.x, p2.y);
-    ctx.stroke();
+    ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
     ctx.restore();
   }
 
@@ -1294,8 +1267,7 @@
       const p = worldToScreen(poly[i], world);
       ctx.lineTo(p.x, p.y);
     }
-    ctx.closePath();
-    ctx.fill();
+    ctx.closePath(); ctx.fill();
 
     ctx.lineWidth = 2;
     ctx.strokeStyle = "rgba(220,235,255,0.55)";
@@ -1345,10 +1317,7 @@
     if (Math.abs(s.R) < 1e-9) {
       const a = worldToScreen({ x: vx, y: -ap }, world);
       const b = worldToScreen({ x: vx, y: ap }, world);
-      ctx.beginPath();
-      ctx.moveTo(a.x, a.y);
-      ctx.lineTo(b.x, b.y);
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
       ctx.restore();
       return;
     }
@@ -1424,10 +1393,7 @@
     ctx.strokeStyle = "#b23b3b";
     const a = worldToScreen({ x: s.vx, y: -ap }, world);
     const b = worldToScreen({ x: s.vx, y: ap }, world);
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y);
-    ctx.lineTo(b.x, b.y);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     ctx.restore();
   }
 
@@ -1440,10 +1406,7 @@
 
     const a = worldToScreen({ x: sensorX, y: -halfH }, world);
     const b = worldToScreen({ x: sensorX, y: halfH }, world);
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y);
-    ctx.lineTo(b.x, b.y);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
 
     ctx.setLineDash([]);
     ctx.restore();
@@ -1463,10 +1426,7 @@
     const a = worldToScreen({ x: xFlange, y: -yWorld }, world);
     const b = worldToScreen({ x: xFlange, y: yWorld }, world);
 
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y);
-    ctx.lineTo(b.x, b.y);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
 
     ctx.setLineDash([]);
     ctx.restore();
@@ -1511,9 +1471,7 @@
     ctx.fillStyle = "rgba(255,255,255,.92)";
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
-    for (let i = 0; i < lines.length; i++) {
-      ctx.fillText(lines[i], padX, 6 + padY + i * lineH);
-    }
+    for (let i = 0; i < lines.length; i++) ctx.fillText(lines[i], padX, 6 + padY + i * lineH);
     ctx.restore();
   }
 
@@ -1584,12 +1542,9 @@
       ? `LEN≈ ${totalLen.toFixed(1)}mm (front→PL + mount)`
       : `LEN≈ —`;
 
-    // Merit + feasibility
     const feas = isFeasible(lens.surfaces, sensorX, wavePreset, rayCount, halfH);
     let meritRes = { merit: 1e9, breakdown: {} };
-    if (feas.ok) {
-      meritRes = computeMeritV2({ surfaces: lens.surfaces, wavePreset, sensorX, rayCount, sensorW, sensorH });
-    }
+    if (feas.ok) meritRes = computeMeritV2({ surfaces: lens.surfaces, wavePreset, sensorX, rayCount, sensorW, sensorH });
     const m = meritRes.merit;
     const bd = meritRes.breakdown;
 
@@ -1610,8 +1565,7 @@
     if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
-  if (ui.covTop) ui.covTop.textContent =
-  ui.cov?.textContent || (covers ? "COV: YES" : "COV: NO");
+    if (ui.covTop) ui.covTop.textContent = ui.cov?.textContent || (covers ? "COV: YES" : "COV: NO");
     if (ui.meritTop) ui.meritTop.textContent = feas.ok ? `Merit: ${m.toFixed(2)}` : `Merit: FAIL`;
 
     if (ui.footerWarn) {
@@ -1694,9 +1648,7 @@
   }
 
   // -------------------- editing actions --------------------
-  function getIMSIndex() {
-    return lens.surfaces.findIndex((s) => String(s.type).toUpperCase() === "IMS");
-  }
+  function getIMSIndex() { return lens.surfaces.findIndex((s) => String(s.type).toUpperCase() === "IMS"); }
 
   function safeInsertAtAfterSelected() {
     clampSelected();
@@ -1808,7 +1760,6 @@
     const factor = target / cur;
     if (!Number.isFinite(factor) || factor <= 0) return;
 
-    // scale all radii + thicknesses + apertures (except OBJ/IMS thickness locks)
     lens.surfaces.forEach((sf) => {
       const t = String(sf.type || "").toUpperCase();
       if (t !== "OBJ" && t !== "IMS") {
@@ -1847,7 +1798,6 @@
   }
 
   // -------------------- OPTIMIZER --------------------
-  // Strategy: random + anneal, with feasibility hard-gates.
   const OPT = {
     running: false,
     iter: 0,
@@ -1855,15 +1805,20 @@
     temperature: 1.0,
     cool: 0.9992,
 
-    best: null,           // { lens, merit, breakdown }
-    bestApplied: false,
-    mode: "safe",         // safe|wild
-    targetEfl: null,      // optional
-    targetT: null,        // optional
+    best: null,
+    mode: "safe",
+    targetEfl: null,
+    targetT: null,
   };
 
+  function optLog(msg) {
+    if (!ui.optLog) return;
+    const s = String(msg || "");
+    ui.optLog.value += (ui.optLog.value ? "\n" : "") + s;
+    ui.optLog.scrollTop = ui.optLog.scrollHeight;
+  }
+
   function ensureOptimizerUI() {
-    // Add toolbar buttons if not present in index.html
     if (!ui.toolbar) return;
 
     const mkBtn = (id, label, cls="btn") => {
@@ -1878,7 +1833,6 @@
       return b;
     };
 
-    // Add separator
     const maybeSep = () => {
       const d = document.createElement("div");
       d.className = "sep";
@@ -1886,7 +1840,6 @@
       ui.toolbar.appendChild(d);
     };
 
-    // if already has optimize buttons, do nothing
     if (!$("#btnOptimize")) {
       maybeSep();
       mkBtn("btnOptimize", "Optimize", "btn btnPrimary");
@@ -1895,7 +1848,6 @@
       mkBtn("btnBench", "Bench", "btn");
     }
 
-    // Inject a tiny optimizer panel in the left controls (optional)
     if (!$("#optPanel") && ui.leftScroll) {
       const wrap = document.createElement("section");
       wrap.id = "optPanel";
@@ -1923,15 +1875,15 @@
             <input id="optTargetT" type="number" step="0.05" placeholder="e.g. 2.0" />
           </div>
         </div>
-        <div class="hint" id="optReadout" style="margin-top:8px;">
-          Optimizer idle.
+        <div class="hint" id="optReadout" style="margin-top:8px;">Optimizer idle.</div>
+        <div class="ctrl" style="margin-top:10px;">
+          <label for="optLog">Optimizer log</label>
+          <textarea id="optLog" rows="7" spellcheck="false" style="width:100%; resize:vertical;"></textarea>
         </div>
       `;
-      // put it near top of leftScroll
       ui.leftScroll.prepend(wrap);
     }
 
-    // refresh ui refs
     ui.btnOptimize = $("#btnOptimize");
     ui.btnOptStop = $("#btnOptStop");
     ui.btnApplyBest = $("#btnApplyBest");
@@ -1941,11 +1893,12 @@
     ui.optTargetEfl = $("#optTargetEfl");
     ui.optTargetT = $("#optTargetT");
     ui.optReadout = $("#optReadout");
+    ui.optLog = $("#optLog");
   }
 
   function scoreCurrentForOptimizer() {
     const wavePreset = ui.wavePreset?.value || "d";
-    const rayCount = Math.max(21, Math.min(61, Number(ui.rayCount?.value || 31))); // stable
+    const rayCount = Math.max(21, Math.min(61, Number(ui.rayCount?.value || 31)));
     const focusMode = String(ui.focusMode?.value || "cam").toLowerCase();
     const sensorX = (focusMode === "cam") ? Number(ui.sensorOffset?.value || 0) : 0.0;
 
@@ -1957,16 +1910,15 @@
 
     const mr = computeMeritV2({ surfaces: lens.surfaces, wavePreset, sensorX, rayCount, sensorW, sensorH });
 
-    // optional target penalties
     let extra = 0;
     if (Number.isFinite(OPT.targetEfl) && Number.isFinite(mr.breakdown.efl)) {
-      const d = (mr.breakdown.efl - OPT.targetEfl) / 1.0; // 1mm units
+      const d = (mr.breakdown.efl - OPT.targetEfl) / 1.0;
       extra += 0.8 * d * d;
     }
     if (Number.isFinite(OPT.targetT)) {
       const T = estimateTStopApprox(mr.breakdown.efl, lens.surfaces);
       if (Number.isFinite(T)) {
-        const d = (T - OPT.targetT) / 0.05; // 0.05 stop units
+        const d = (T - OPT.targetT) / 0.05;
         extra += 0.25 * d * d;
       }
     }
@@ -1975,11 +1927,9 @@
   }
 
   function mutateLensInPlace(surfaces, mode="safe") {
-    // Mutate parameters while preserving OBJ/IMS locks and single STOP.
     const n = surfaces.length;
     if (n < 3) return;
 
-    // pick a mutable index
     const candidates = [];
     for (let i = 0; i < n; i++) {
       const t = String(surfaces[i].type || "").toUpperCase();
@@ -1992,31 +1942,24 @@
     const s = surfaces[i];
     const t = String(s.type || "").toUpperCase();
 
-    // Safe = small nudges; Wild = bigger + glass swaps + occasional stop move
-    const ampR = (mode === "wild") ? 0.22 : 0.08; // relative
-    const ampT = (mode === "wild") ? 0.28 : 0.10; // relative
-    const ampAp= (mode === "wild") ? 0.18 : 0.08; // relative
+    const ampR = (mode === "wild") ? 0.22 : 0.08;
+    const ampT = (mode === "wild") ? 0.28 : 0.10;
+    const ampAp= (mode === "wild") ? 0.18 : 0.08;
 
-    // mutate R
     if (Math.random() < 0.60 && Math.abs(s.R) > 1e-9) {
       const f = 1 + randf(-ampR, ampR);
       s.R *= f;
-      // keep away from tiny radii
       if (Math.abs(s.R) < FEAS.minRadiusAbs) s.R = Math.sign(s.R) * FEAS.minRadiusAbs;
     } else if (Math.random() < 0.10) {
-      // sometimes flip curvature
       s.R = -s.R;
     }
 
-    // mutate thickness (not for IMS/OBJ already excluded)
     if (Math.random() < 0.70) {
       const f = 1 + randf(-ampT, ampT);
       s.t *= f;
-      // clamp by medium kind later in feasibility; but keep >0 now
       s.t = Math.max(0.05, s.t);
     }
 
-    // mutate aperture (but keep not insane)
     if (Math.random() < 0.55 && t !== "STOP") {
       const f = 1 + randf(-ampAp, ampAp);
       s.ap *= f;
@@ -2027,22 +1970,16 @@
       s.ap = clamp(s.ap, AP_MIN, FEAS.maxAp);
     }
 
-    // glass swap (avoid AIR for element bodies)
     if (Math.random() < (mode === "wild" ? 0.25 : 0.08)) {
+      const glassPool = Object.keys(GLASS_DB).filter(g => g !== "AIR");
       if (String(s.glass || "AIR").toUpperCase() !== "AIR") {
-        const glassPool = Object.keys(GLASS_DB).filter(g => g !== "AIR");
         s.glass = choice(glassPool);
-      } else {
-        // If it's an AIR medium surface, sometimes turn it into glass (create element segment)
-        if (Math.random() < 0.35) {
-          const glassPool = Object.keys(GLASS_DB).filter(g => g !== "AIR");
-          s.glass = choice(glassPool);
-          s.t = Math.max(s.t, FEAS.minGlass);
-        }
+      } else if (Math.random() < 0.35) {
+        s.glass = choice(glassPool);
+        s.t = Math.max(s.t, FEAS.minGlass);
       }
     }
 
-    // Occasionally move STOP (wild only): pick another surface
     if (mode === "wild" && Math.random() < 0.04) {
       const stopCandidates = candidates.filter(j => {
         const tt = String(surfaces[j].type || "").toUpperCase();
@@ -2052,13 +1989,10 @@
         const newStopIdx = choice(stopCandidates);
         surfaces.forEach(ss => ss.stop = false);
         surfaces[newStopIdx].stop = true;
-        if (String(surfaces[newStopIdx].type || "").toUpperCase() !== "STOP") {
-          surfaces[newStopIdx].type = "STOP";
-        }
+        if (String(surfaces[newStopIdx].type || "").toUpperCase() !== "STOP") surfaces[newStopIdx].type = "STOP";
       }
     }
 
-    // Rare structural move (wild only): insert/remove an AIR spacer surface near middle
     if (mode === "wild" && Math.random() < 0.02 && surfaces.length < FEAS.maxSurfaces) {
       const imsIdx = surfaces.findIndex(ss => String(ss.type).toUpperCase() === "IMS");
       const at = clamp(randi(2, Math.max(2, imsIdx - 1)), 1, Math.max(1, imsIdx));
@@ -2070,7 +2004,6 @@
       if (tt !== "OBJ" && tt !== "IMS") surfaces.splice(rem, 1);
     }
 
-    // normalize types
     surfaces.forEach((sf, idx) => { if (!sf.type || !String(sf.type).trim()) sf.type = String(idx); });
     surfaces[0].type = "OBJ";
     surfaces[surfaces.length - 1].type = "IMS";
@@ -2089,32 +2022,27 @@
     if (!Number.isFinite(OPT.targetEfl)) OPT.targetEfl = null;
     if (!Number.isFinite(OPT.targetT)) OPT.targetT = null;
 
-    // establish current as best baseline
     const baseline = scoreCurrentForOptimizer();
-    OPT.best = {
-      lens: clone(lens),
-      merit: baseline.merit,
-      breakdown: baseline.breakdown,
-      feas: baseline.feas
-    };
+    OPT.best = { lens: clone(lens), merit: baseline.merit, breakdown: baseline.breakdown, feas: baseline.feas };
+
+    if (ui.optLog) ui.optLog.value = "";
+    optLog(`start | mode=${OPT.mode} | targetEFL=${OPT.targetEfl ?? "—"} | targetT=${OPT.targetT ?? "—"}`);
+    optLog(`baseline merit=${Number.isFinite(baseline.merit) ? baseline.merit.toFixed(2) : "—"} | feas=${baseline.feas.ok ? "OK" : "FAIL"} ${baseline.feas.reason ?? ""}`);
 
     toast("Optimizer started");
     optimizerTick();
   }
 
-  function optimizerStop() {
-    OPT.running = false;
-    toast("Optimizer stopped");
-  }
+  function optimizerStop() { OPT.running = false; toast("Optimizer stopped"); optLog("stop"); }
 
   function optimizerApplyBest() {
     if (!OPT.best?.lens) return toast("No best yet");
     loadLens(OPT.best.lens);
     toast(`Applied best (Merit ${Number.isFinite(OPT.best.merit) ? OPT.best.merit.toFixed(2) : "—"})`);
+    optLog(`apply best merit=${Number.isFinite(OPT.best.merit) ? OPT.best.merit.toFixed(2) : "—"}`);
   }
 
   function optimizerBench() {
-    // quick local benchmark: evaluate N random small mutations, report acceptance & speed-like info (no time estimates)
     const N = 200;
     const wavePreset = ui.wavePreset?.value || "d";
     const rayCount = Math.max(21, Math.min(61, Number(ui.rayCount?.value || 31)));
@@ -2130,7 +2058,9 @@
     for (let k = 0; k < N; k++) {
       const cand = clone(base);
       mutateLensInPlace(cand.surfaces, "safe");
+      applySensorToIMSOnSurfaces(cand.surfaces);
       cand.surfaces = sanitizeLens(cand).surfaces;
+      clampAllApertures(cand.surfaces);
 
       computeVertices(cand.surfaces, 0, sensorX);
       const feas = isFeasible(cand.surfaces, sensorX, wavePreset, rayCount, halfH);
@@ -2142,6 +2072,7 @@
     }
 
     toast(`Bench: ok ${ok}/${N} • fail ${fail} • best merit ${Number.isFinite(bestM) ? bestM.toFixed(2) : "—"}`);
+    optLog(`bench ok=${ok}/${N} fail=${fail} best=${Number.isFinite(bestM) ? bestM.toFixed(2) : "—"}`);
   }
 
   function optimizerTick() {
@@ -2157,23 +2088,17 @@
     const sensorX = (focusMode === "cam") ? Number(ui.sensorOffset?.value || 0) : 0.0;
     const { w: sensorW, h: sensorH, halfH } = getSensorWH();
 
-    // current state in optimizer space
-    let curLens = clone(lens);
     let curScore = scoreCurrentForOptimizer();
-
-    // if current is infeasible, we start from best if feasible
     if (!curScore.feas.ok && OPT.best?.feas?.ok) {
-      curLens = clone(OPT.best.lens);
-      lens = sanitizeLens(curLens);
+      lens = sanitizeLens(OPT.best.lens);
       buildTable();
       renderAll();
       curScore = scoreCurrentForOptimizer();
+      optLog(`reset to best (current infeasible)`);
     }
 
     const startMerit = curScore.merit;
-
-    let accepted = 0;
-    let improved = 0;
+    let accepted = 0, improved = 0, fails = 0;
 
     for (let step = 0; step < OPT.chunk; step++) {
       if (!OPT.running) break;
@@ -2183,27 +2108,26 @@
 
       const cand = clone(lens);
       mutateLensInPlace(cand.surfaces, OPT.mode);
+      applySensorToIMSOnSurfaces(cand.surfaces);
       const candSan = sanitizeLens(cand);
-      cand.surfaces = candSan.surfaces;
-      clampAllApertures(cand.surfaces);
-      applySensorToIMS(); // keep IMS ap consistent with UI sensor
+      candSan.surfaces = candSan.surfaces;
+      clampAllApertures(candSan.surfaces);
 
-      // evaluate candidate
-      computeVertices(cand.surfaces, 0, sensorX);
-      const feas = isFeasible(cand.surfaces, sensorX, wavePreset, rayCount, halfH);
+      computeVertices(candSan.surfaces, 0, sensorX);
+      const feas = isFeasible(candSan.surfaces, sensorX, wavePreset, rayCount, halfH);
       let candMerit = 1e9;
       let candBreakdown = { reason: feas.reason };
+
       if (feas.ok) {
-        const mr = computeMeritV2({ surfaces: cand.surfaces, wavePreset, sensorX, rayCount, sensorW, sensorH });
+        const mr = computeMeritV2({ surfaces: candSan.surfaces, wavePreset, sensorX, rayCount, sensorW, sensorH });
         candMerit = mr.merit;
 
-        // optional target penalties
         if (Number.isFinite(OPT.targetEfl) && Number.isFinite(mr.breakdown.efl)) {
           const d = (mr.breakdown.efl - OPT.targetEfl) / 1.0;
           candMerit += 0.8 * d * d;
         }
         if (Number.isFinite(OPT.targetT)) {
-          const T = estimateTStopApprox(mr.breakdown.efl, cand.surfaces);
+          const T = estimateTStopApprox(mr.breakdown.efl, candSan.surfaces);
           if (Number.isFinite(T)) {
             const d = (T - OPT.targetT) / 0.05;
             candMerit += 0.25 * d * d;
@@ -2211,49 +2135,47 @@
         }
 
         candBreakdown = mr.breakdown;
+      } else {
+        fails++;
       }
 
       const curM = curScore.merit;
       const dM = candMerit - curM;
 
-      // Metropolis acceptance
       const Ttemp = Math.max(1e-6, OPT.temperature);
       const accept = (dM <= 0) || (Math.random() < Math.exp(-dM / (Ttemp)));
       OPT.temperature *= OPT.cool;
 
       if (accept) {
-        // commit candidate to live lens
         lens = candSan;
         curScore = { merit: candMerit, feas, breakdown: candBreakdown };
         accepted++;
-
         if (candMerit < curM) improved++;
 
-        // update global best
         if (feas.ok && candMerit < (OPT.best?.merit ?? Infinity)) {
           OPT.best = { lens: clone(lens), merit: candMerit, breakdown: candBreakdown, feas };
+          optLog(`new best @iter ${OPT.iter}: ${candMerit.toFixed(2)} | EFL ${candBreakdown.efl?.toFixed?.(2) ?? "—"} | Vig ${candBreakdown.vigPct ?? "—"}%`);
         }
       }
     }
 
-    // update UI lightly
     buildTable();
     renderAll();
 
     if (ui.optReadout) {
-      const bestTxt = OPT.best?.feas?.ok
-        ? `best ${OPT.best.merit.toFixed(2)}`
-        : `best —`;
-
+      const bestTxt = OPT.best?.feas?.ok ? `best ${OPT.best.merit.toFixed(2)}` : `best —`;
       ui.optReadout.textContent =
-        `Optimize | iter ${OPT.iter}/${itersHint} | mode ${OPT.mode} | start ${Number.isFinite(startMerit) ? startMerit.toFixed(2) : "—"} | now ${Number.isFinite(curScore.merit) ? curScore.merit.toFixed(2) : "—"} | ${bestTxt} | acc ${accepted} | imp ${improved}`;
+        `Optimize | iter ${OPT.iter}/${itersHint} | mode ${OPT.mode} | start ${Number.isFinite(startMerit) ? startMerit.toFixed(2) : "—"} | now ${Number.isFinite(curScore.merit) ? curScore.merit.toFixed(2) : "—"} | ${bestTxt} | acc ${accepted} | imp ${improved} | fail ${fails}`;
+    }
+
+    if (OPT.iter % (OPT.chunk * 6) === 0) {
+      optLog(`iter ${OPT.iter}: now ${Number.isFinite(curScore.merit) ? curScore.merit.toFixed(2) : "—"} | acc ${accepted} | imp ${improved} | fail ${fails}`);
     }
 
     if (OPT.running) requestAnimationFrame(optimizerTick);
-    else toast("Optimizer finished");
+    else { toast("Optimizer finished"); optLog("finished"); }
   }
 
-  // -------------------- wire optimizer events --------------------
   function wireOptimizerButtons() {
     ensureOptimizerUI();
     ui.btnOptimize?.addEventListener("click", optimizerStart);
@@ -2311,7 +2233,6 @@
   function boot() {
     wireUI();
 
-    // Force top on boot (page + internal scroll pane)
     window.scrollTo(0, 0);
     ui.leftScroll?.scrollTo(0, 0);
     setTimeout(() => ui.leftScroll?.scrollTo(0, 0), 0);
