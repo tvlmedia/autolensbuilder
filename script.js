@@ -1315,24 +1315,25 @@
   // Lower = better.
   const MERIT_CFG = {
     rmsNorm: 0.05,            // 0.05mm RMS = "ok" baseline
-    vigWeight: 16.0,
-    centerVigWeight: 180.0,
-    midVigWeight: 60.0,
-    covPenalty: 180.0,
-    intrusionWeight: 16.0,
+    vigWeight: 4.5,
+    centerVigWeight: 20.0,
+    midVigWeight: 10.0,
+    covPenalty: 55.0,
+    intrusionWeight: 5.0,
     fieldWeights: [1.0, 1.5, 2.0],
 
     // target terms (optimizer uses these)
-    eflWeight: 0.35,          // penalty per mm error (squared)
-    tWeight: 10.0,            // penalty per T error (squared)
+    eflWeight: 0.25,          // penalty per mm error (squared)
+    tWeight: 18.0,            // penalty per T error (squared)
     bflMin: 52.0,             // for PL: discourage too-short backfocus
-    bflWeight: 6.0,
-    lowValidPenalty: 450.0,
-    hardInvalidPenalty: 1_000_000.0,
-    covShortfallWeight: 180.0,
-    distTargetPct: 1.5,
-    distEdgeWeight: 2.1,
-    distRmsWeight: 1.1,
+    bflWeight: 2.5,
+    lowValidPenalty: 28.0,
+    hardInvalidPenalty: 650.0,
+    covShortfallWeight: 26.0,
+    distTargetPct: 2.0,
+    distEdgeWeight: 1.2,
+    distRmsWeight: 0.7,
+    physPenaltyScale: 0.045,
   };
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
@@ -1433,10 +1434,10 @@
     const minValidTarget = Math.max(7, Math.floor(rayCount * 0.45));
     if (validMin < minValidTarget) {
       const d = (minValidTarget - validMin);
-      merit += MERIT_CFG.lowValidPenalty + 32.0 * d * d;
+      merit += MERIT_CFG.lowValidPenalty + 4.0 * d * d;
     }
 
-    if (Number.isFinite(physPenalty) && physPenalty > 0) merit += physPenalty;
+    if (Number.isFinite(physPenalty) && physPenalty > 0) merit += MERIT_CFG.physPenaltyScale * physPenalty;
     if (hardInvalid) merit += MERIT_CFG.hardInvalidPenalty;
 
     const breakdown = {
@@ -2532,7 +2533,7 @@
         ss.t = clamp(Number(ss.t||0) * (1 + d), PHYS_CFG.minThickness, 42);
       } else if (choice < 0.88){
         // aperture tweak
-        const scale = mode === "wild" ? 0.45 : 0.20;
+        const scale = ss.stop ? (mode === "wild" ? 0.65 : 0.32) : (mode === "wild" ? 0.45 : 0.20);
         const d = randn() * scale;
         ss.ap = clamp(Number(ss.ap||0) * (1 + d), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
       } else {
@@ -2582,7 +2583,7 @@
     const phys = evaluatePhysicalConstraints(surfaces);
 
     if (phys.hardFail) {
-      const score = MERIT_CFG.hardInvalidPenalty + Math.max(0, Number(phys.penalty || 0));
+      const score = MERIT_CFG.hardInvalidPenalty + MERIT_CFG.physPenaltyScale * Math.max(0, Number(phys.penalty || 0));
       return {
         score,
         efl: null,
@@ -2687,9 +2688,10 @@
     let curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
 
-    // annealing-ish
-    let temp0 = mode === "wild" ? 3.5 : 1.8;
-    let temp1 = mode === "wild" ? 0.25 : 0.12;
+    // annealing-ish (adaptive to current score scale)
+    const scoreScale = Math.max(1.0, Math.sqrt(Math.max(1.0, curEval.score || 1)));
+    let temp0 = (mode === "wild" ? 2.4 : 1.35) * scoreScale;
+    let temp1 = (mode === "wild" ? 0.16 : 0.08) * scoreScale;
 
     const tStart = performance.now();
 
