@@ -704,7 +704,7 @@
   }
 
   const PHYS_CFG = {
-    minAirGap: 0.06,
+    minAirGap: 0.22,
     minGlassCT: 0.35,
     minRadius: 8.0,
     minAperture: 1.2,
@@ -721,6 +721,8 @@
     pinchWeight: 220.0,
     stopOversizeWeight: 240.0,
     stopTooTinyWeight: 200.0,
+    minAirGapsPreferred: 3,
+    tooFewAirGapsWeight: 260.0,
   };
 
   function minGapBetweenSurfaces(sFront, sBack, yMax, samples = 11) {
@@ -744,6 +746,7 @@
     let hardFail = false;
     let worstOverlap = 0;
     let worstPinch = 0;
+    let airGapCount = 0;
 
     const stopIdx = findStopSurfaceIndex(surfaces);
     const stopAp = stopIdx >= 0 ? Math.max(0.1, Number(surfaces[stopIdx]?.ap || 0)) : null;
@@ -814,6 +817,7 @@
       const apShared = Math.max(0.1, Math.min(Number(sA.ap || 0), Number(sB.ap || 0), maxApForSurface(sA), maxApForSurface(sB)));
       const minGap = minGapBetweenSurfaces(sA, sB, apShared, 13);
       const mediumAfterA = String(sA.glass || "AIR").toUpperCase();
+      if (mediumAfterA === "AIR") airGapCount++;
       const required = mediumAfterA === "AIR" ? PHYS_CFG.minAirGap : PHYS_CFG.minGlassCT;
 
       if (!Number.isFinite(minGap)) {
@@ -876,7 +880,12 @@
       }
     }
 
-    return { penalty, hardFail, worstOverlap, worstPinch };
+    if (airGapCount < PHYS_CFG.minAirGapsPreferred) {
+      const d = PHYS_CFG.minAirGapsPreferred - airGapCount;
+      penalty += PHYS_CFG.tooFewAirGapsWeight * d * d;
+    }
+
+    return { penalty, hardFail, worstOverlap, worstPinch, airGapCount };
   }
 
   // -------------------- tracing --------------------
@@ -1084,6 +1093,43 @@
     return { hfov: rad2deg(hfov), vfov: rad2deg(vfov), dfov: rad2deg(dfov) };
   }
 
+  const COVERAGE_CFG = {
+    mode: "d",              // evaluate in diagonal plane
+    marginDeg: 0.5,
+    minSensorW: 36.0,       // always at least full-frame
+    minSensorH: 24.0,
+  };
+
+  function requiredHalfFieldDeg(efl, sensorW, sensorH, mode = "d") {
+    const fov = computeFovDeg(efl, sensorW, sensorH);
+    if (!fov) return null;
+    if (mode === "h") return fov.hfov * 0.5;
+    if (mode === "v") return fov.vfov * 0.5;
+    return fov.dfov * 0.5;
+  }
+
+  function coverageRequirementDeg(efl, sensorW, sensorH, mode = "d") {
+    const reqCur = requiredHalfFieldDeg(efl, sensorW, sensorH, mode);
+    const reqMin = requiredHalfFieldDeg(efl, COVERAGE_CFG.minSensorW, COVERAGE_CFG.minSensorH, mode);
+    if (!Number.isFinite(reqCur) && !Number.isFinite(reqMin)) return null;
+    if (!Number.isFinite(reqCur)) return reqMin;
+    if (!Number.isFinite(reqMin)) return reqCur;
+    return Math.max(reqCur, reqMin);
+  }
+
+  function coverageHalfSizeMm(sensorW, sensorH, mode = "d") {
+    if (mode === "h") return Math.max(0.1, sensorW * 0.5);
+    if (mode === "v") return Math.max(0.1, sensorH * 0.5);
+    const d = Math.hypot(sensorW, sensorH);
+    return Math.max(0.1, d * 0.5);
+  }
+
+  function coverageHalfSizeWithFloorMm(sensorW, sensorH, mode = "d") {
+    const cur = coverageHalfSizeMm(sensorW, sensorH, mode);
+    const min = coverageHalfSizeMm(COVERAGE_CFG.minSensorW, COVERAGE_CFG.minSensorH, mode);
+    return Math.max(cur, min);
+  }
+
   function coversSensorYesNo({ fov, maxField, mode = "diag", marginDeg = 0.5 }) {
     if (!fov || !Number.isFinite(maxField)) return { ok: false, req: null };
     let req = null;
@@ -1183,6 +1229,7 @@
     bflWeight: 6.0,
     lowValidPenalty: 450.0,
     hardInvalidPenalty: 1_000_000.0,
+    covShortfallWeight: 180.0,
   };
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
@@ -1243,6 +1290,10 @@
     merit += MERIT_CFG.centerVigWeight * (vigCenter * vigCenter);
     merit += MERIT_CFG.midVigWeight * (vigMid * vigMid);
     if (!covers) merit += MERIT_CFG.covPenalty;
+    if (Number.isFinite(req) && Number.isFinite(maxField) && maxField < req) {
+      const d = req - maxField;
+      merit += MERIT_CFG.covShortfallWeight * (d * d);
+    }
 
     if (Number.isFinite(intrusion) && intrusion > 0){
       const x = intrusion / 1.0;
@@ -1782,13 +1833,17 @@
       ? "FOV: —"
       : `FOV: H ${fov.hfov.toFixed(1)}° • V ${fov.vfov.toFixed(1)}° • D ${fov.dfov.toFixed(1)}°`;
 
-    const maxField = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, halfH);
-    const covMode = "v";
-    const { ok: covers, req } = coversSensorYesNo({ fov, maxField, mode: covMode, marginDeg: 0.5 });
+    const covMode = COVERAGE_CFG.mode;
+    const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
+    const maxField = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, covHalfMm);
+    const reqFloor = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
+    const reqFromFov = coversSensorYesNo({ fov, maxField, mode: covMode, marginDeg: COVERAGE_CFG.marginDeg }).req;
+    const req = Number.isFinite(reqFloor) ? reqFloor : reqFromFov;
+    const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
 
     const covTxt = !fov
-      ? "COV(V): —"
-      : `COV(V): ±${maxField.toFixed(1)}° • REQ(V): ${(req ?? 0).toFixed(1)}° • ${covers ? "COVERS ✅" : "NO ❌"}`;
+      ? "COV(D): —"
+      : `COV(D): ±${maxField.toFixed(1)}° • REQ(D): ${(req ?? 0).toFixed(1)}° • ${covers ? "COVERS ✅" : "NO ❌"}`;
 
     const rearVx = lastPhysicalVertexX(lens.surfaces);
     const intrusion = rearVx - plX;
@@ -1850,6 +1905,9 @@
     if (phys.hardFail && ui.footerWarn) {
       ui.footerWarn.textContent =
         `INVALID geometry: overlap/clearance issue (overlap ${phys.worstOverlap.toFixed(2)}mm, pinch ${phys.worstPinch.toFixed(2)}mm).`;
+    } else if (phys.airGapCount < PHYS_CFG.minAirGapsPreferred && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `Few air gaps (${phys.airGapCount}); aim for >= ${PHYS_CFG.minAirGapsPreferred} for practical designs.`;
     } else if (tirCount > 0 && ui.footerWarn) {
       ui.footerWarn.textContent = `TIR on ${tirCount} rays (check glass / curvature).`;
     }
@@ -2343,7 +2401,7 @@
     const surfaces = tmp.surfaces;
 
     // IMS ap = half height
-    const halfH = Math.max(0.1, sensorH*0.5);
+    const halfH = Math.max(0.1, sensorH * 0.5);
     const ims = surfaces[surfaces.length-1];
     if (ims && String(ims.type).toUpperCase()==="IMS") ims.ap = halfH;
 
@@ -2391,8 +2449,11 @@
     const T = estimateTStopApprox(efl, surfaces);
 
     const fov = computeFovDeg(efl, sensorW, sensorH);
-    const maxField = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, halfH);
-    const { ok: covers, req } = coversSensorYesNo({ fov, maxField, mode: "v", marginDeg: 0.5 });
+    const covMode = COVERAGE_CFG.mode;
+    const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
+    const maxField = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfMm);
+    const req = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
+    const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
 
     const rearVx = lastPhysicalVertexX(surfaces);
     const intrusion = rearVx - (-PL_FFD);
