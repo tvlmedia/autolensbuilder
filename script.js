@@ -1162,8 +1162,9 @@
   };
   const IMAGE_CIRCLE_CFG = {
     minDiagMm: 45.0,        // full-frame coverage floor with small margin
-    maxReqVigFrac: 0.10,    // max vignette fraction at required edge field
-    minReqValidFrac: 0.62,  // minimum valid traced ray fraction at required edge field
+    maxReqVigFrac: 0.02,    // max vignette fraction at required edge field (strict)
+    minReqValidFrac: 0.90,  // minimum valid traced ray fraction at required edge field (strict)
+    bundleSearchIters: 12,
   };
 
   function halfFieldFromDiagDeg(efl, diagMm) {
@@ -1213,6 +1214,34 @@
     if (mode === "d") return Math.max(cur, 0.5 * IMAGE_CIRCLE_CFG.minDiagMm);
     const min = coverageHalfSizeMm(COVERAGE_CFG.minSensorW, COVERAGE_CFG.minSensorH, mode);
     return Math.max(cur, min);
+  }
+
+  // Conservative field limit: require bundle quality (not just chief ray)
+  function coverageTestMaxFieldBundleDeg(
+    surfaces,
+    wavePreset,
+    sensorX,
+    rayCount,
+    maxVigFrac = IMAGE_CIRCLE_CFG.maxReqVigFrac,
+    minValidFrac = IMAGE_CIRCLE_CFG.minReqValidFrac,
+  ) {
+    const nRays = Math.max(9, Math.min(81, rayCount | 0));
+    let lo = 0, hi = 60, best = 0;
+    const iters = Math.max(8, Math.min(20, IMAGE_CIRCLE_CFG.bundleSearchIters | 0));
+    for (let i = 0; i < iters; i++) {
+      const mid = 0.5 * (lo + hi);
+      const pack = traceBundleAtField(surfaces, mid, nRays, wavePreset, sensorX);
+      const vigFrac = Number.isFinite(pack?.vigFrac) ? pack.vigFrac : 1;
+      const validFrac = (pack?.n || 0) / Math.max(1, nRays);
+      const ok = (vigFrac <= maxVigFrac) && (validFrac >= minValidFrac);
+      if (ok) {
+        best = mid;
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+    return best;
   }
 
   function coversSensorYesNo({ fov, maxField, mode = "diag", marginDeg = 0.5 }) {
@@ -2055,7 +2084,16 @@
 
     const covMode = COVERAGE_CFG.mode;
     const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
-    const maxField = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, covHalfMm);
+    const maxFieldChief = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, covHalfMm);
+    const maxFieldBundle = coverageTestMaxFieldBundleDeg(
+      lens.surfaces,
+      wavePreset,
+      sensorX,
+      rayCount,
+      IMAGE_CIRCLE_CFG.maxReqVigFrac,
+      IMAGE_CIRCLE_CFG.minReqValidFrac
+    );
+    const maxField = Math.min(maxFieldChief, maxFieldBundle);
     const reqFloor = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
     const reqFromFov = coversSensorYesNo({ fov, maxField, mode: covMode, marginDeg: COVERAGE_CFG.marginDeg }).req;
     const req = Number.isFinite(reqFloor) ? reqFloor : reqFromFov;
@@ -2141,6 +2179,12 @@
     } else if (!bd.imageCircleOk && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Image circle too small: ${icDiagTxt}. Required: ${icTargetTxt} (target >= ${IMAGE_CIRCLE_CFG.minDiagMm.toFixed(0)}mm for full frame).`;
+    } else if (Number.isFinite(bd.reqVigPct) && bd.reqVigPct > Math.round(IMAGE_CIRCLE_CFG.maxReqVigFrac * 100) && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `Edge clipping: Vreq ${bd.reqVigPct}% is above max ${Math.round(IMAGE_CIRCLE_CFG.maxReqVigFrac * 100)}%. Increase edge throughput.`;
+    } else if (Number.isFinite(bd.reqValidPct) && bd.reqValidPct < Math.round(IMAGE_CIRCLE_CFG.minReqValidFrac * 100) && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `Too few valid edge rays: ${bd.reqValidPct}% < ${Math.round(IMAGE_CIRCLE_CFG.minReqValidFrac * 100)}%. This will show hard cutoff.`;
     } else if (phys.airGapCount < PHYS_CFG.minAirGapsPreferred && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Few air gaps (${phys.airGapCount}); aim for >= ${PHYS_CFG.minAirGapsPreferred} for practical designs.`;
@@ -2731,7 +2775,17 @@
     const fov = computeFovDeg(efl, sensorW, sensorH);
     const covMode = COVERAGE_CFG.mode;
     const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
-    const maxField = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfMm);
+    const maxFieldChief = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfMm);
+    const covRayCount = Math.max(11, Math.min(31, rayCount | 0));
+    const maxFieldBundle = coverageTestMaxFieldBundleDeg(
+      surfaces,
+      wavePreset,
+      sensorX,
+      covRayCount,
+      IMAGE_CIRCLE_CFG.maxReqVigFrac,
+      IMAGE_CIRCLE_CFG.minReqValidFrac
+    );
+    const maxField = Math.min(maxFieldChief, maxFieldBundle);
     const req = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
     const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
 
