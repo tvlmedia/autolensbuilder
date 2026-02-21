@@ -401,6 +401,7 @@
   function loadLens(obj) {
     lens = sanitizeLens(obj);
     selectedIndex = 0;
+    expandMiddleApertures(lens.surfaces);
     clampAllApertures(lens.surfaces);
     buildTable();
     applySensorToIMS();
@@ -554,6 +555,7 @@
     }
 
     applySensorToIMS();
+    expandMiddleApertures(lens.surfaces);
     clampAllApertures(lens.surfaces);
     buildTable();
     renderAll();
@@ -658,6 +660,12 @@
   const AP_SAFETY = 0.90;
   const AP_MAX_PLANE = 30.0;
   const AP_MIN = 0.01;
+  const MID_AP_CFG = {
+    minMiddleVsEdge: 0.98,
+    minStopVsEdge: 0.90,
+    stopHeadroom: 1.00,
+    nearStopHeadroom: 1.08,
+  };
 
   function maxApForSurface(s) {
     const R = Number(s?.R || 0);
@@ -672,6 +680,58 @@
     const lim = maxApForSurface(s);
     const ap = Number(s.ap || 0);
     s.ap = Math.max(AP_MIN, Math.min(ap, lim));
+  }
+
+  function expandMiddleApertures(surfaces, opts = {}) {
+    if (!Array.isArray(surfaces) || surfaces.length < 4) return;
+
+    const minMiddleVsEdge = Number.isFinite(opts.minMiddleVsEdge) ? opts.minMiddleVsEdge : MID_AP_CFG.minMiddleVsEdge;
+    const minStopVsEdge = Number.isFinite(opts.minStopVsEdge) ? opts.minStopVsEdge : MID_AP_CFG.minStopVsEdge;
+    const stopHeadroom = Number.isFinite(opts.stopHeadroom) ? opts.stopHeadroom : MID_AP_CFG.stopHeadroom;
+    const nearStopHeadroom = Number.isFinite(opts.nearStopHeadroom) ? opts.nearStopHeadroom : MID_AP_CFG.nearStopHeadroom;
+    const targetStopAp = Number.isFinite(opts.targetStopAp) ? Math.max(AP_MIN, Number(opts.targetStopAp)) : null;
+
+    const physIdx = [];
+    for (let i = 0; i < surfaces.length; i++) {
+      const t = String(surfaces[i]?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      physIdx.push(i);
+    }
+    if (physIdx.length < 3) return;
+
+    const first = surfaces[physIdx[0]];
+    const last = surfaces[physIdx[physIdx.length - 1]];
+    const edgeRef = Math.max(AP_MIN, Math.min(Number(first?.ap || 0), Number(last?.ap || 0)));
+    if (!Number.isFinite(edgeRef) || edgeRef <= AP_MIN) return;
+
+    const middleFloor = Math.max(AP_MIN, edgeRef * Math.max(0, minMiddleVsEdge));
+    const stopFloorBase = Math.max(AP_MIN, edgeRef * Math.max(0, minStopVsEdge));
+    const stopIdx = findStopSurfaceIndex(surfaces);
+
+    for (let k = 1; k < physIdx.length - 1; k++) {
+      const i = physIdx[k];
+      const s = surfaces[i];
+      const t = String(s?.type || "").toUpperCase();
+      const isStop = i === stopIdx || t === "STOP";
+
+      let floor = middleFloor;
+      if (isStop) {
+        floor = Math.max(floor, stopFloorBase);
+      } else if (targetStopAp != null && stopIdx >= 0 && Math.abs(i - stopIdx) <= 2) {
+        floor = Math.max(floor, targetStopAp * nearStopHeadroom);
+      }
+
+      const apNow = Number(s?.ap || 0);
+      if (apNow < floor) s.ap = floor;
+      clampSurfaceAp(s);
+    }
+
+    if (targetStopAp != null && stopIdx >= 0) {
+      const sStop = surfaces[stopIdx];
+      const stopTarget = Math.max(targetStopAp * stopHeadroom, stopFloorBase);
+      if (Number(sStop?.ap || 0) < stopTarget) sStop.ap = stopTarget;
+      clampSurfaceAp(sStop);
+    }
   }
 
   function clampAllApertures(surfaces) {
@@ -1307,6 +1367,7 @@
       applyUiSnapshot(payload.ui);
       lens = sanitizeLens(payload.lens);
       selectedIndex = 0;
+      expandMiddleApertures(lens.surfaces);
       clampAllApertures(lens.surfaces);
       buildTable();
       applySensorToIMS();
@@ -2246,6 +2307,7 @@
     lens.surfaces.splice(atIndex, 0, surfaceObj);
     selectedIndex = atIndex;
     lens = sanitizeLens(lens);
+    expandMiddleApertures(lens.surfaces);
     clampAllApertures(lens.surfaces);
     buildTable();
     applySensorToIMS();
@@ -2280,6 +2342,8 @@
     lens.surfaces[i] = lens.surfaces[j];
     lens.surfaces[j] = a;
     selectedIndex = j;
+    expandMiddleApertures(lens.surfaces);
+    clampAllApertures(lens.surfaces);
     buildTable();
     applySensorToIMS();
     renderAll();
@@ -2292,6 +2356,7 @@
     selectedIndex = Math.max(0, selectedIndex - 1);
 
     lens = sanitizeLens(lens);
+    expandMiddleApertures(lens.surfaces);
     clampAllApertures(lens.surfaces);
     buildTable();
     applySensorToIMS();
@@ -2396,6 +2461,7 @@
       lens.surfaces.splice(at + 1, 0, { type: "", R: R2, t: tAir, ap, glass: "AIR", stop: false });
 
       lens = sanitizeLens(lens);
+      expandMiddleApertures(lens.surfaces);
       clampAllApertures(lens.surfaces);
       selectedIndex = at;
       buildTable();
@@ -2431,6 +2497,7 @@
 
     // keep sensor half-height (IMS ap)
     applySensorToIMS();
+    expandMiddleApertures(lens.surfaces);
     clampAllApertures(lens.surfaces);
     buildTable();
     renderAll();
@@ -2450,8 +2517,9 @@
     if (!Number.isFinite(efl) || efl <= 1) return toast("Set T failed (EFL not solvable)");
 
     const desiredStopAp = efl / (2 * targetT);
-    lens.surfaces[stopIdx].ap = clamp(desiredStopAp, 0.2, maxApForSurface(lens.surfaces[stopIdx]));
+    lens.surfaces[stopIdx].ap = desiredStopAp;
 
+    expandMiddleApertures(lens.surfaces, { targetStopAp: desiredStopAp });
     clampAllApertures(lens.surfaces);
     buildTable();
     renderAll();
@@ -2552,6 +2620,7 @@
       if (ref > 0.5 && Number(b.ap || 0) < 0.45 * ref) b.ap = 0.45 * ref;
       clampSurfaceAp(b);
     }
+    expandMiddleApertures(surfaces);
   }
 
   function captureTopology(lensObj) {
@@ -3016,6 +3085,8 @@
 
     const restored = restoreAutosave();
     if (!restored) {
+      expandMiddleApertures(lens.surfaces);
+      clampAllApertures(lens.surfaces);
       buildTable();
       applySensorToIMS();
     }
