@@ -1610,7 +1610,8 @@
     if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
-    if (ui.covTop) ui.covTop.textContent = ui.cov?.textContent || (covers ? "COV: YES" : "COV: NO";
+  if (ui.covTop) ui.covTop.textContent =
+  ui.cov?.textContent || (covers ? "COV: YES" : "COV: NO");
     if (ui.meritTop) ui.meritTop.textContent = feas.ok ? `Merit: ${m.toFixed(2)}` : `Merit: FAIL`;
 
     if (ui.footerWarn) {
