@@ -1161,9 +1161,12 @@
     minSensorH: 24.0,
   };
   const IMAGE_CIRCLE_CFG = {
-    minDiagMm: 45.0,        // full-frame coverage floor with small margin
-    maxReqVigFrac: 0.02,    // max vignette fraction at required edge field (strict)
-    minReqValidFrac: 0.90,  // minimum valid traced ray fraction at required edge field (strict)
+    minDiagMm: 45.0,        // baseline floor
+    targetMarginMm: 1.0,    // extra safety margin to avoid visible edge cutoff
+    maxCenterVigFrac: 0.00, // no center clipping accepted
+    maxMidVigFrac: 0.01,    // almost no mid-field clipping accepted
+    maxReqVigFrac: 0.005,   // near-zero clipping at required edge field
+    minReqValidFrac: 0.97,  // very high valid-ray fraction at required edge field
     bundleSearchIters: 12,
   };
 
@@ -1179,7 +1182,7 @@
 
   function targetImageCircleDiagMm(sensorW, sensorH) {
     const sensorDiag = Math.hypot(sensorW, sensorH);
-    return Math.max(sensorDiag, IMAGE_CIRCLE_CFG.minDiagMm);
+    return Math.max(sensorDiag, IMAGE_CIRCLE_CFG.minDiagMm) + IMAGE_CIRCLE_CFG.targetMarginMm;
   }
 
   function requiredHalfFieldDeg(efl, sensorW, sensorH, mode = "d") {
@@ -1211,7 +1214,7 @@
 
   function coverageHalfSizeWithFloorMm(sensorW, sensorH, mode = "d") {
     const cur = coverageHalfSizeMm(sensorW, sensorH, mode);
-    if (mode === "d") return Math.max(cur, 0.5 * IMAGE_CIRCLE_CFG.minDiagMm);
+    if (mode === "d") return Math.max(cur, 0.5 * (IMAGE_CIRCLE_CFG.minDiagMm + IMAGE_CIRCLE_CFG.targetMarginMm));
     const min = coverageHalfSizeMm(COVERAGE_CFG.minSensorW, COVERAGE_CFG.minSensorH, mode);
     return Math.max(cur, min);
   }
@@ -1437,9 +1440,11 @@
     lowValidPenalty: 450.0,
     hardInvalidPenalty: 1_000_000.0,
     covShortfallWeight: 180.0,
-    imageCircleShortfallWeight: 180.0,
-    imageCircleReqVigWeight: 1400.0,
-    imageCircleReqValidWeight: 900.0,
+    imageCircleShortfallWeight: 220.0,
+    imageCircleReqVigWeight: 2200.0,
+    imageCircleReqValidWeight: 1600.0,
+    imageCircleCenterVigWeight: 2400.0,
+    imageCircleMidVigWeight: 1800.0,
   };
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
@@ -1504,6 +1509,14 @@
       const d = req - maxField;
       merit += MERIT_CFG.covShortfallWeight * (d * d);
     }
+    if (Number.isFinite(vigCenter) && vigCenter > IMAGE_CIRCLE_CFG.maxCenterVigFrac) {
+      const d = vigCenter - IMAGE_CIRCLE_CFG.maxCenterVigFrac;
+      merit += MERIT_CFG.imageCircleCenterVigWeight * (d * d);
+    }
+    if (Number.isFinite(vigMid) && vigMid > IMAGE_CIRCLE_CFG.maxMidVigFrac) {
+      const d = vigMid - IMAGE_CIRCLE_CFG.maxMidVigFrac;
+      merit += MERIT_CFG.imageCircleMidVigWeight * (d * d);
+    }
 
     const imageCircleDiag = imageCircleDiagFromHalfFieldMm(efl, maxField);
     const imageCircleTarget = imageCircleDiagFromHalfFieldMm(efl, req);
@@ -1564,9 +1577,11 @@
       Number.isFinite(imageCircleDiag) &&
       Number.isFinite(imageCircleTarget) &&
       imageCircleDiag + 0.25 >= imageCircleTarget;
+    const centerVigOk = !Number.isFinite(vigCenter) || vigCenter <= IMAGE_CIRCLE_CFG.maxCenterVigFrac;
+    const midVigOk = !Number.isFinite(vigMid) || vigMid <= IMAGE_CIRCLE_CFG.maxMidVigFrac;
     const reqVigOk = !Number.isFinite(reqVigFrac) || reqVigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac;
     const reqValidOk = !Number.isFinite(reqValidFrac) || reqValidFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
-    const coversStrict = !!covers && imageCircleOk && reqVigOk && reqValidOk;
+    const coversStrict = !!covers && imageCircleOk && centerVigOk && midVigOk && reqVigOk && reqValidOk;
 
     const breakdown = {
       rmsCenter, rmsEdge,
@@ -1580,6 +1595,8 @@
       imageCircleDiag: Number.isFinite(imageCircleDiag) ? imageCircleDiag : null,
       imageCircleTarget: Number.isFinite(imageCircleTarget) ? imageCircleTarget : null,
       imageCircleOk,
+      centerVigOk,
+      midVigOk,
       reqVigPct: Number.isFinite(reqVigFrac) ? Math.round(reqVigFrac * 100) : null,
       reqValidPct: Number.isFinite(reqValidFrac) ? Math.round(reqValidFrac * 100) : null,
       physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
@@ -2178,7 +2195,13 @@
         `INVALID geometry: overlap/clearance issue (overlap ${phys.worstOverlap.toFixed(2)}mm, pinch ${phys.worstPinch.toFixed(2)}mm).`;
     } else if (!bd.imageCircleOk && ui.footerWarn) {
       ui.footerWarn.textContent =
-        `Image circle too small: ${icDiagTxt}. Required: ${icTargetTxt} (target >= ${IMAGE_CIRCLE_CFG.minDiagMm.toFixed(0)}mm for full frame).`;
+        `Image circle too small: ${icDiagTxt}. Required: ${icTargetTxt} (includes ${IMAGE_CIRCLE_CFG.targetMarginMm.toFixed(1)}mm safety margin).`;
+    } else if (!bd.centerVigOk && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `Center clipping present: V0 ${bd.vigCenterPct}% (must be ${Math.round(IMAGE_CIRCLE_CFG.maxCenterVigFrac * 100)}%).`;
+    } else if (!bd.midVigOk && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `Mid-field clipping present: Vmid ${bd.vigMidPct}% (max ${Math.round(IMAGE_CIRCLE_CFG.maxMidVigFrac * 100)}%).`;
     } else if (Number.isFinite(bd.reqVigPct) && bd.reqVigPct > Math.round(IMAGE_CIRCLE_CFG.maxReqVigFrac * 100) && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Edge clipping: Vreq ${bd.reqVigPct}% is above max ${Math.round(IMAGE_CIRCLE_CFG.maxReqVigFrac * 100)}%. Increase edge throughput.`;
