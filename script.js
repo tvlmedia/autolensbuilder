@@ -719,6 +719,8 @@
     tinyApWeight: 120.0,
     tinyRadiusWeight: 80.0,
     pinchWeight: 220.0,
+    stopOversizeWeight: 240.0,
+    stopTooTinyWeight: 200.0,
   };
 
   function minGapBetweenSurfaces(sFront, sBack, yMax, samples = 11) {
@@ -843,6 +845,35 @@
     if (stopIdx < 0) {
       penalty += 1500;
       hardFail = true;
+    } else {
+      // STOP should be compatible with nearby clear apertures to avoid heavy on-axis clipping.
+      const neighbors = [];
+      for (let d = 1; d <= 2; d++) {
+        const iL = stopIdx - d;
+        const iR = stopIdx + d;
+        if (iL >= 0) {
+          const sL = surfaces[iL];
+          const tL = String(sL?.type || "").toUpperCase();
+          if (tL !== "OBJ" && tL !== "IMS") neighbors.push(Number(sL.ap || 0));
+        }
+        if (iR < surfaces.length) {
+          const sR = surfaces[iR];
+          const tR = String(sR?.type || "").toUpperCase();
+          if (tR !== "OBJ" && tR !== "IMS") neighbors.push(Number(sR.ap || 0));
+        }
+      }
+      if (neighbors.length) {
+        const minNeigh = Math.max(0.2, Math.min(...neighbors));
+        if (stopAp > 1.08 * minNeigh) {
+          const d = stopAp - 1.08 * minNeigh;
+          penalty += PHYS_CFG.stopOversizeWeight * d * d;
+          if (d > 0.9) hardFail = true;
+        }
+        if (stopAp < 0.55 * minNeigh) {
+          const d = 0.55 * minNeigh - stopAp;
+          penalty += PHYS_CFG.stopTooTinyWeight * d * d;
+        }
+      }
     }
 
     return { penalty, hardFail, worstOverlap, worstPinch };
@@ -1139,6 +1170,8 @@
   const MERIT_CFG = {
     rmsNorm: 0.05,            // 0.05mm RMS = "ok" baseline
     vigWeight: 16.0,
+    centerVigWeight: 180.0,
+    midVigWeight: 60.0,
     covPenalty: 180.0,
     intrusionWeight: 16.0,
     fieldWeights: [1.0, 1.5, 2.0],
@@ -1185,6 +1218,8 @@
     let merit = 0;
     let rmsCenter = null, rmsEdge = null;
     let vigAvg = 0;
+    let vigCenter = 1;
+    let vigMid = 1;
     let validMin = 999;
 
     for (let k = 0; k < fields.length; k++){
@@ -1197,12 +1232,16 @@
       const rms = Number.isFinite(pack.rms) ? pack.rms : 999;
       if (k === 0) rmsCenter = rms;
       if (k === fields.length - 1) rmsEdge = rms;
+      if (k === 0) vigCenter = pack.vigFrac;
+      if (k === 1) vigMid = pack.vigFrac;
 
       const rn = rms / MERIT_CFG.rmsNorm;
       merit += fieldWeights[k] * (rn * rn);
     }
 
     merit += MERIT_CFG.vigWeight * (vigAvg * vigAvg);
+    merit += MERIT_CFG.centerVigWeight * (vigCenter * vigCenter);
+    merit += MERIT_CFG.midVigWeight * (vigMid * vigMid);
     if (!covers) merit += MERIT_CFG.covPenalty;
 
     if (Number.isFinite(intrusion) && intrusion > 0){
@@ -1241,6 +1280,8 @@
       covers,
       intrusion: Number.isFinite(intrusion) ? intrusion : null,
       fields: fields.map(v => Number.isFinite(v) ? v : 0),
+      vigCenterPct: Math.round(vigCenter * 100),
+      vigMidPct: Math.round(vigMid * 100),
       physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
       hardInvalid: !!hardInvalid,
     };
@@ -1773,6 +1814,8 @@
     const meritTxt =
       `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} ` +
       `(RMS0 ${bd.rmsCenter?.toFixed?.(3) ?? "—"}mm • RMSedge ${bd.rmsEdge?.toFixed?.(3) ?? "—"}mm • Vig ${bd.vigPct}%` +
+      `${Number.isFinite(bd.vigCenterPct) ? ` • V0 ${bd.vigCenterPct}%` : ""}` +
+      `${Number.isFinite(bd.vigMidPct) ? ` • Vmid ${bd.vigMidPct}%` : ""}` +
       `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""}` +
       `${bd.physPenalty > 0 ? ` • PHYS +${bd.physPenalty.toFixed(1)}` : ""}` +
       `${bd.hardInvalid ? " • INVALID ❌" : ""})`;
