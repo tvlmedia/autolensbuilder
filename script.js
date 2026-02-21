@@ -661,10 +661,10 @@
   const AP_MAX_PLANE = 30.0;
   const AP_MIN = 0.01;
   const MID_AP_CFG = {
-    minMiddleVsEdge: 0.98,
-    minStopVsEdge: 0.90,
+    minMiddleVsEdge: 1.00,
+    minStopVsEdge: 0.96,
     stopHeadroom: 1.00,
-    nearStopHeadroom: 1.08,
+    nearStopHeadroom: 1.18,
   };
 
   function maxApForSurface(s) {
@@ -701,7 +701,9 @@
 
     const first = surfaces[physIdx[0]];
     const last = surfaces[physIdx[physIdx.length - 1]];
-    const edgeRef = Math.max(AP_MIN, Math.min(Number(first?.ap || 0), Number(last?.ap || 0)));
+    const apFirst = Math.max(AP_MIN, Number(first?.ap || 0));
+    const apLast = Math.max(AP_MIN, Number(last?.ap || 0));
+    const edgeRef = Math.max(AP_MIN, 0.5 * (apFirst + apLast));
     if (!Number.isFinite(edgeRef) || edgeRef <= AP_MIN) return;
 
     const middleFloor = Math.max(AP_MIN, edgeRef * Math.max(0, minMiddleVsEdge));
@@ -988,10 +990,11 @@
       }
       if (neighbors.length) {
         const minNeigh = Math.max(0.2, Math.min(...neighbors));
-        if (stopAp > 1.08 * minNeigh) {
-          const d = stopAp - 1.08 * minNeigh;
+        // Allow a somewhat larger STOP for faster targets, but still penalize mismatch.
+        if (stopAp > 1.20 * minNeigh) {
+          const d = stopAp - 1.20 * minNeigh;
           penalty += PHYS_CFG.stopOversizeWeight * d * d;
-          if (d > 0.9) hardFail = true;
+          if (d > 2.4) hardFail = true;
         }
         if (stopAp < 0.55 * minNeigh) {
           const d = 0.55 * minNeigh - stopAp;
@@ -1129,6 +1132,28 @@
     return best;
   }
 
+  function coverageTestBundleMaxFieldDeg(surfaces, wavePreset, sensorX, rayCount) {
+    let lo = 0, hi = 60, best = 0;
+    for (let iter = 0; iter < 18; iter++) {
+      const mid = (lo + hi) * 0.5;
+      const pack = traceBundleAtField(surfaces, mid, rayCount, wavePreset, sensorX);
+      const vigFrac = Number(pack?.vigFrac);
+      const validFrac = Number(pack?.n || 0) / Math.max(1, rayCount);
+      const ok =
+        Number.isFinite(vigFrac) &&
+        vigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac &&
+        Number.isFinite(validFrac) &&
+        validFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
+      if (ok) {
+        best = mid;
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+    return best;
+  }
+
   // -------------------- EFL/BFL (paraxial-ish) --------------------
   function lastPhysicalVertexX(surfaces) {
     let maxX = -Infinity;
@@ -1193,12 +1218,49 @@
     return { efl, bfl };
   }
 
-  function estimateTStopApprox(efl, surfaces) {
+  function estimateEffectiveOnAxisSemiAperture(surfaces, wavePreset = "d") {
+    if (!Array.isArray(surfaces) || surfaces.length < 2) return null;
+    const xStart = (surfaces[0]?.vx ?? 0) - 120;
+
+    function passes(yAtRef) {
+      const ray = { p: { x: xStart, y: yAtRef }, d: { x: 1, y: 0 } };
+      const tr = traceRayForward(clone(ray), surfaces, wavePreset);
+      return !!tr && !tr.vignetted && !tr.tir;
+    }
+
+    if (!passes(0)) return 0;
+
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    const seed = (stopIdx >= 0)
+      ? Math.max(AP_MIN, Number(surfaces[stopIdx]?.ap || 0))
+      : Math.max(AP_MIN, Number(getRayReferencePlane(surfaces).apRef || 0));
+
+    let lo = 0;
+    let hi = Math.max(seed, AP_MIN);
+    const maxHi = Math.max(PHYS_CFG.maxAperture * 1.6, hi);
+
+    while (hi < maxHi && passes(hi)) {
+      lo = hi;
+      hi *= 1.25;
+    }
+    if (lo <= 0) lo = 0;
+
+    for (let i = 0; i < 24; i++) {
+      const mid = 0.5 * (lo + hi);
+      if (passes(mid)) lo = mid;
+      else hi = mid;
+    }
+    return Math.max(0, lo);
+  }
+
+  function estimateTStopApprox(efl, surfaces, wavePreset = "d") {
     const stopIdx = findStopSurfaceIndex(surfaces);
     if (stopIdx < 0) return null;
     const stopAp = Math.max(1e-6, Number(surfaces[stopIdx].ap || 0));
+    const effAp = estimateEffectiveOnAxisSemiAperture(surfaces, wavePreset);
+    const useAp = Number.isFinite(effAp) && effAp > 0 ? Math.min(stopAp, effAp) : stopAp;
     if (!Number.isFinite(efl) || efl <= 0) return null;
-    const T = efl / (2 * stopAp);
+    const T = efl / (2 * Math.max(1e-6, useAp));
     return Number.isFinite(T) ? T : null;
   }
 
@@ -1216,14 +1278,15 @@
 
   const COVERAGE_CFG = {
     mode: "d",              // evaluate in diagonal plane
-    marginDeg: 0.5,
+    marginDeg: 0.2,
     minSensorW: 36.0,       // always at least full-frame
     minSensorH: 24.0,
   };
   const IMAGE_CIRCLE_CFG = {
     minDiagMm: 45.0,        // full-frame coverage floor with small margin
-    maxReqVigFrac: 0.10,    // max vignette fraction at required edge field
-    minReqValidFrac: 0.62,  // minimum valid traced ray fraction at required edge field
+    maxReqVigFrac: 0.06,    // max vignette fraction at required edge field
+    minReqValidFrac: 0.72,  // minimum valid traced ray fraction at required edge field
+    maxCenterVigFrac: 0.01, // center field should be essentially clean
   };
 
   function halfFieldFromDiagDeg(efl, diagMm) {
@@ -1463,7 +1526,8 @@
 
     // target terms (optimizer uses these)
     eflWeight: 0.35,          // penalty per mm error (squared)
-    tWeight: 10.0,            // penalty per T error (squared)
+    tWeight: 24.0,            // penalty per T error (squared)
+    tSlowWeight: 64.0,        // extra penalty when T is slower than target
     bflMin: 52.0,             // for PL: discourage too-short backfocus
     bflWeight: 6.0,
     lowValidPenalty: 450.0,
@@ -1581,6 +1645,7 @@
     if (Number.isFinite(targetT) && Number.isFinite(T)){
       const d = (T - targetT);
       merit += MERIT_CFG.tWeight * (d * d);
+      if (d > 0) merit += MERIT_CFG.tSlowWeight * (d * d);
     }
 
     const minValidTarget = Math.max(7, Math.floor(rayCount * 0.45));
@@ -1598,7 +1663,8 @@
       imageCircleDiag + 0.25 >= imageCircleTarget;
     const reqVigOk = !Number.isFinite(reqVigFrac) || reqVigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac;
     const reqValidOk = !Number.isFinite(reqValidFrac) || reqValidFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
-    const coversStrict = !!covers && imageCircleOk && reqVigOk && reqValidOk;
+    const centerVigOk = !Number.isFinite(vigCenter) || vigCenter <= IMAGE_CIRCLE_CFG.maxCenterVigFrac;
+    const coversStrict = !!covers && imageCircleOk && reqVigOk && reqValidOk && centerVigOk;
 
     const breakdown = {
       rmsCenter, rmsEdge,
@@ -1614,6 +1680,7 @@
       imageCircleOk,
       reqVigPct: Number.isFinite(reqVigFrac) ? Math.round(reqVigFrac * 100) : null,
       reqValidPct: Number.isFinite(reqValidFrac) ? Math.round(reqValidFrac * 100) : null,
+      centerVigOk,
       physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
       hardInvalid: !!hardInvalid,
     };
@@ -2107,7 +2174,7 @@
     const vigPct = traces.length ? Math.round((vCount / traces.length) * 100) : 0;
 
     const { efl, bfl } = estimateEflBflParaxial(lens.surfaces, wavePreset);
-    const T = estimateTStopApprox(efl, lens.surfaces);
+    const T = estimateTStopApprox(efl, lens.surfaces, wavePreset);
 
     const fov = computeFovDeg(efl, sensorW, sensorH);
     const fovTxt = !fov
@@ -2116,7 +2183,9 @@
 
     const covMode = COVERAGE_CFG.mode;
     const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
-    const maxField = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, covHalfMm);
+    const maxFieldGeom = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, covHalfMm);
+    const maxFieldBundle = coverageTestBundleMaxFieldDeg(lens.surfaces, wavePreset, sensorX, rayCount);
+    const maxField = Math.min(maxFieldGeom, maxFieldBundle);
     const reqFloor = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
     const reqFromFov = coversSensorYesNo({ fov, maxField, mode: covMode, marginDeg: COVERAGE_CFG.marginDeg }).req;
     const req = Number.isFinite(reqFloor) ? reqFloor : reqFromFov;
@@ -2152,7 +2221,7 @@
     const icTargetTxt = Number.isFinite(bd.imageCircleTarget) ? `${bd.imageCircleTarget.toFixed(1)}mm` : "—";
     covTxt = !fov
       ? "COV(D): —"
-      : `COV(D): ±${maxField.toFixed(1)}° • REQ(D): ${(req ?? 0).toFixed(1)}° • IC ${icDiagTxt}/${icTargetTxt} • ${coversStrict ? "COVERS ✅" : "NO ❌"}`;
+      : `COV(D): ±${maxField.toFixed(1)}° (geom ${maxFieldGeom.toFixed(1)}° • illum ${maxFieldBundle.toFixed(1)}°) • REQ(D): ${(req ?? 0).toFixed(1)}° • IC ${icDiagTxt}/${icTargetTxt} • ${coversStrict ? "COVERS ✅" : "NO ❌"}`;
 
     const meritTxt =
       `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} ` +
@@ -2199,6 +2268,9 @@
     if (phys.hardFail && ui.footerWarn) {
       ui.footerWarn.textContent =
         `INVALID geometry: overlap/clearance issue (overlap ${phys.worstOverlap.toFixed(2)}mm, pinch ${phys.worstPinch.toFixed(2)}mm).`;
+    } else if (bd.centerVigOk === false && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `Center vignette too high (${bd.vigCenterPct ?? "—"}%). Increase middle/stop apertures.`;
     } else if (!bd.imageCircleOk && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Image circle too small: ${icDiagTxt}. Required: ${icTargetTxt} (target >= ${IMAGE_CIRCLE_CFG.minDiagMm.toFixed(0)}mm for full frame).`;
@@ -2516,14 +2588,30 @@
     const { efl } = estimateEflBflParaxial(lens.surfaces, wave);
     if (!Number.isFinite(efl) || efl <= 1) return toast("Set T failed (EFL not solvable)");
 
-    const desiredStopAp = efl / (2 * targetT);
+    let desiredStopAp = efl / (2 * targetT);
     lens.surfaces[stopIdx].ap = desiredStopAp;
+
+    // Iterate a few times so effective T (after clipping) gets closer to target.
+    for (let iter = 0; iter < 6; iter++) {
+      expandMiddleApertures(lens.surfaces, { targetStopAp: desiredStopAp });
+      clampAllApertures(lens.surfaces);
+      computeVertices(lens.surfaces, 0, 0);
+
+      const tNow = estimateTStopApprox(efl, lens.surfaces, wave);
+      if (!Number.isFinite(tNow)) break;
+      if (tNow <= targetT * 1.01) break;
+
+      const factor = clamp(tNow / targetT, 1.02, 1.35);
+      desiredStopAp *= factor;
+      lens.surfaces[stopIdx].ap *= factor;
+    }
 
     expandMiddleApertures(lens.surfaces, { targetStopAp: desiredStopAp });
     clampAllApertures(lens.surfaces);
     buildTable();
     renderAll();
-    toast(`STOP ap → ${lens.surfaces[stopIdx].ap.toFixed(2)} (T≈${targetT.toFixed(2)})`);
+    const tFinal = estimateTStopApprox(efl, lens.surfaces, wave);
+    toast(`STOP ap → ${lens.surfaces[stopIdx].ap.toFixed(2)} (T≈${Number.isFinite(tFinal) ? tFinal.toFixed(2) : targetT.toFixed(2)})`);
   }
 
   // -------------------- save/load JSON --------------------
@@ -2795,12 +2883,14 @@
     const vigFrac = traces.length ? (vCount / traces.length) : 1;
 
     const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
-    const T = estimateTStopApprox(efl, surfaces);
+    const T = estimateTStopApprox(efl, surfaces, wavePreset);
 
     const fov = computeFovDeg(efl, sensorW, sensorH);
     const covMode = COVERAGE_CFG.mode;
     const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
-    const maxField = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfMm);
+    const maxFieldGeom = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfMm);
+    const maxFieldBundle = coverageTestBundleMaxFieldDeg(surfaces, wavePreset, sensorX, rayCount);
+    const maxField = Math.min(maxFieldGeom, maxFieldBundle);
     const req = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
     const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
 
