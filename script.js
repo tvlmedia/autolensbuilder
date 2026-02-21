@@ -35,6 +35,7 @@
     dist: $("#badgeDist"),
     fov: $("#badgeFov"),
     cov: $("#badgeCov"),
+    ic: $("#badgeIc"),
     merit: $("#badgeMerit"),
 
     footerWarn: $("#footerWarn"),
@@ -45,6 +46,7 @@
     tstopTop: $("#badgeTTop"),
     fovTop: $("#badgeFovTop"),
     covTop: $("#badgeCovTop"),
+    icTop: $("#badgeIcTop"),
     distTop: $("#badgeDistTop"),
     meritTop: $("#badgeMeritTop"),
 
@@ -1406,9 +1408,9 @@
     lowValidPenalty: 450.0,
     hardInvalidPenalty: 1_000_000.0,
     covShortfallWeight: 180.0,
-    imageCircleShortfallWeight: 95.0,
-    imageCircleReqVigWeight: 520.0,
-    imageCircleReqValidWeight: 320.0,
+    imageCircleShortfallWeight: 180.0,
+    imageCircleReqVigWeight: 1400.0,
+    imageCircleReqValidWeight: 900.0,
   };
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
@@ -2123,12 +2125,14 @@
     if (ui.dist) ui.dist.textContent = `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
     if (ui.fov) ui.fov.textContent = fovTxt;
     if (ui.cov) ui.cov.textContent = coversStrict ? "COV: YES" : `COV: NO (IC ${icDiagTxt})`;
+    if (ui.ic) ui.ic.textContent = `IC: ${icDiagTxt} / ${icTargetTxt}`;
 
     if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
     if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.covTop) ui.covTop.textContent = ui.cov?.textContent || (coversStrict ? "COV: YES" : "COV: NO");
+    if (ui.icTop) ui.icTop.textContent = ui.ic?.textContent || `IC: ${icDiagTxt} / ${icTargetTxt}`;
     if (ui.distTop) ui.distTop.textContent = ui.dist?.textContent || `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
 
     if (phys.hardFail && ui.footerWarn) {
@@ -2787,6 +2791,13 @@
     let cur = startLens;
     let curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
+    const icText = (ev) => {
+      const ic = ev?.breakdown?.imageCircleDiag;
+      const tgt = ev?.breakdown?.imageCircleTarget;
+      const icStr = Number.isFinite(ic) ? `${ic.toFixed(1)}mm` : "—";
+      const tgtStr = Number.isFinite(tgt) ? `${tgt.toFixed(1)}mm` : "—";
+      return `IC ${icStr}/${tgtStr}`;
+    };
 
     // annealing-ish
     let temp0 = mode === "wild" ? 3.5 : 1.8;
@@ -2822,7 +2833,7 @@
             `score ${best.eval.score.toFixed(2)}\n` +
             `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
             `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
-            `COV ${best.eval.covers?"YES":"NO"} • INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
+            `COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
             `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
           );
         }
@@ -2836,7 +2847,7 @@
           setOptLog(
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
             `current ${curEval.score.toFixed(2)} • best ${best.eval.score.toFixed(2)} @${best.iter}\n` +
-            `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • COV ${best.eval.covers?"YES":"NO"} • INTR ${best.eval.intrusion.toFixed(2)}mm\n`
+            `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • INTR ${best.eval.intrusion.toFixed(2)}mm\n`
           );
         }
         // yield to UI
@@ -2855,7 +2866,7 @@
         `BEST score ${best.eval.score.toFixed(2)}\n` +
         `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
         `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
-        `COV ${best.eval.covers?"YES":"NO"} • INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
+        `COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
         `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
         `Click “Apply best” to load.`
       );
