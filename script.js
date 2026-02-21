@@ -32,6 +32,7 @@
     bfl: $("#badgeBfl"),
     tstop: $("#badgeT"),
     vig: $("#badgeVig"),
+    dist: $("#badgeDist"),
     fov: $("#badgeFov"),
     cov: $("#badgeCov"),
     merit: $("#badgeMerit"),
@@ -44,6 +45,7 @@
     tstopTop: $("#badgeTTop"),
     fovTop: $("#badgeFovTop"),
     covTop: $("#badgeCovTop"),
+    distTop: $("#badgeDistTop"),
     meritTop: $("#badgeMeritTop"),
 
     sensorPreset: $("#sensorPreset"),
@@ -92,6 +94,8 @@
 
     elementModal: $("#elementModal"),
   };
+
+  const AUTOSAVE_KEY = "tvl_lens_builder_autosave_v1";
 
   function toast(msg, ms = 2200) {
     if (!ui.toastHost) return;
@@ -399,6 +403,7 @@
     buildTable();
     applySensorToIMS();
     renderAll();
+    scheduleAutosave();
   }
 
   // -------------------- table helpers --------------------
@@ -516,6 +521,7 @@
 
     applySensorToIMS();
     scheduleRenderAll();
+    scheduleAutosave();
   }
 
   function onCellCommit(e) {
@@ -549,6 +555,7 @@
     clampAllApertures(lens.surfaces);
     buildTable();
     renderAll();
+    scheduleAutosave();
   }
 
   // -------------------- math helpers --------------------
@@ -1189,6 +1196,99 @@
     else req = fov.dfov * 0.5;
     const ok = maxField + marginDeg >= req;
     return { ok, req };
+  }
+
+  function estimateDistortionPct(surfaces, wavePreset, sensorX, sensorW, sensorH, efl, mode = "d") {
+    const req = requiredHalfFieldDeg(efl, sensorW, sensorH, mode);
+    const idealHalf = coverageHalfSizeMm(sensorW, sensorH, mode);
+    if (!Number.isFinite(req) || !Number.isFinite(idealHalf) || idealHalf < 1e-9) return null;
+
+    const chief = buildChiefRay(surfaces, req);
+    const tr = traceRayForward(clone(chief), surfaces, wavePreset);
+    if (!tr || tr.vignetted || tr.tir) return null;
+
+    const y = rayHitYAtX(tr.endRay, sensorX);
+    if (!Number.isFinite(y)) return null;
+
+    const actualHalf = Math.abs(y);
+    const dist = ((actualHalf - idealHalf) / idealHalf) * 100;
+    return Number.isFinite(dist) ? dist : null;
+  }
+
+  function collectUiSnapshot() {
+    return {
+      sensorPreset: ui.sensorPreset?.value || "ARRI Alexa Mini LF (LF)",
+      sensorW: ui.sensorW?.value || "",
+      sensorH: ui.sensorH?.value || "",
+      fieldAngle: ui.fieldAngle?.value || "0",
+      rayCount: ui.rayCount?.value || "31",
+      wavePreset: ui.wavePreset?.value || "d",
+      sensorOffset: ui.sensorOffset?.value || "0",
+      focusMode: ui.focusMode?.value || "cam",
+      lensFocus: ui.lensFocus?.value || "0",
+      renderScale: ui.renderScale?.value || "1.25",
+      optTargetFL: ui.optTargetFL?.value || "75",
+      optTargetT: ui.optTargetT?.value || "2.0",
+      optIters: ui.optIters?.value || "2000",
+      optPop: ui.optPop?.value || "safe",
+    };
+  }
+
+  function applyUiSnapshot(snap) {
+    if (!snap || typeof snap !== "object") return;
+    const set = (el, v) => { if (el != null && v != null) el.value = String(v); };
+    set(ui.sensorPreset, snap.sensorPreset);
+    set(ui.sensorW, snap.sensorW);
+    set(ui.sensorH, snap.sensorH);
+    set(ui.fieldAngle, snap.fieldAngle);
+    set(ui.rayCount, snap.rayCount);
+    set(ui.wavePreset, snap.wavePreset);
+    set(ui.sensorOffset, snap.sensorOffset);
+    set(ui.focusMode, snap.focusMode);
+    set(ui.lensFocus, snap.lensFocus);
+    set(ui.renderScale, snap.renderScale);
+    set(ui.optTargetFL, snap.optTargetFL);
+    set(ui.optTargetT, snap.optTargetT);
+    set(ui.optIters, snap.optIters);
+    set(ui.optPop, snap.optPop);
+  }
+
+  let _autosaveTimer = 0;
+  function saveAutosaveNow() {
+    try {
+      const payload = {
+        savedAt: Date.now(),
+        lens: sanitizeLens(lens),
+        ui: collectUiSnapshot(),
+      };
+      localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(payload));
+    } catch (_) {}
+  }
+  function scheduleAutosave(ms = 320) {
+    if (_autosaveTimer) clearTimeout(_autosaveTimer);
+    _autosaveTimer = setTimeout(() => {
+      _autosaveTimer = 0;
+      saveAutosaveNow();
+    }, ms);
+  }
+  function restoreAutosave() {
+    try {
+      const raw = localStorage.getItem(AUTOSAVE_KEY);
+      if (!raw) return false;
+      const payload = JSON.parse(raw);
+      if (!payload || !payload.lens) return false;
+      applyUiSnapshot(payload.ui);
+      lens = sanitizeLens(payload.lens);
+      selectedIndex = 0;
+      clampAllApertures(lens.surfaces);
+      buildTable();
+      applySensorToIMS();
+      renderAll();
+      toast("Autosave restored");
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   // -------------------- spot RMS + autofocus core --------------------
@@ -1895,6 +1995,7 @@
     const covTxt = !fov
       ? "COV(D): —"
       : `COV(D): ±${maxField.toFixed(1)}° • REQ(D): ${(req ?? 0).toFixed(1)}° • ${covers ? "COVERS ✅" : "NO ❌"}`;
+    const distPct = estimateDistortionPct(lens.surfaces, wavePreset, sensorX, sensorW, sensorH, efl, covMode);
 
     const rearVx = lastPhysicalVertexX(lens.surfaces);
     const intrusion = rearVx - plX;
@@ -1944,6 +2045,7 @@
     if (ui.bfl) ui.bfl.textContent = `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstop) ui.tstop.textContent = `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
     if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
+    if (ui.dist) ui.dist.textContent = `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
     if (ui.fov) ui.fov.textContent = fovTxt;
     if (ui.cov) ui.cov.textContent = covers ? "COV: YES" : "COV: NO";
 
@@ -1952,6 +2054,7 @@
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.covTop) ui.covTop.textContent = ui.cov?.textContent || (covers ? "COV: YES" : "COV: NO");
+    if (ui.distTop) ui.distTop.textContent = ui.dist?.textContent || `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
 
     if (phys.hardFail && ui.footerWarn) {
       ui.footerWarn.textContent =
@@ -2730,31 +2833,32 @@
     ui.sensorPreset?.addEventListener("change", () => {
       applyPreset(ui.sensorPreset.value);
       renderAll();
+      scheduleAutosave();
     });
-    ui.sensorW?.addEventListener("input", () => { applySensorToIMS(); renderAll(); });
-    ui.sensorH?.addEventListener("input", () => { applySensorToIMS(); renderAll(); });
+    ui.sensorW?.addEventListener("input", () => { applySensorToIMS(); renderAll(); scheduleAutosave(); });
+    ui.sensorH?.addEventListener("input", () => { applySensorToIMS(); renderAll(); scheduleAutosave(); });
 
     ["fieldAngle","rayCount","wavePreset","sensorOffset","focusMode","lensFocus"].forEach((id) => {
-      ui[id]?.addEventListener("input", scheduleRenderAll);
-      ui[id]?.addEventListener("change", scheduleRenderAll);
+      ui[id]?.addEventListener("input", () => { scheduleRenderAll(); scheduleAutosave(); });
+      ui[id]?.addEventListener("change", () => { scheduleRenderAll(); scheduleAutosave(); });
     });
-    ui.renderScale?.addEventListener("input", scheduleRenderAll);
+    ui.renderScale?.addEventListener("input", () => { scheduleRenderAll(); scheduleAutosave(); });
 
-    ui.btnNew?.addEventListener("click", newClearLens);
-    ui.btnLoadOmit?.addEventListener("click", () => loadLens(omit50ConceptV1()));
-    ui.btnLoadDemo?.addEventListener("click", () => loadLens(demoLensSimple()));
+    ui.btnNew?.addEventListener("click", () => { newClearLens(); scheduleAutosave(); });
+    ui.btnLoadOmit?.addEventListener("click", () => { loadLens(omit50ConceptV1()); scheduleAutosave(); });
+    ui.btnLoadDemo?.addEventListener("click", () => { loadLens(demoLensSimple()); scheduleAutosave(); });
 
-    ui.btnAdd?.addEventListener("click", addSurface);
+    ui.btnAdd?.addEventListener("click", () => { addSurface(); scheduleAutosave(); });
     ui.btnAddElement?.addEventListener("click", openElementModal);
-    ui.btnDuplicate?.addEventListener("click", duplicateSelected);
-    ui.btnMoveUp?.addEventListener("click", () => moveSelected(-1));
-    ui.btnMoveDown?.addEventListener("click", () => moveSelected(+1));
-    ui.btnRemove?.addEventListener("click", removeSelected);
+    ui.btnDuplicate?.addEventListener("click", () => { duplicateSelected(); scheduleAutosave(); });
+    ui.btnMoveUp?.addEventListener("click", () => { moveSelected(-1); scheduleAutosave(); });
+    ui.btnMoveDown?.addEventListener("click", () => { moveSelected(+1); scheduleAutosave(); });
+    ui.btnRemove?.addEventListener("click", () => { removeSelected(); scheduleAutosave(); });
 
-    ui.btnScaleToFocal?.addEventListener("click", scaleToFocal);
-    ui.btnSetTStop?.addEventListener("click", setTStop);
+    ui.btnScaleToFocal?.addEventListener("click", () => { scaleToFocal(); scheduleAutosave(); });
+    ui.btnSetTStop?.addEventListener("click", () => { setTStop(); scheduleAutosave(); });
 
-    ui.btnAutoFocus?.addEventListener("click", autoFocus);
+    ui.btnAutoFocus?.addEventListener("click", () => { autoFocus(); scheduleAutosave(); });
 
     ui.btnSave?.addEventListener("click", saveJSON);
     ui.fileLoad?.addEventListener("change", (e) => {
@@ -2763,6 +2867,7 @@
         console.error(err);
         toast("Load failed (invalid JSON?)");
       });
+      if (f) scheduleAutosave();
       e.target.value = "";
     });
 
@@ -2775,17 +2880,43 @@
     ui.btnOptBench?.addEventListener("click", benchOptimizer);
 
     ["optTargetFL","optTargetT","optIters","optPop"].forEach((id)=>{
-      ui[id]?.addEventListener("change", scheduleRenderAll);
+      ui[id]?.addEventListener("change", () => { scheduleRenderAll(); scheduleAutosave(); });
       ui[id]?.addEventListener("input", () => {
         // don't rerender constantly for iters/preset; but update merit targets
         if (id === "optTargetFL" || id === "optTargetT") scheduleRenderAll();
+        scheduleAutosave();
       });
+    });
+  }
+
+  function bindKeyboardShortcuts() {
+    document.addEventListener("keydown", (e) => {
+      const target = e.target;
+      const tag = String(target?.tagName || "").toUpperCase();
+      const inField = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable;
+
+      if ((e.metaKey || e.ctrlKey) && String(e.key).toLowerCase() === "s") {
+        e.preventDefault();
+        saveJSON();
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && String(e.key).toLowerCase() === "o") {
+        e.preventDefault();
+        ui.fileLoad?.click();
+        return;
+      }
+      if (!inField && !e.metaKey && !e.ctrlKey && !e.altKey && String(e.key).toLowerCase() === "a") {
+        e.preventDefault();
+        autoFocus();
+        scheduleAutosave();
+      }
     });
   }
 
   // -------------------- boot --------------------
   function boot() {
     wireUI();
+    bindKeyboardShortcuts();
 
     // Force top on boot
     try {
@@ -2794,8 +2925,11 @@
       setTimeout(() => document.querySelector(".leftScroll")?.scrollTo(0, 0), 0);
     } catch(_) {}
 
-    buildTable();
-    applySensorToIMS();
+    const restored = restoreAutosave();
+    if (!restored) {
+      buildTable();
+      applySensorToIMS();
+    }
     bindViewControls();
     renderAll();
 
