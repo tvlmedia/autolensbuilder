@@ -837,7 +837,7 @@
     maxAperture: 32.0,
     minThickness: 0.05,
     maxThickness: 55.0,
-    minStopToApertureRatio: 0.28,
+    minStopToApertureRatio: 0.62,
     maxNegOverlap: 0.05,
     gapWeightAir: 1200.0,
     gapWeightGlass: 2600.0,
@@ -1349,6 +1349,38 @@
     }
   }
 
+  function nudgeStopToTargetT(surfaces, targetT, wavePreset = "d") {
+    if (!Array.isArray(surfaces) || !Number.isFinite(targetT) || targetT <= 0.2) return;
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 0) return;
+
+    for (let iter = 0; iter < 4; iter++) {
+      computeVertices(surfaces, 0, 0);
+      const para = estimateEflBflParaxial(surfaces, wavePreset);
+      const eflNow = Number(para?.efl);
+      if (!Number.isFinite(eflNow) || eflNow <= 1) break;
+
+      const desiredStopAp = eflNow / (2 * targetT);
+      if (!Number.isFinite(desiredStopAp) || desiredStopAp <= AP_MIN) break;
+      surfaces[stopIdx].ap = desiredStopAp;
+
+      expandMiddleApertures(surfaces, { targetStopAp: desiredStopAp });
+      clampAllApertures(surfaces);
+
+      const tNow = estimateTStopApprox(eflNow, surfaces, wavePreset);
+      if (!Number.isFinite(tNow)) break;
+      if (Math.abs(tNow - targetT) <= Math.max(0.12, targetT * 0.08)) break;
+
+      if (tNow > targetT) {
+        const factor = clamp(tNow / targetT, 1.02, 1.45);
+        surfaces[stopIdx].ap = Number(surfaces[stopIdx].ap || desiredStopAp) * factor;
+      }
+    }
+
+    expandMiddleApertures(surfaces);
+    clampAllApertures(surfaces);
+  }
+
   // -------------------- FOV --------------------
   function deg2rad(d) { return (d * Math.PI) / 180; }
   function rad2deg(r) { return (r * 180) / Math.PI; }
@@ -1626,6 +1658,9 @@
     imageCircleShortfallWeight: 180.0,
     imageCircleReqVigWeight: 1400.0,
     imageCircleReqValidWeight: 900.0,
+    maxTRatio: 2.4,          // hard gate: reject candidates far slower than target T
+    minTRatio: 0.45,         // hard gate: reject unrealistically fast candidates vs target
+    maxRearIntrusion: 0.0,   // hard gate: no lens intrusion into PL side
   };
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
@@ -2800,6 +2835,20 @@
       clampSurfaceAp(s);
     }
 
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    const stopAp = (stopIdx >= 0) ? Math.max(AP_MIN, Number(surfaces[stopIdx]?.ap || 0)) : null;
+    if (Number.isFinite(stopAp)) {
+      for (let i = 0; i < surfaces.length; i++) {
+        if (i === stopIdx) continue;
+        const s = surfaces[i];
+        const t = String(s?.type || "").toUpperCase();
+        if (t === "OBJ" || t === "IMS") continue;
+        const floor = stopAp * 0.70;
+        if (Number(s.ap || 0) < floor) s.ap = floor;
+        clampSurfaceAp(s);
+      }
+    }
+
     // discourage abrupt aperture pinches (common optimizer failure mode)
     for (let i = 1; i < surfaces.length - 1; i++) {
       const a = surfaces[i - 1], b = surfaces[i], c = surfaces[i + 1];
@@ -2981,6 +3030,9 @@
     if (Number.isFinite(targetEfl) && targetEfl > 1) {
       nudgeSurfacesToTargetEfl(surfaces, targetEfl, wavePreset);
     }
+    if (Number.isFinite(targetT) && targetT > 0.2) {
+      nudgeStopToTargetT(surfaces, targetT, wavePreset);
+    }
 
     // autofocus (lens shift)
     const af = bestLensShiftForDesign(surfaces, fieldAngle, rayCount, wavePreset);
@@ -3013,6 +3065,13 @@
       const score = MERIT_CFG.hardInvalidPenalty * 0.5 + 50_000 + Math.max(0, Number(phys.penalty || 0));
       return invalidEval(score, lensShift, phys.penalty);
     }
+    if (Number.isFinite(targetT) && targetT > 0 && Number.isFinite(T)) {
+      const tRatio = T / targetT;
+      if (tRatio > MERIT_CFG.maxTRatio || tRatio < MERIT_CFG.minTRatio) {
+        const score = MERIT_CFG.hardInvalidPenalty * 0.35 + 40_000 + (Math.abs(T - targetT) ** 2) * 2000 + Math.max(0, Number(phys.penalty || 0));
+        return invalidEval(score, lensShift, phys.penalty);
+      }
+    }
 
     const rays = buildRays(surfaces, fieldAngle, rayCount);
     const traces = rays.map(r => traceRayForward(clone(r), surfaces, wavePreset));
@@ -3034,6 +3093,12 @@
 
     const rearVx = lastPhysicalVertexX(surfaces);
     const intrusion = rearVx - (-PL_FFD);
+    if (intrusion > MERIT_CFG.maxRearIntrusion) {
+      const score = MERIT_CFG.hardInvalidPenalty * 0.5 + 90_000 + intrusion * intrusion * 6000 + Math.max(0, Number(phys.penalty || 0));
+      const bad = invalidEval(score, lensShift, phys.penalty);
+      bad.intrusion = intrusion;
+      return bad;
+    }
 
     const meritRes = computeMeritV1({
       surfaces,
@@ -3082,11 +3147,18 @@
     const rayCount = Math.max(9, Math.min(61, (num(ui.rayCount?.value, 31) | 0))); // limit for speed
     const wavePreset = ui.wavePreset?.value || "d";
 
-    const startLens = sanitizeLens(lens);
-    const topo = captureTopology(startLens);
+    const userStart = sanitizeLens(lens);
+    const baseStart = sanitizeLens(omit50ConceptV1());
+    nudgeSurfacesToTargetEfl(baseStart.surfaces, targetEfl, wavePreset);
+    nudgeStopToTargetT(baseStart.surfaces, targetT, wavePreset);
+    quickSanity(baseStart.surfaces);
 
-    let cur = startLens;
-    let curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+    const userEval = evalLensMerit(userStart, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+    const baseEval = evalLensMerit(baseStart, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+
+    let cur = (baseEval.score < userEval.score) ? baseStart : userStart;
+    let curEval = (baseEval.score < userEval.score) ? baseEval : userEval;
+    const topo = captureTopology(cur);
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
     const icText = (ev) => {
       const ic = ev?.breakdown?.imageCircleDiag;
