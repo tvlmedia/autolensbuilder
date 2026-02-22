@@ -1657,7 +1657,7 @@
     invalidEflPenalty: 25000.0,
     invalidTPenalty: 16000.0,
     invalidCoveragePenalty: 6000.0,
-    guardFailPenalty: 3_000_000.0,
+    guardFailPenalty: 1_200_000.0,
   };
 
   const OPT_GUARD_CFG = {
@@ -1665,6 +1665,7 @@
     tMaxOverFrac: 0.003,      // allow tiny numeric slack above target T
     minImageCircleMm: 45.0,   // hard floor; larger is always fine
     invalidRestartEvery: 120, // force exploration reset on long invalid streak
+    repairPasses: 2,
   };
 
   function assessOptimizerConstraints(ev, { targetEfl, targetT, sensorW, sensorH }) {
@@ -1698,7 +1699,7 @@
     if (!eflOk) reasons.push(`EFL±${Math.round(OPT_GUARD_CFG.eflTolFrac * 100)}%`);
     if (!tOk) reasons.push("T too slow");
     if (!icOk) reasons.push(`IC<${reqIc.toFixed(1)}mm`);
-    if (!coversOk) reasons.push("COV NO");
+    // COV remains a strong soft objective in merit, but not a hard reject for BEST feasibility.
 
     return {
       ok: reasons.length === 0,
@@ -1707,7 +1708,124 @@
       tCeil,
       eflErrFrac,
       ic,
+      coversOk,
     };
+  }
+
+  function nudgeScaleToTargetEfl(surfaces, targetEfl, wavePreset) {
+    if (!Array.isArray(surfaces) || !Number.isFinite(targetEfl) || targetEfl <= 1) return;
+    computeVertices(surfaces, 0, 0);
+    const { efl } = estimateEflBflParaxial(surfaces, wavePreset);
+    if (!Number.isFinite(efl) || efl <= 1) return;
+    const k = clamp(targetEfl / efl, 0.86, 1.16);
+    if (!Number.isFinite(k) || Math.abs(k - 1) < 0.01) return;
+
+    for (const s of surfaces) {
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      s.R = Number(s.R || 0) * k;
+      s.t = clamp(Number(s.t || 0) * k, PHYS_CFG.minThickness, PHYS_CFG.maxThickness);
+      s.ap = clamp(Number(s.ap || 0) * k, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+    }
+    clampAllApertures(surfaces);
+  }
+
+  function nudgeStopToTargetT(surfaces, targetT, wavePreset) {
+    if (!Array.isArray(surfaces) || !Number.isFinite(targetT) || targetT <= 0.2) return;
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 0) return;
+
+    for (let i = 0; i < 3; i++) {
+      computeVertices(surfaces, 0, 0);
+      const { efl } = estimateEflBflParaxial(surfaces, wavePreset);
+      const tNow = estimateTStopApprox(efl, surfaces, wavePreset);
+      if (!Number.isFinite(efl) || !Number.isFinite(tNow) || tNow <= targetT * (1 + OPT_GUARD_CFG.tMaxOverFrac)) break;
+
+      const desired = efl / (2 * Math.max(0.2, targetT));
+      const curAp = Math.max(AP_MIN, Number(surfaces[stopIdx]?.ap || AP_MIN));
+      const mul = clamp(desired / curAp, 1.04, 1.55);
+      surfaces[stopIdx].ap = clamp(curAp * mul, PHYS_CFG.minAperture, maxApForSurface(surfaces[stopIdx]));
+
+      expandMiddleApertures(surfaces, {
+        targetStopAp: surfaces[stopIdx].ap,
+        nearStopHeadroom: 1.10,
+      });
+      clampGlassPairClearApertures(surfaces, PHYS_CFG.minGlassCT, 0.985);
+      clampAllApertures(surfaces);
+    }
+  }
+
+  function nudgeCoverageAndImageCircle(surfaces, wavePreset, sensorW, sensorH, rayCount) {
+    if (!Array.isArray(surfaces) || !surfaces.length) return;
+    const sensorX = 0.0;
+    computeVertices(surfaces, 0, sensorX);
+
+    const { efl } = estimateEflBflParaxial(surfaces, wavePreset);
+    if (!Number.isFinite(efl) || efl <= 1) return;
+
+    const covMode = COVERAGE_CFG.mode;
+    const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
+    const maxFieldGeom = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfMm);
+    const maxFieldBundle = coverageTestBundleMaxFieldDeg(surfaces, wavePreset, sensorX, rayCount);
+    const maxField = Math.min(maxFieldGeom, maxFieldBundle);
+    const req = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
+
+    const ic = imageCircleDiagFromChiefAtField(surfaces, wavePreset, sensorX, maxField)
+      ?? imageCircleDiagFromHalfFieldMm(efl, maxField);
+    const reqIc = Math.max(
+      OPT_GUARD_CFG.minImageCircleMm,
+      targetImageCircleDiagMm(sensorW, sensorH) || OPT_GUARD_CFG.minImageCircleMm,
+    );
+    const needMoreCoverage =
+      !Number.isFinite(maxField) ||
+      !Number.isFinite(req) ||
+      (maxField + COVERAGE_CFG.marginDeg < req) ||
+      !Number.isFinite(ic) ||
+      ic < reqIc;
+
+    if (!needMoreCoverage) return;
+
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    for (let i = 0; i < surfaces.length; i++) {
+      const s = surfaces[i];
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      const nearStop = stopIdx >= 0 && Math.abs(i - stopIdx) <= 2;
+      const mul = nearStop ? 1.16 : 1.08;
+      s.ap = clamp(Number(s.ap || 0) * mul, PHYS_CFG.minAperture, maxApForSurface(s));
+    }
+
+    if (stopIdx >= 0) {
+      if (stopIdx > 0) {
+        surfaces[stopIdx - 1].t = clamp(
+          Number(surfaces[stopIdx - 1]?.t || 0) * 1.06,
+          PHYS_CFG.minStopSideAirGap,
+          PHYS_CFG.maxThickness,
+        );
+      }
+      if (stopIdx < surfaces.length - 1) {
+        surfaces[stopIdx].t = clamp(
+          Number(surfaces[stopIdx]?.t || 0) * 1.06,
+          PHYS_CFG.minStopSideAirGap,
+          PHYS_CFG.maxThickness,
+        );
+      }
+    }
+
+    clampGlassPairClearApertures(surfaces, PHYS_CFG.minGlassCT, 0.98);
+    clampAllApertures(surfaces);
+  }
+
+  function repairCandidateTowardsTargets(surfaces, cfg) {
+    if (!Array.isArray(surfaces) || !cfg) return;
+    const passes = Math.max(1, Number(cfg.passes || OPT_GUARD_CFG.repairPasses || 2) | 0);
+
+    for (let i = 0; i < passes; i++) {
+      nudgeScaleToTargetEfl(surfaces, cfg.targetEfl, cfg.wavePreset);
+      nudgeStopToTargetT(surfaces, cfg.targetT, cfg.wavePreset);
+      nudgeCoverageAndImageCircle(surfaces, cfg.wavePreset, cfg.sensorW, cfg.sensorH, cfg.rayCount);
+      quickSanity(surfaces);
+    }
   }
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
@@ -3199,7 +3317,7 @@
     );
     const rulesTxt =
       `Rules: EFL ±${Math.round(OPT_GUARD_CFG.eflTolFrac * 100)}% • ` +
-      `T <= ${targetT.toFixed(2)} • IC >= ${hardReqIc.toFixed(1)}mm • COV YES`;
+      `T <= ${targetT.toFixed(2)} • IC >= ${hardReqIc.toFixed(1)}mm • COV preferred`;
 
     const startLens = sanitizeLens(lens);
     const topo = captureTopology(startLens);
@@ -3234,6 +3352,15 @@
 
     let cur = startLens;
     let curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+    if (!curEval.validDesign) {
+      const curSeed = clone(cur);
+      repairCandidateTowardsTargets(curSeed.surfaces, { targetEfl, targetT, wavePreset, sensorW, sensorH, rayCount, passes: 2 });
+      const seededEval = evalLensMerit(curSeed, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+      if (seededEval.validDesign || seededEval.score < curEval.score) {
+        cur = curSeed;
+        curEval = seededEval;
+      }
+    }
     let best = curEval.validDesign ? { lens: clone(cur), eval: curEval, iter: 0 } : null;
     let invalidStreak = curEval.validDesign ? 0 : 1;
     const icText = (ev) => {
@@ -3282,7 +3409,12 @@
       const temp = temp0 * (1 - a) + temp1 * a;
 
       const cand = mutateLens(cur, mode, topoForOptimize);
-      const candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+      let candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+      if (!candEval.validDesign || Math.random() < 0.40) {
+        repairCandidateTowardsTargets(cand.surfaces, { targetEfl, targetT, wavePreset, sensorW, sensorH, rayCount, passes: 1 });
+        const candReEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+        if (candReEval.score <= candEval.score || candReEval.validDesign) candEval = candReEval;
+      }
 
       let accept = false;
       if (candEval.validDesign) {
@@ -3329,6 +3461,7 @@
       if (invalidStreak >= OPT_GUARD_CFG.invalidRestartEvery) {
         const seedLens = best?.lens ? clone(best.lens) : clone(startLens);
         cur = mutateLens(seedLens, "wild", topoForOptimize);
+        repairCandidateTowardsTargets(cur.surfaces, { targetEfl, targetT, wavePreset, sensorW, sensorH, rayCount, passes: 2 });
         curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
         invalidStreak = curEval.validDesign ? 0 : 1;
       }
