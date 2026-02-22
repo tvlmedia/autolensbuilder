@@ -679,7 +679,7 @@
 
   // -------------------- physical sanity clamps --------------------
   const AP_SAFETY = 0.90;
-  const AP_MAX_PLANE = 30.0;
+  const AP_MAX_PLANE = 40.0;
   const AP_MIN = 0.01;
   const MID_AP_CFG = {
     minMiddleVsEdge: 0.92,
@@ -701,6 +701,23 @@
     const lim = maxApForSurface(s);
     const ap = Number(s.ap || 0);
     s.ap = Math.max(AP_MIN, Math.min(ap, lim));
+  }
+
+  function ensureRadiusSupportsAperture(s, targetAp, opts = {}) {
+    if (!s || !Number.isFinite(targetAp) || targetAp <= AP_MIN) return;
+    const t = String(s.type || "").toUpperCase();
+    if (t === "IMS" || t === "OBJ") return;
+
+    const R = Number(s.R || 0);
+    if (!Number.isFinite(R) || Math.abs(R) < 1e-9) return;
+
+    const margin = Number.isFinite(opts.margin) ? opts.margin : 1.08;
+    const needR = Math.max(
+      PHYS_CFG.minRadius,
+      Math.abs(targetAp) * Math.max(1.0, margin) / Math.max(1e-6, AP_SAFETY)
+    );
+    const absR = Math.abs(R);
+    if (absR < needR) s.R = (R >= 0 ? 1 : -1) * needR;
   }
 
   function minRequiredGapForPair(sFront, opts = {}) {
@@ -853,18 +870,20 @@
     prefAirGap: 0.60,
     minGlassCT: 0.35,
     prefGlassCT: 1.20,
-    minRadius: 8.0,
+    // Radius limits kept extremely wide to avoid constraining exploration.
+    minRadius: 0.10,
+    maxRadius: 10000.0,
     minAperture: 1.2,
-    maxAperture: 32.0,
+    maxAperture: 40.0,
     minThickness: 0.05,
     maxThickness: 55.0,
-    minStopToApertureRatio: 0.62,
+    minStopToApertureRatio: 0.76,
     maxNegOverlap: 0.05,
     gapWeightAir: 1200.0,
     gapWeightGlass: 2600.0,
     overlapWeight: 3200.0,
     tinyApWeight: 120.0,
-    tinyRadiusWeight: 80.0,
+    tinyRadiusWeight: 0.0,
     pinchWeight: 220.0,
     stopOversizeWeight: 240.0,
     stopTooTinyWeight: 200.0,
@@ -1069,10 +1088,11 @@
       if (neighbors.length) {
         const minNeigh = Math.max(0.2, Math.min(...neighbors));
         // Allow a somewhat larger STOP for faster targets, but still penalize mismatch.
-        if (stopAp > 1.20 * minNeigh) {
-          const d = stopAp - 1.20 * minNeigh;
+        const maxStopVsNeigh = 1.65;
+        if (stopAp > maxStopVsNeigh * minNeigh) {
+          const d = stopAp - maxStopVsNeigh * minNeigh;
           penalty += PHYS_CFG.stopOversizeWeight * d * d;
-          if (d > 2.4) hardFail = true;
+          if (d > 10.0) hardFail = true;
         }
         if (stopAp < 0.55 * minNeigh) {
           const d = 0.55 * minNeigh - stopAp;
@@ -1419,6 +1439,7 @@
     const targetT = Number(opts.targetT);
     const wavePreset = String(opts.wavePreset || "d");
     const icShortMm = Math.max(0, Number(opts.icShortMm || 0));
+    const icTargetMm = Number(opts.icTargetMm);
     const strength = clamp(0.25 + icShortMm / 24, 0.25, 1.50);
 
     const stopIdx = findStopSurfaceIndex(surfaces);
@@ -1427,6 +1448,10 @@
     const eflNow = Number(para?.efl);
     const desiredStopAp = (Number.isFinite(targetT) && targetT > 0.2 && Number.isFinite(eflNow) && eflNow > 1)
       ? (eflNow / (2 * targetT))
+      : null;
+    const icSemiTarget = Number.isFinite(icTargetMm) ? Math.max(0.5, icTargetMm * 0.5) : null;
+    const baseFloorFromIc = Number.isFinite(icSemiTarget)
+      ? clamp(icSemiTarget * (0.60 + 0.22 * strength), 4.0, PHYS_CFG.maxAperture * 0.92)
       : null;
 
     const physIdx = [];
@@ -1456,22 +1481,29 @@
       const baseMul = 1 + 0.10 * strength;
       const mul = baseMul * centerMul * stopBias * edgeBias;
 
-      s.ap = clamp(Number(s.ap || AP_MIN) * mul, AP_MIN, PHYS_CFG.maxAperture);
+      const localIcFloor = Number.isFinite(baseFloorFromIc)
+        ? baseFloorFromIc * (k === 0 || k === physIdx.length - 1 ? 1.08 : 1.0)
+        : null;
+      let targetAp = Number(s.ap || AP_MIN) * mul;
+      if (Number.isFinite(localIcFloor)) targetAp = Math.max(targetAp, localIcFloor);
+      s.ap = clamp(targetAp, AP_MIN, PHYS_CFG.maxAperture);
+      ensureRadiusSupportsAperture(s, s.ap, { margin: 1.10 + 0.15 * strength });
       clampSurfaceAp(s);
     }
 
     if (stopIdx >= 0 && Number.isFinite(desiredStopAp) && desiredStopAp > AP_MIN) {
       const sStop = surfaces[stopIdx];
       sStop.ap = Math.max(Number(sStop.ap || 0), desiredStopAp * (1.05 + 0.20 * strength));
+      ensureRadiusSupportsAperture(sStop, sStop.ap, { margin: 1.18 });
       clampSurfaceAp(sStop);
     }
 
     expandMiddleApertures(surfaces, {
       targetStopAp: Number.isFinite(desiredStopAp) ? desiredStopAp : null,
-      minMiddleVsEdge: 1.00,
-      minStopVsEdge: 1.08,
-      stopHeadroom: 1.15,
-      nearStopHeadroom: 1.32,
+      minMiddleVsEdge: 1.06,
+      minStopVsEdge: 1.12,
+      stopHeadroom: 1.20,
+      nearStopHeadroom: 1.40,
     });
 
     // Slightly increase air around stop and central section to help off-axis rays clear.
@@ -3196,7 +3228,7 @@
         const s = surfaces[i];
         const t = String(s?.type || "").toUpperCase();
         if (t === "OBJ" || t === "IMS") continue;
-        const floor = stopAp * 0.70;
+        const floor = stopAp * 0.82;
         if (Number(s.ap || 0) < floor) s.ap = floor;
         clampSurfaceAp(s);
       }
@@ -3312,7 +3344,7 @@
         const R = Number(ss.R || 0);
         const absR = Math.max(PHYS_CFG.minRadius, Math.abs(R));
         const newAbs = absR * (1 + d);
-        ss.R = (R >= 0 ? 1 : -1) * clamp(newAbs, PHYS_CFG.minRadius, 450);
+        ss.R = (R >= 0 ? 1 : -1) * clamp(newAbs, PHYS_CFG.minRadius, PHYS_CFG.maxRadius);
       } else if (choice < 0.70){
         // thickness tweak
         const scale = topo
@@ -3369,6 +3401,7 @@
       const tgtEfl = Number(target.efl);
       const tgtT = Number(target.t);
       const icShortNow = Number(target.icShortNow || 0);
+      const icTargetNow = Number(target.icTargetNow);
       const wp = String(target.wavePreset || "d");
       const guideP = phaseHint === "ic" ? 0.90 : phaseHint === "t" ? 0.82 : 0.68;
       if (Math.random() < guideP) {
@@ -3377,20 +3410,34 @@
           if (Number.isFinite(tgtT) && tgtT > 0.2 && Math.random() < 0.30) nudgeStopToTargetT(s, tgtT, wp);
         } else if (phaseHint === "t") {
           if (Number.isFinite(tgtT) && tgtT > 0.2) nudgeStopToTargetT(s, tgtT, wp);
+          if (icShortNow > 6 && Math.random() < 0.45) {
+            nudgeForImageCircleAndCoverage(s, {
+              targetT: tgtT,
+              wavePreset: wp,
+              icShortMm: icShortNow * 0.6,
+              icTargetMm: icTargetNow,
+            });
+          }
           if (Number.isFinite(tgtEfl) && tgtEfl > 1) nudgeSurfacesToTargetEfl(s, tgtEfl, wp);
         } else {
           // ic/refine: keep T near target and aggressively open coverage.
           if (Number.isFinite(tgtT) && tgtT > 0.2) nudgeStopToTargetT(s, tgtT, wp);
-          nudgeForImageCircleAndCoverage(s, { targetT: tgtT, wavePreset: wp, icShortMm: icShortNow });
+          nudgeForImageCircleAndCoverage(s, {
+            targetT: tgtT,
+            wavePreset: wp,
+            icShortMm: icShortNow,
+            icTargetMm: icTargetNow,
+          });
           if (Number.isFinite(tgtEfl) && tgtEfl > 1) nudgeSurfacesToTargetEfl(s, tgtEfl, wp);
         }
       }
     }
 
     if (topo?.anchors?.length === s.length) {
-      const apHiMul = phaseHint === "ic" ? 2.60 : phaseHint === "t" ? 2.25 : 1.95;
-      const airTHiMul = phaseHint === "ic" ? 2.80 : phaseHint === "t" ? 2.25 : 1.70;
-      const glassTHiMul = phaseHint === "ic" ? 2.25 : phaseHint === "t" ? 1.95 : 1.55;
+      const apHiMul = phaseHint === "ic" ? 4.40 : phaseHint === "t" ? 3.20 : 2.10;
+      const airTHiMul = phaseHint === "ic" ? 3.20 : phaseHint === "t" ? 2.55 : 1.75;
+      const glassTHiMul = phaseHint === "ic" ? 2.80 : phaseHint === "t" ? 2.15 : 1.60;
+      const rHiMul = phaseHint === "ic" ? 24.0 : phaseHint === "t" ? 16.0 : 10.0;
       for (let i = 0; i < s.length; i++) {
         const si = s[i];
         const ti = String(si?.type || "").toUpperCase();
@@ -3404,8 +3451,9 @@
           si.R = 0;
         } else {
           const sign = aR >= 0 ? 1 : -1;
-          const loR = Math.max(PHYS_CFG.minRadius, aAbs * 0.72);
-          const hiR = Math.min(450, aAbs * 1.38);
+          const loR = Math.max(PHYS_CFG.minRadius, aAbs * 0.35);
+          const apNeed = Math.max(PHYS_CFG.minRadius, Number(si.ap || 0) / Math.max(1e-6, AP_SAFETY) * 1.10);
+          const hiR = Math.min(PHYS_CFG.maxRadius, Math.max(aAbs * rHiMul, apNeed * 1.20));
           const curR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(si.R || aR)));
           si.R = sign * clamp(curR, loR, hiR);
         }
@@ -3418,6 +3466,7 @@
 
         const aAp = Math.max(PHYS_CFG.minAperture, Number(a.ap || PHYS_CFG.minAperture));
         si.ap = clamp(Number(si.ap || aAp), Math.max(PHYS_CFG.minAperture, aAp * 0.68), Math.min(PHYS_CFG.maxAperture, aAp * apHiMul));
+        ensureRadiusSupportsAperture(si, si.ap, { margin: phaseHint === "ic" ? 1.16 : 1.10 });
 
         const wantMedium = topo.media?.[i];
         if (wantMedium === "AIR") si.glass = "AIR";
@@ -3672,6 +3721,7 @@
         0,
         Number(curEval?.breakdown?.imageCircleTarget || 0) - Number(curEval?.breakdown?.imageCircleDiag || 0)
       );
+      const icTargetNow = Number(curEval?.breakdown?.imageCircleTarget || 0);
 
       const cand = mutateLens(cur, mode, topo, {
         efl: targetEfl,
@@ -3679,6 +3729,7 @@
         wavePreset,
         phase: phaseNow,
         icShortNow,
+        icTargetNow,
       });
       const candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
       const candUsable = isUsable(candEval);
