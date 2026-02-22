@@ -3205,14 +3205,6 @@
     const ims = surfaces[surfaces.length-1];
     if (ims && String(ims.type).toUpperCase()==="IMS") ims.ap = halfH;
 
-    // Keep search close to the requested focal family before evaluating.
-    if (Number.isFinite(targetEfl) && targetEfl > 1) {
-      nudgeSurfacesToTargetEfl(surfaces, targetEfl, wavePreset);
-    }
-    if (Number.isFinite(targetT) && targetT > 0.2) {
-      nudgeStopToTargetT(surfaces, targetT, wavePreset);
-    }
-
     // autofocus (lens shift)
     const af = bestLensShiftForDesign(surfaces, fieldAngle, rayCount, wavePreset);
     const lensShiftRaw = af.ok ? af.shift : 0;
@@ -3248,33 +3240,11 @@
       const score = MERIT_CFG.hardInvalidPenalty * 0.5 + 80_000 + Math.max(0, Number(phys.penalty || 0));
       return invalidEval(score, lensShift, phys.penalty, { mPhys: phys.penalty, mHard: score });
     }
-    if (Number.isFinite(targetEfl) && targetEfl > 1) {
-      const farMm = Math.abs(efl - targetEfl);
-      if (farMm > 10) {
-        const score = MERIT_CFG.hardInvalidPenalty * 0.25 + 20_000 + farMm * farMm * 40 + Math.max(0, Number(phys.penalty || 0));
-        return invalidEval(score, lensShift, phys.penalty, {
-          mPhys: phys.penalty,
-          mEfl: farMm * farMm * 40,
-          mHard: MERIT_CFG.hardInvalidPenalty * 0.25 + 20_000,
-        });
-      }
-    }
 
     const T = estimateTStopApprox(efl, surfaces, wavePreset);
     if (Number.isFinite(targetT) && targetT > 0 && (!Number.isFinite(T) || T <= 0)) {
       const score = MERIT_CFG.hardInvalidPenalty * 0.5 + 50_000 + Math.max(0, Number(phys.penalty || 0));
       return invalidEval(score, lensShift, phys.penalty, { mPhys: phys.penalty, mHard: score });
-    }
-    if (Number.isFinite(targetT) && targetT > 0 && Number.isFinite(T)) {
-      const tRatio = T / targetT;
-      if (tRatio > MERIT_CFG.maxTRatio || tRatio < MERIT_CFG.minTRatio) {
-        const score = MERIT_CFG.hardInvalidPenalty * 0.35 + 40_000 + (Math.abs(T - targetT) ** 2) * 2000 + Math.max(0, Number(phys.penalty || 0));
-        return invalidEval(score, lensShift, phys.penalty, {
-          mPhys: phys.penalty,
-          mT: (Math.abs(T - targetT) ** 2) * 2000,
-          mHard: MERIT_CFG.hardInvalidPenalty * 0.35 + 40_000,
-        });
-      }
     }
 
     const rays = buildRays(surfaces, fieldAngle, rayCount);
@@ -3294,27 +3264,6 @@
     const maxField = Math.min(maxFieldGeom, maxFieldBundleIc);
     const req = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
     const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
-    const icDiagEval = imageCircleDiagFromHalfFieldMm(efl, maxField);
-    const icTargetEval = imageCircleDiagFromHalfFieldMm(efl, req);
-    if (Number.isFinite(req) && Number.isFinite(maxField) && maxField < req * 0.70) {
-      const short = Math.max(0, req - maxField);
-      const score = MERIT_CFG.hardInvalidPenalty * 0.3 + 30_000 + short * short * 2200 + Math.max(0, Number(phys.penalty || 0));
-      return invalidEval(score, lensShift, phys.penalty, {
-        mPhys: phys.penalty,
-        mIc: short * short * 2200,
-        mCov: short * short * 600,
-        mHard: MERIT_CFG.hardInvalidPenalty * 0.3 + 30_000,
-      });
-    }
-    if (Number.isFinite(icDiagEval) && Number.isFinite(icTargetEval) && icDiagEval < icTargetEval * 0.70) {
-      const shortMm = Math.max(0, icTargetEval - icDiagEval);
-      const score = MERIT_CFG.hardInvalidPenalty * 0.3 + 30_000 + shortMm * shortMm * 1200 + Math.max(0, Number(phys.penalty || 0));
-      return invalidEval(score, lensShift, phys.penalty, {
-        mPhys: phys.penalty,
-        mIc: shortMm * shortMm * 1200,
-        mHard: MERIT_CFG.hardInvalidPenalty * 0.3 + 30_000,
-      });
-    }
 
     const rearVx = lastPhysicalVertexX(surfaces);
     const intrusion = rearVx - (-PL_FFD);
@@ -3362,24 +3311,13 @@
   }
 
   function evalIsUsable(ev, opts = {}) {
-    const targetEfl = Number(opts?.targetEfl);
-    const targetT = Number(opts?.targetT);
     if (!ev || !Number.isFinite(ev.score)) return false;
     if (!Number.isFinite(ev.efl) || ev.efl <= 1) return false;
     if (!Number.isFinite(ev.T) || ev.T <= 0) return false;
     if (!Number.isFinite(ev.bfl)) return false;
-    if (ev.covers !== true) return false;
     if ((ev.breakdown?.hardInvalid) === true) return false;
-    const ic = Number(ev.breakdown?.imageCircleDiag);
-    const icTarget = Number(ev.breakdown?.imageCircleTarget);
-    if (Number.isFinite(ic) && Number.isFinite(icTarget) && ic + 0.2 < icTarget) return false;
     if (!Number.isFinite(ev.intrusion)) return false;
     if (ev.intrusion > MERIT_CFG.maxRearIntrusion + 1e-6) return false;
-    if (Number.isFinite(targetEfl) && targetEfl > 1 && Math.abs(ev.efl - targetEfl) > 6.0) return false;
-    if (Number.isFinite(targetT) && targetT > 0) {
-      if (ev.T > targetT * 1.45) return false;
-      if (ev.T < targetT * 0.5) return false;
-    }
     return true;
   }
 
@@ -3400,24 +3338,13 @@
     const wavePreset = ui.wavePreset?.value || "d";
 
     const userStart = sanitizeLens(lens);
-    const baseSeed = getStandardSeedLens();
-    quickSanity(baseSeed.surfaces);
-
-    const baseNudged = sanitizeLens(baseSeed);
-    nudgeSurfacesToTargetEfl(baseNudged.surfaces, targetEfl, wavePreset);
-    nudgeStopToTargetT(baseNudged.surfaces, targetT, wavePreset);
-    quickSanity(baseNudged.surfaces);
+    const baseStart = getStandardSeedLens();
+    quickSanity(baseStart.surfaces);
 
     const userEval = evalLensMerit(userStart, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
-    const baseSeedEval = evalLensMerit(baseSeed, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
-    const baseNudgedEval = evalLensMerit(baseNudged, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+    const baseEval = evalLensMerit(baseStart, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
 
     const isUsable = (ev) => evalIsUsable(ev, { targetEfl, targetT });
-    const baseSeedUsable = isUsable(baseSeedEval);
-    const baseNudgedUsable = isUsable(baseNudgedEval);
-    const useNudgedBase = baseNudgedUsable && (!baseSeedUsable || baseNudgedEval.score <= baseSeedEval.score);
-    const baseStart = useNudgedBase ? baseNudged : baseSeed;
-    const baseEval = useNudgedBase ? baseNudgedEval : baseSeedEval;
 
     // Keep optimizer around a sane Double-Gauss-like base topology.
     const topo = captureTopology(baseStart);
