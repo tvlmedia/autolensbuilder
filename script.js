@@ -66,12 +66,16 @@
     adFocusTarget: $("#adFocusTarget"),
     adAttempts: $("#adAttempts"),
     adLog: $("#adLog"),
+    surfaceTableWrap: $("#surfaceTableWrap"),
+    statusPanel: $("#statusPanel"),
 
     btnScaleToFocal: $("#btnScaleToFocal"),
     btnSetTStop: $("#btnSetTStop"),
     btnAutoDesign: $("#btnAutoDesign"),
     btnAutoDesignPreview: $("#btnAutoDesignPreview"),
     btnAutoDesignStop: $("#btnAutoDesignStop"),
+    btnAdLogExpand: $("#btnAdLogExpand"),
+    btnAdToggleDetails: $("#btnAdToggleDetails"),
     btnNew: $("#btnNew"),
     btnLoadOmit: $("#btnLoadOmit"),
     btnLoadDemo: $("#btnLoadDemo"),
@@ -1494,6 +1498,8 @@
       adTargetT: ui.adTargetT?.value || "2.0",
       adFocusTarget: ui.adFocusTarget?.value || "both",
       adAttempts: ui.adAttempts?.value || "1",
+      adDetailsCollapsed: adDetailsCollapsed ? "1" : "0",
+      adLogExpanded: adLogExpanded ? "1" : "0",
     };
   }
 
@@ -1514,6 +1520,8 @@
     set(ui.adTargetT, snap.adTargetT);
     set(ui.adFocusTarget, snap.adFocusTarget);
     set(ui.adAttempts, snap.adAttempts);
+    setAdDetailsCollapsed(String(snap.adDetailsCollapsed || "0") === "1");
+    setAdLogExpanded(String(snap.adLogExpanded || "0") === "1");
   }
 
   let _autosaveTimer = 0;
@@ -2805,6 +2813,8 @@
 
   let adRunning = false;
   let adBest = null;
+  let adDetailsCollapsed = false;
+  let adLogExpanded = false;
 
   function setADLog(text) {
     if (!ui.adLog) return;
@@ -2828,6 +2838,34 @@
     if (ui.btnAutoDesign) ui.btnAutoDesign.disabled = !!isRunning;
     if (ui.btnAutoDesignStop) ui.btnAutoDesignStop.disabled = !isRunning;
     if (ui.btnAutoDesignPreview) ui.btnAutoDesignPreview.disabled = !!isRunning || !adBest?.lens;
+  }
+
+  function setAdDetailsCollapsed(collapsed) {
+    adDetailsCollapsed = !!collapsed;
+    ui.surfaceTableWrap?.classList.toggle("isHidden", adDetailsCollapsed);
+    ui.statusPanel?.classList.toggle("isHidden", adDetailsCollapsed);
+    if (ui.btnAdToggleDetails) {
+      ui.btnAdToggleDetails.textContent = adDetailsCollapsed ? "Show details" : "Collapse details";
+    }
+  }
+
+  function toggleAdDetailsCollapsed() {
+    setAdDetailsCollapsed(!adDetailsCollapsed);
+    scheduleAutosave();
+  }
+
+  function setAdLogExpanded(expanded) {
+    adLogExpanded = !!expanded;
+    ui.adLog?.classList.toggle("adLogExpanded", adLogExpanded);
+    if (ui.btnAdLogExpand) {
+      ui.btnAdLogExpand.textContent = adLogExpanded ? "Normal log" : "Bigger log";
+    }
+  }
+
+  function toggleAdLogExpanded() {
+    setAdLogExpanded(!adLogExpanded);
+    if (adLogExpanded) setAdDetailsCollapsed(true);
+    scheduleAutosave();
   }
 
   function adNormalizeFocusTarget(v) {
@@ -3974,14 +4012,16 @@
         return;
       }
 
+      adBest = globalBest;
+
       if (!globalBest.eval.valid) {
         appendADLog(`Best candidate is still invalid: ${globalBest.eval.reasons.join(", ")}`);
         appendADLog(adFormatEval(globalBest.eval));
-        toast("Autodesign klaar, maar constraints niet gehaald");
+        appendADLog(`Preview Best is beschikbaar voor visuele inspectie.`);
+        toast("Autodesign klaar (invalid), maar Preview Best is beschikbaar");
         return;
       }
 
-      adBest = globalBest;
       loadLens(globalBest.lens);
       if (ui.focusMode) ui.focusMode.value = "lens";
       if (ui.sensorOffset) ui.sensorOffset.value = "0";
@@ -4013,6 +4053,11 @@
     const shift = mode === "near"
       ? Number(adBest.eval?.focusNear?.shift || 0)
       : Number(adBest.eval?.focusInf?.shift || 0);
+    const modeTxt = mode === "near"
+      ? "focus 2000mm"
+      : mode === "inf"
+        ? "focus infinity"
+        : "focus infinity (checked on both)";
 
     loadLens(adBest.lens);
     if (ui.focusMode) ui.focusMode.value = "lens";
@@ -4021,7 +4066,7 @@
     scheduleAutosave();
     renderAll();
 
-    appendADLog(`Preview Best loaded (${mode === "near" ? "focus 2000mm" : "focus infinity"}).`);
+    appendADLog(`Preview Best loaded (${modeTxt}).`);
     toast("Preview Best loaded");
   }
 
@@ -4078,6 +4123,8 @@
     });
     ui.btnAutoDesignPreview?.addEventListener("click", previewAutodesignBest);
     ui.btnAutoDesignStop?.addEventListener("click", stopAutodesign);
+    ui.btnAdLogExpand?.addEventListener("click", toggleAdLogExpanded);
+    ui.btnAdToggleDetails?.addEventListener("click", toggleAdDetailsCollapsed);
 
     ui.btnSave?.addEventListener("click", saveJSON);
     ui.fileLoad?.addEventListener("change", (e) => {
@@ -4091,6 +4138,8 @@
     });
 
     ui.btnRaysFS?.addEventListener("click", () => toggleFullscreen(ui.raysPane));
+    setAdLogExpanded(false);
+    setAdDetailsCollapsed(false);
     adSetRunningUI(false);
   }
 

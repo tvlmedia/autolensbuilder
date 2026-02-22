@@ -155,6 +155,14 @@
               <input id="adAttempts" type="number" step="1" min="1" max="12" value="1" />
             </div>
 
+            <div class="ctrl">
+              <button id="btnAdLogExpand" class="btn" type="button">Bigger log</button>
+            </div>
+
+            <div class="ctrl">
+              <button id="btnAdToggleDetails" class="btn" type="button">Collapse details</button>
+            </div>
+
             <div class="ctrl two">
               <label for="adLog">Autodesigner log</label>
               <textarea id="adLog" class="glassNote" rows="4" readonly>—</textarea>
@@ -162,7 +170,7 @@
           </div>
         </section>
 
-        <section class="tableWrap" aria-label="Surface table">
+        <section id="surfaceTableWrap" class="tableWrap" aria-label="Surface table">
           <table class="tbl" aria-describedby="surfaceTableHelp">
             <thead>
               <tr>
@@ -183,7 +191,7 @@
         </section>
       </div>
 
-      <section class="status" aria-label="Status">
+      <section id="statusPanel" class="status" aria-label="Status">
         <div id="statusText" class="statusLine">—</div>
 
         <div class="badges">
