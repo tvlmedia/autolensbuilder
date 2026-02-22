@@ -1848,36 +1848,45 @@
     return { rms, n: ys.length };
   }
 
-  function bestLensShiftForDesign(surfaces, fieldAngle, rayCount, wavePreset) {
+  function bestLensShiftForDesign(surfaces, fieldAngle, rayCount, wavePreset, opts = {}) {
     const sensorX = 0.0;
-    const x0 = 0;
-    const range = 22;
-    const coarseStep = 0.35;
-    const fineStep = 0.07;
+    const shiftMin = Number.isFinite(opts.shiftMin) ? Number(opts.shiftMin) : -30.0;
+    const shiftMax = Number.isFinite(opts.shiftMax) ? Number(opts.shiftMax) : 0.0;
+    const loBound = Math.min(shiftMin, shiftMax);
+    const hiBound = Math.max(shiftMin, shiftMax);
+    const coarseStep = Number.isFinite(opts.coarseStep) ? Math.max(0.02, Number(opts.coarseStep)) : 0.35;
+    const fineStep = Number.isFinite(opts.fineStep) ? Math.max(0.01, Number(opts.fineStep)) : 0.07;
 
-    let best = { shift: x0, rms: Infinity, n: 0 };
+    let best = { shift: clamp(0, loBound, hiBound), rms: Infinity, n: 0 };
 
     function evalShift(shift) {
-      computeVertices(surfaces, shift, sensorX);
+      const sh = clamp(shift, loBound, hiBound);
+      computeVertices(surfaces, sh, sensorX);
+      const rearVx = lastPhysicalEnvelopeX(surfaces);
+      const intrusion = rearVx - (-PL_FFD);
+      if (intrusion > MERIT_CFG.maxRearIntrusion + 1e-6) return { rms: null, n: 0 };
+
       const rays = buildRays(surfaces, fieldAngle, rayCount);
       const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
       return spotRmsAtSensorX(traces, sensorX);
     }
 
-    function scan(center, halfRange, step) {
-      const start = center - halfRange;
-      const end = center + halfRange;
-      for (let sh = start; sh <= end + 1e-9; sh += step) {
+    function scan(start, end, step) {
+      const a = clamp(Math.min(start, end), loBound, hiBound);
+      const b = clamp(Math.max(start, end), loBound, hiBound);
+      for (let sh = a; sh <= b + 1e-9; sh += step) {
         const { rms, n } = evalShift(sh);
         if (rms == null) continue;
         if (rms < best.rms) best = { shift: sh, rms, n };
       }
     }
 
-    scan(x0, range, coarseStep);
-    if (Number.isFinite(best.rms)) scan(best.shift, 2.4, fineStep);
-    if (!Number.isFinite(best.rms) || best.n < 5) return { shift: 0, ok: false, rms: null };
-    return { shift: best.shift, ok: true, rms: best.rms };
+    scan(loBound, hiBound, coarseStep);
+    if (Number.isFinite(best.rms)) scan(best.shift - 2.4, best.shift + 2.4, fineStep);
+    if (!Number.isFinite(best.rms) || best.n < 5) {
+      return { shift: clamp(0, loBound, hiBound), ok: false, rms: null };
+    }
+    return { shift: clamp(best.shift, loBound, hiBound), ok: true, rms: best.rms };
   }
 
   function autoFocus() {
@@ -1888,7 +1897,10 @@
     const rayCount = Number(ui.rayCount?.value || 31);
     const wavePreset = ui.wavePreset?.value || "d";
 
-    const res = bestLensShiftForDesign(lens.surfaces, fieldAngle, rayCount, wavePreset);
+    const res = bestLensShiftForDesign(lens.surfaces, fieldAngle, rayCount, wavePreset, {
+      shiftMin: -30.0,
+      shiftMax: 0.0,
+    });
 
     if (!res.ok) {
       if (ui.footerWarn) ui.footerWarn.textContent =
@@ -1897,7 +1909,7 @@
       return;
     }
 
-    if (ui.lensFocus) ui.lensFocus.value = res.shift.toFixed(2);
+    if (ui.lensFocus) ui.lensFocus.value = clamp(Number(res.shift || 0), -30.0, 0.0).toFixed(2);
     if (ui.footerWarn) ui.footerWarn.textContent =
       `Auto focus (LENS): lensFocus=${res.shift.toFixed(2)}mm • RMS=${res.rms.toFixed(3)}mm`;
 
