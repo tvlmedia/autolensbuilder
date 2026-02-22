@@ -1132,7 +1132,20 @@
     return best;
   }
 
-  function coverageTestBundleMaxFieldDeg(surfaces, wavePreset, sensorX, rayCount) {
+  function coverageTestBundleMaxFieldDeg(surfaces, wavePreset, sensorX, rayCount, opts = {}) {
+    const maxVigFrac = Number.isFinite(opts.maxVigFrac) ? opts.maxVigFrac : IMAGE_CIRCLE_CFG.maxReqVigFrac;
+    const minValidFrac = Number.isFinite(opts.minValidFrac) ? opts.minValidFrac : IMAGE_CIRCLE_CFG.minReqValidFrac;
+
+    const centerPack = traceBundleAtField(surfaces, 0, rayCount, wavePreset, sensorX);
+    const centerVig = Number(centerPack?.vigFrac);
+    const centerValid = Number(centerPack?.n || 0) / Math.max(1, rayCount);
+    const centerOk =
+      Number.isFinite(centerVig) &&
+      centerVig <= maxVigFrac &&
+      Number.isFinite(centerValid) &&
+      centerValid >= minValidFrac;
+    if (!centerOk) return 0;
+
     let lo = 0, hi = 60, best = 0;
     for (let iter = 0; iter < 18; iter++) {
       const mid = (lo + hi) * 0.5;
@@ -1141,9 +1154,9 @@
       const validFrac = Number(pack?.n || 0) / Math.max(1, rayCount);
       const ok =
         Number.isFinite(vigFrac) &&
-        vigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac &&
+        vigFrac <= maxVigFrac &&
         Number.isFinite(validFrac) &&
-        validFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
+        validFrac >= minValidFrac;
       if (ok) {
         best = mid;
         lo = mid;
@@ -1284,9 +1297,12 @@
   };
   const IMAGE_CIRCLE_CFG = {
     minDiagMm: 45.0,        // full-frame coverage floor with small margin
-    maxReqVigFrac: 0.06,    // max vignette fraction at required edge field
-    minReqValidFrac: 0.72,  // minimum valid traced ray fraction at required edge field
-    maxCenterVigFrac: 0.01, // center field should be essentially clean
+    targetGuardMm: 1.0,     // extra diagonal guard so corners stay clean in practice
+    maxReqVigFrac: 0.05,    // optimizer edge requirement at requested field
+    minReqValidFrac: 0.78,  // optimizer minimum valid traced rays at req field
+    maxIcVigFrac: 0.02,     // strict vignette limit for reported "usable IC"
+    minIcValidFrac: 0.90,   // strict valid-ray limit for reported "usable IC"
+    maxCenterVigFrac: 0.005,// center field should be essentially clean
   };
 
   function halfFieldFromDiagDeg(efl, diagMm) {
@@ -1301,7 +1317,7 @@
 
   function targetImageCircleDiagMm(sensorW, sensorH) {
     const sensorDiag = Math.hypot(sensorW, sensorH);
-    return Math.max(sensorDiag, IMAGE_CIRCLE_CFG.minDiagMm);
+    return Math.max(sensorDiag + IMAGE_CIRCLE_CFG.targetGuardMm, IMAGE_CIRCLE_CFG.minDiagMm);
   }
 
   function requiredHalfFieldDeg(efl, sensorW, sensorH, mode = "d") {
@@ -2184,8 +2200,15 @@
     const covMode = COVERAGE_CFG.mode;
     const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
     const maxFieldGeom = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, covHalfMm);
-    const maxFieldBundle = coverageTestBundleMaxFieldDeg(lens.surfaces, wavePreset, sensorX, rayCount);
-    const maxField = Math.min(maxFieldGeom, maxFieldBundle);
+    const maxFieldBundleReq = coverageTestBundleMaxFieldDeg(lens.surfaces, wavePreset, sensorX, rayCount, {
+      maxVigFrac: IMAGE_CIRCLE_CFG.maxReqVigFrac,
+      minValidFrac: IMAGE_CIRCLE_CFG.minReqValidFrac,
+    });
+    const maxFieldBundleIc = coverageTestBundleMaxFieldDeg(lens.surfaces, wavePreset, sensorX, rayCount, {
+      maxVigFrac: IMAGE_CIRCLE_CFG.maxIcVigFrac,
+      minValidFrac: IMAGE_CIRCLE_CFG.minIcValidFrac,
+    });
+    const maxField = Math.min(maxFieldGeom, maxFieldBundleIc);
     const reqFloor = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
     const reqFromFov = coversSensorYesNo({ fov, maxField, mode: covMode, marginDeg: COVERAGE_CFG.marginDeg }).req;
     const req = Number.isFinite(reqFloor) ? reqFloor : reqFromFov;
@@ -2221,7 +2244,7 @@
     const icTargetTxt = Number.isFinite(bd.imageCircleTarget) ? `${bd.imageCircleTarget.toFixed(1)}mm` : "—";
     covTxt = !fov
       ? "COV(D): —"
-      : `COV(D): ±${maxField.toFixed(1)}° (geom ${maxFieldGeom.toFixed(1)}° • illum ${maxFieldBundle.toFixed(1)}°) • REQ(D): ${(req ?? 0).toFixed(1)}° • IC ${icDiagTxt}/${icTargetTxt} • ${coversStrict ? "COVERS ✅" : "NO ❌"}`;
+      : `COV(D): ±${maxField.toFixed(1)}° (geom ${maxFieldGeom.toFixed(1)}° • illum-req ${maxFieldBundleReq.toFixed(1)}° • illum-IC ${maxFieldBundleIc.toFixed(1)}°) • REQ(D): ${(req ?? 0).toFixed(1)}° • IC ${icDiagTxt}/${icTargetTxt} • ${coversStrict ? "COVERS ✅" : "NO ❌"}`;
 
     const meritTxt =
       `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} ` +
@@ -2889,8 +2912,11 @@
     const covMode = COVERAGE_CFG.mode;
     const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
     const maxFieldGeom = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfMm);
-    const maxFieldBundle = coverageTestBundleMaxFieldDeg(surfaces, wavePreset, sensorX, rayCount);
-    const maxField = Math.min(maxFieldGeom, maxFieldBundle);
+    const maxFieldBundleIc = coverageTestBundleMaxFieldDeg(surfaces, wavePreset, sensorX, rayCount, {
+      maxVigFrac: IMAGE_CIRCLE_CFG.maxIcVigFrac,
+      minValidFrac: IMAGE_CIRCLE_CFG.minIcValidFrac,
+    });
+    const maxField = Math.min(maxFieldGeom, maxFieldBundleIc);
     const req = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
     const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
 
