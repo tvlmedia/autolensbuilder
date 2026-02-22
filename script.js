@@ -1324,6 +1324,31 @@
     return Number.isFinite(T) ? T : null;
   }
 
+  function nudgeSurfacesToTargetEfl(surfaces, targetEfl, wavePreset = "d") {
+    if (!Array.isArray(surfaces) || !Number.isFinite(targetEfl) || targetEfl <= 1) return;
+
+    for (let iter = 0; iter < 2; iter++) {
+      computeVertices(surfaces, 0, 0);
+      const para = estimateEflBflParaxial(surfaces, wavePreset);
+      const eflNow = Number(para?.efl);
+      if (!Number.isFinite(eflNow) || eflNow <= 1) break;
+
+      const ratio = targetEfl / eflNow;
+      if (!Number.isFinite(ratio) || Math.abs(ratio - 1) < 0.01) break;
+      const k = clamp(ratio, 0.72, 1.38);
+
+      for (let i = 0; i < surfaces.length; i++) {
+        const s = surfaces[i];
+        const t = String(s?.type || "").toUpperCase();
+        if (t === "OBJ" || t === "IMS") continue;
+        s.R = Number(s.R || 0) * k;
+        s.t = Number(s.t || 0) * k;
+        s.ap = Number(s.ap || 0) * k;
+      }
+      clampAllApertures(surfaces);
+    }
+  }
+
   // -------------------- FOV --------------------
   function deg2rad(d) { return (d * Math.PI) / 180; }
   function rad2deg(r) { return (r * 180) / Math.PI; }
@@ -1588,7 +1613,9 @@
     fieldWeights: [1.0, 1.5, 2.0],
 
     // target terms (optimizer uses these)
-    eflWeight: 2.0,           // penalty per mm error (squared)
+    eflWeight: 8.0,           // penalty per mm error (squared)
+    eflFarThresh: 8.0,        // extra penalty starts beyond this FL error (mm)
+    eflFarWeight: 80.0,       // extra strong penalty for large FL mismatch
     tWeight: 32.0,            // penalty per T error (squared)
     tSlowWeight: 140.0,       // extra penalty when T is slower than target
     bflMin: 52.0,             // for PL: discourage too-short backfocus
@@ -1703,7 +1730,12 @@
     // Targets (optional)
     if (Number.isFinite(targetEfl) && Number.isFinite(efl)){
       const d = (efl - targetEfl);
+      const ad = Math.abs(d);
       merit += MERIT_CFG.eflWeight * (d * d);
+      if (ad > MERIT_CFG.eflFarThresh) {
+        const x = ad - MERIT_CFG.eflFarThresh;
+        merit += MERIT_CFG.eflFarWeight * (x * x);
+      }
     }
     if (Number.isFinite(targetT) && Number.isFinite(T)){
       const d = (T - targetT);
@@ -2945,6 +2977,11 @@
     const ims = surfaces[surfaces.length-1];
     if (ims && String(ims.type).toUpperCase()==="IMS") ims.ap = halfH;
 
+    // Keep search close to the requested focal family before evaluating.
+    if (Number.isFinite(targetEfl) && targetEfl > 1) {
+      nudgeSurfacesToTargetEfl(surfaces, targetEfl, wavePreset);
+    }
+
     // autofocus (lens shift)
     const af = bestLensShiftForDesign(surfaces, fieldAngle, rayCount, wavePreset);
     const lensShift = af.ok ? af.shift : 0;
@@ -2962,6 +2999,13 @@
     if (!Number.isFinite(efl) || efl <= 1) {
       const score = MERIT_CFG.hardInvalidPenalty * 0.5 + 80_000 + Math.max(0, Number(phys.penalty || 0));
       return invalidEval(score, lensShift, phys.penalty);
+    }
+    if (Number.isFinite(targetEfl) && targetEfl > 1) {
+      const farMm = Math.abs(efl - targetEfl);
+      if (farMm > 45) {
+        const score = MERIT_CFG.hardInvalidPenalty * 0.25 + 20_000 + farMm * farMm * 40 + Math.max(0, Number(phys.penalty || 0));
+        return invalidEval(score, lensShift, phys.penalty);
+      }
     }
 
     const T = estimateTStopApprox(efl, surfaces, wavePreset);
