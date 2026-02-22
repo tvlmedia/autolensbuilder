@@ -2808,6 +2808,7 @@
     guardFailPenalty: 900000.0,
     maxSurfaceCount: 32,
   };
+  const AD_BUILD_TAG = "v2-rescue-r3";
 
   const AD_GLASS_CLASSES = {
     CROWN: ["N-BK7HT", "N-BAK4", "N-BAK2", "N-K5", "N-PSK3", "N-SK14"],
@@ -3328,7 +3329,8 @@
     computeVertices(surfaces, 0, 0);
     const { efl } = estimateEflBflParaxial(surfaces, wavePreset);
     if (!Number.isFinite(efl) || efl <= 1) return;
-    const k = clamp(targetEfl / efl, 0.84, 1.18);
+    const ratio = targetEfl / efl;
+    const k = clamp(ratio, 0.25, 3.20);
     if (!Number.isFinite(k) || Math.abs(k - 1) < 0.005) return;
 
     for (const s of surfaces) {
@@ -3340,6 +3342,19 @@
       s.ap = clamp(Number(s.ap || 0) * Math.sqrt(k), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
     }
     clampAllApertures(surfaces);
+  }
+
+  function adApproxSingletPower(surfaces, i, wavePreset = "d") {
+    const a = surfaces?.[i];
+    const b = surfaces?.[i + 1];
+    if (!a || !b) return 0;
+    if (airOrGlass(a?.glass) !== "GLASS") return 0;
+    if (airOrGlass(b?.glass) !== "AIR") return 0;
+    const R1 = Number(a.R || 0);
+    const R2 = Number(b.R || 0);
+    if (Math.abs(R1) < 1e-9 || Math.abs(R2) < 1e-9) return 0;
+    const n = Number(glassN(a.glass, wavePreset) || 1.5);
+    return (n - 1) * ((1 / R1) - (1 / R2));
   }
 
   function adNudgeStopToTargetT(surfaces, targetT, wavePreset) {
@@ -3358,6 +3373,80 @@
       expandMiddleApertures(surfaces, { targetStopAp: surfaces[stopIdx].ap, nearStopHeadroom: 1.12 });
       clampAllApertures(surfaces);
       if (Math.abs(tNow - targetT) < 0.03) break;
+    }
+  }
+
+  function adNudgeBflForPL(surfaces, cfg) {
+    if (!Array.isArray(surfaces) || !surfaces.length) return;
+    const bflMin = Number(cfg?.bflMinMm || AD_CFG.bflMinMm || 52);
+    const targetEfl = Number(cfg?.targetEfl || 50);
+    const targetT = Number(cfg?.targetT || 2.0);
+    const wavePreset = cfg?.wavePreset || "d";
+
+    computeVertices(surfaces, 0, 0);
+    let { bfl } = estimateEflBflParaxial(surfaces, wavePreset);
+    if (!Number.isFinite(bfl)) return;
+    let miss = bflMin - bfl;
+    if (!(miss > 0.25)) return;
+
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    const singlets = [];
+    for (let i = 0; i < surfaces.length - 1; i++) {
+      const a = surfaces[i];
+      const b = surfaces[i + 1];
+      const ta = String(a?.type || "").toUpperCase();
+      const tb = String(b?.type || "").toUpperCase();
+      if (ta === "OBJ" || ta === "IMS" || tb === "OBJ" || tb === "IMS") continue;
+      if (ta === "STOP" || tb === "STOP") continue;
+      if (airOrGlass(a?.glass) !== "GLASS") continue;
+      if (airOrGlass(b?.glass) !== "AIR") continue;
+      singlets.push(i);
+    }
+
+    for (let pass = 0; pass < 3; pass++) {
+      const airBoost = clamp(1 + miss * (pass === 0 ? 0.012 : 0.007), 1.02, 1.32);
+      for (let i = 0; i < surfaces.length - 1; i++) {
+        const s = surfaces[i];
+        const t = String(s?.type || "").toUpperCase();
+        if (t === "OBJ" || t === "IMS") continue;
+        if (airOrGlass(s?.glass) !== "AIR") continue;
+        if (stopIdx >= 0 && i > stopIdx + 1) continue;
+        const floor = stopIdx >= 0 && Math.abs(i - stopIdx) <= 1
+          ? PHYS_CFG.minStopSideAirGap
+          : PHYS_CFG.minThickness;
+        s.t = adClampThicknessForSurface(s, Number(s.t || 0) * airBoost, floor);
+      }
+
+      for (const idx of singlets) {
+        const inFront = stopIdx >= 0 ? idx < stopIdx : idx < Math.floor(surfaces.length * 0.45);
+        const inRear = stopIdx >= 0 ? idx > stopIdx : idx > Math.floor(surfaces.length * 0.45);
+        const p = adApproxSingletPower(surfaces, idx, wavePreset);
+
+        if (inFront && p < 0) {
+          const gain = clamp(1 - miss * 0.0048, 0.72, 0.97);
+          surfaces[idx].R = clampSignedRadius(Number(surfaces[idx].R || 30) * gain);
+          surfaces[idx + 1].R = clampSignedRadius(Number(surfaces[idx + 1].R || -30) * gain);
+        } else if (inRear && p > 0) {
+          const gain = clamp(1 + miss * 0.0038, 1.02, 1.28);
+          surfaces[idx].R = clampSignedRadius(Number(surfaces[idx].R || 30) * gain);
+          surfaces[idx + 1].R = clampSignedRadius(Number(surfaces[idx + 1].R || -30) * gain);
+        }
+      }
+
+      adScaleTowardTargetEfl(surfaces, targetEfl, wavePreset);
+      adNudgeStopToTargetT(surfaces, targetT, wavePreset);
+      adQuickSanity(surfaces, {
+        targetStopAp: adStopApFromTarget(targetEfl, targetT),
+        minRearGap: Number(cfg?.minRearGapMm || AD_CFG.minRearGapMm),
+        targetEfl,
+      });
+
+      computeVertices(surfaces, 0, 0);
+      const est = estimateEflBflParaxial(surfaces, wavePreset);
+      bfl = est?.bfl;
+      if (!Number.isFinite(bfl)) break;
+      miss = bflMin - bfl;
+      if (!(miss > 0.2)) break;
     }
   }
 
@@ -3399,12 +3488,21 @@
     const tmp = sanitizeLens(clone(lensObj));
     const s = tmp.surfaces;
     const stopApTarget = adStopApFromTarget(cfg.targetEfl, cfg.targetT);
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 7; i++) {
       adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm, targetEfl: cfg.targetEfl });
       adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset);
       adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset);
+      adNudgeBflForPL(s, cfg);
       adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount);
       adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm, targetEfl: cfg.targetEfl });
+
+      computeVertices(s, 0, 0);
+      const est = estimateEflBflParaxial(s, cfg.wavePreset);
+      const tNow = estimateTStopApprox(est?.efl, s, cfg.wavePreset);
+      const eflOk = Number.isFinite(est?.efl) && Math.abs(est.efl - cfg.targetEfl) <= cfg.targetEfl * 0.05;
+      const bflOk = Number.isFinite(est?.bfl) && est.bfl >= cfg.bflMinMm - 0.6;
+      const tOk = Number.isFinite(tNow) && tNow <= cfg.targetT * 1.08;
+      if (eflOk && bflOk && tOk) break;
     }
     return sanitizeLens(tmp);
   }
@@ -3966,6 +4064,10 @@
       const changed = op.fn();
       if (!changed) continue;
 
+      adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset);
+      adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset);
+      adNudgeBflForPL(s, cfg);
+      if (Math.random() < 0.70) adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount);
       adQuickSanity(s, {
         targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
         minRearGap: cfg.minRearGapMm,
@@ -3989,12 +4091,37 @@
       minRearGap: cfg.minRearGapMm,
       targetEfl: cfg.targetEfl,
     });
+    adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset);
+    adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset);
+    adNudgeBflForPL(s, cfg);
+    adQuickSanity(s, {
+      targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
+      minRearGap: cfg.minRearGapMm,
+      targetEfl: cfg.targetEfl,
+    });
     if (topo) adEnforceTopology(s, topo);
     return {
       lens: sanitizeLens(L),
       op: chosen?.id || "none",
       topologyChanged: false,
     };
+  }
+
+  function adBuildRescueSeed(cfg, family = "distagon") {
+    let seed = adBuildTemplateByFamily(family, cfg);
+    const tmp = sanitizeLens(clone(seed));
+    const s = tmp.surfaces;
+    const stopApTarget = adStopApFromTarget(cfg.targetEfl, cfg.targetT);
+
+    for (let i = 0; i < 12; i++) {
+      adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm, targetEfl: cfg.targetEfl });
+      adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset);
+      adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset);
+      adNudgeBflForPL(s, cfg);
+      adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount);
+      adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm, targetEfl: cfg.targetEfl });
+    }
+    return sanitizeLens(tmp);
   }
 
   async function adGenerateSeeds(cfg) {
@@ -4046,12 +4173,26 @@
       }
     }
 
+    if (!valid.length) {
+      appendADLog("Seed rescue: generating deterministic fallback seeds...");
+      const rescueFamilies = cfg.targetEfl <= 60
+        ? ["distagon", "retrofocus", "gauss"]
+        : ["retrofocus", "distagon", "sonnar"];
+      for (const fam of rescueFamilies) {
+        const seed = adBuildRescueSeed(cfg, fam);
+        const ev = adEvaluateCandidate(seed, cfg, { quick: false });
+        const item = { family: `${fam}:rescue`, lens: clone(ev.lens), eval: ev };
+        if (ev.valid) valid.push(item);
+        else near.push(item);
+      }
+    }
+
     valid.sort((a, b) => a.eval.score - b.eval.score);
     near.sort((a, b) => a.eval.score - b.eval.score);
 
-    if (valid.length < cfg.minValidSeeds && near.length) {
-      const need = Math.max(0, cfg.minValidSeeds - valid.length);
-      valid.push(...near.slice(0, need));
+    if (!valid.length && near.length) {
+      const take = Math.min(Math.max(1, cfg.minValidSeeds), near.length);
+      valid.push(...near.slice(0, take));
       valid.sort((a, b) => a.eval.score - b.eval.score);
     }
 
@@ -4139,6 +4280,69 @@
     return bestValid || bestAny || { lens: clone(curEval.lens || cur), eval: curEval, iter: cfg.optimizeIters };
   }
 
+  async function adRescueInvalidBest(bestItem, cfg) {
+    const fallback = adBuildRescueSeed(cfg, cfg.targetEfl <= 60 ? "distagon" : "retrofocus");
+    let curLens = sanitizeLens(clone(bestItem?.eval?.lens || bestItem?.lens || fallback));
+    let curEval = adEvaluateCandidate(curLens, cfg, { quick: false });
+    curLens = curEval.lens;
+    let best = { lens: clone(curLens), eval: curEval, iter: 0 };
+
+    for (let iter = 1; iter <= 260; iter++) {
+      if (!adRunning) break;
+      let candEval;
+
+      if (iter % 2 === 0) {
+        const tuned = sanitizeLens(clone(curLens));
+        const s = tuned.surfaces;
+        adQuickSanity(s, {
+          targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
+          minRearGap: cfg.minRearGapMm,
+          targetEfl: cfg.targetEfl,
+        });
+        adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset);
+        adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset);
+        adNudgeBflForPL(s, cfg);
+        adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount);
+        adQuickSanity(s, {
+          targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
+          minRearGap: cfg.minRearGapMm,
+          targetEfl: cfg.targetEfl,
+        });
+        candEval = adEvaluateCandidate(tuned, cfg, { quick: (iter % 6) !== 0 });
+      } else {
+        const m = adMutateLens(curLens, cfg, null, {
+          edgeRmsInf: curEval.focusInf?.rmsEdge,
+          centerRmsInf: curEval.focusInf?.rmsCenter,
+          focusNearOk: curEval.focusNear?.ok,
+        });
+        candEval = adEvaluateCandidate(m.lens, cfg, { quick: (iter % 5) !== 0 });
+      }
+
+      if (
+        candEval.score < curEval.score ||
+        (candEval.valid && !curEval.valid)
+      ) {
+        curEval = candEval;
+        curLens = candEval.lens;
+      }
+
+      if (
+        candEval.score < best.eval.score ||
+        (candEval.valid && !best.eval.valid)
+      ) {
+        best = { lens: clone(candEval.lens), eval: candEval, iter };
+      }
+
+      if (best.eval.valid) break;
+      if (iter % 52 === 0) {
+        appendADLog(`Rescue ${iter}/260 • cur ${curEval.score.toFixed(2)} • best ${best.eval.score.toFixed(2)}`);
+        await adYield();
+      }
+    }
+
+    return best;
+  }
+
   function adFormatEval(ev) {
     if (!ev) return "—";
     const efl = Number.isFinite(ev.efl) ? `${ev.efl.toFixed(2)}mm` : "—";
@@ -4222,7 +4426,7 @@
     try {
       adForceFixedSensorPreset();
       setADLog(
-        `Autodesigner v2 start\n` +
+        `Autodesigner ${AD_BUILD_TAG} start\n` +
         `Target EFL ${targetEfl.toFixed(2)}mm • Target T ${targetT.toFixed(2)}\n` +
         `Focus target: ${focusTarget === "near" ? "2000mm" : focusTarget === "inf" ? "infinity" : "infinity + 2000mm"}\n` +
         `Effort: ${attempts}x (seeds ${cfg.seedCount}, iters ${cfg.optimizeIters}, topK ${cfg.topK})\n` +
@@ -4265,6 +4469,17 @@
       }
 
       adBest = globalBest;
+
+      if (!globalBest.eval.valid) {
+        appendADLog("Stage C: rescue invalid best candidate...");
+        const rescued = await adRescueInvalidBest(globalBest, cfg);
+        if (!adRunning) return;
+        if (rescued?.eval && (rescued.eval.valid || rescued.eval.score < globalBest.eval.score)) {
+          globalBest = rescued;
+          adBest = rescued;
+          appendADLog(`Rescue done: ${adFormatEval(rescued.eval)}`);
+        }
+      }
 
       if (!globalBest.eval.valid) {
         appendADLog(`Best candidate is still invalid: ${globalBest.eval.reasons.join(", ")}`);
