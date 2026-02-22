@@ -3159,7 +3159,7 @@
   function evalLensMerit(lensObj, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH}){
     const tmp = clone(lensObj);
     const surfaces = tmp.surfaces;
-    const invalidEval = (score, lensShift, physPenalty = 0) => ({
+    const invalidEval = (score, lensShift, physPenalty = 0, parts = {}) => ({
       score,
       efl: null,
       T: null,
@@ -3185,17 +3185,17 @@
         reqValidPct: null,
         centerVigOk: false,
         physPenalty: Number(physPenalty || 0),
-        mSharp: null,
-        mVig: null,
-        mCov: null,
-        mIc: null,
-        mIntr: null,
-        mBfl: null,
-        mEfl: null,
-        mT: null,
-        mValid: null,
-        mPhys: Number(physPenalty || 0),
-        mHard: score,
+        mSharp: Number(parts.mSharp ?? 0),
+        mVig: Number(parts.mVig ?? 0),
+        mCov: Number(parts.mCov ?? 0),
+        mIc: Number(parts.mIc ?? 0),
+        mIntr: Number(parts.mIntr ?? 0),
+        mBfl: Number(parts.mBfl ?? 0),
+        mEfl: Number(parts.mEfl ?? 0),
+        mT: Number(parts.mT ?? 0),
+        mValid: Number(parts.mValid ?? 0),
+        mPhys: Number(parts.mPhys ?? physPenalty ?? 0),
+        mHard: Number(parts.mHard ?? Math.max(0, score - Number(physPenalty || 0))),
         hardInvalid: true,
       },
     });
@@ -3217,46 +3217,63 @@
     const af = bestLensShiftForDesign(surfaces, fieldAngle, rayCount, wavePreset);
     const lensShiftRaw = af.ok ? af.shift : 0;
     // During optimization we never push the optical block toward sensor/PL side.
-    const lensShift = clamp(lensShiftRaw, -8.0, 0.0);
+    let lensShift = clamp(lensShiftRaw, -30.0, 0.0);
 
     const sensorX = 0.0;
     computeVertices(surfaces, lensShift, sensorX);
-    const phys = evaluatePhysicalConstraints(surfaces);
+    let phys = evaluatePhysicalConstraints(surfaces);
+    // If rear still intrudes into PL side, push full block further front when possible.
+    let rearVxNow = lastPhysicalVertexX(surfaces);
+    let intrusionNow = rearVxNow - (-PL_FFD);
+    if (intrusionNow > 0.0 && lensShift > -30.0) {
+      const avail = Math.max(0, 30.0 + lensShift);
+      const need = intrusionNow + 0.10;
+      const extra = Math.min(avail, need);
+      if (extra > 1e-6) {
+        lensShift -= extra;
+        computeVertices(surfaces, lensShift, sensorX);
+        phys = evaluatePhysicalConstraints(surfaces);
+        rearVxNow = lastPhysicalVertexX(surfaces);
+        intrusionNow = rearVxNow - (-PL_FFD);
+      }
+    }
 
     if (phys.hardFail) {
       const score = MERIT_CFG.hardInvalidPenalty + Math.max(0, Number(phys.penalty || 0));
-      return invalidEval(score, lensShift, phys.penalty);
+      return invalidEval(score, lensShift, phys.penalty, { mPhys: phys.penalty, mHard: score });
     }
 
     const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
     if (!Number.isFinite(efl) || efl <= 1) {
       const score = MERIT_CFG.hardInvalidPenalty * 0.5 + 80_000 + Math.max(0, Number(phys.penalty || 0));
-      return invalidEval(score, lensShift, phys.penalty);
-    }
-    const bflMountMin = Math.max(MERIT_CFG.bflMin, PL_FFD - 0.25);
-    if (!Number.isFinite(bfl) || bfl < bflMountMin) {
-      const d = Number.isFinite(bfl) ? (bflMountMin - bfl) : 40;
-      const score = MERIT_CFG.hardInvalidPenalty * 0.4 + 60_000 + d * d * 1800 + Math.max(0, Number(phys.penalty || 0));
-      return invalidEval(score, lensShift, phys.penalty);
+      return invalidEval(score, lensShift, phys.penalty, { mPhys: phys.penalty, mHard: score });
     }
     if (Number.isFinite(targetEfl) && targetEfl > 1) {
       const farMm = Math.abs(efl - targetEfl);
       if (farMm > 10) {
         const score = MERIT_CFG.hardInvalidPenalty * 0.25 + 20_000 + farMm * farMm * 40 + Math.max(0, Number(phys.penalty || 0));
-        return invalidEval(score, lensShift, phys.penalty);
+        return invalidEval(score, lensShift, phys.penalty, {
+          mPhys: phys.penalty,
+          mEfl: farMm * farMm * 40,
+          mHard: MERIT_CFG.hardInvalidPenalty * 0.25 + 20_000,
+        });
       }
     }
 
     const T = estimateTStopApprox(efl, surfaces, wavePreset);
     if (Number.isFinite(targetT) && targetT > 0 && (!Number.isFinite(T) || T <= 0)) {
       const score = MERIT_CFG.hardInvalidPenalty * 0.5 + 50_000 + Math.max(0, Number(phys.penalty || 0));
-      return invalidEval(score, lensShift, phys.penalty);
+      return invalidEval(score, lensShift, phys.penalty, { mPhys: phys.penalty, mHard: score });
     }
     if (Number.isFinite(targetT) && targetT > 0 && Number.isFinite(T)) {
       const tRatio = T / targetT;
       if (tRatio > MERIT_CFG.maxTRatio || tRatio < MERIT_CFG.minTRatio) {
         const score = MERIT_CFG.hardInvalidPenalty * 0.35 + 40_000 + (Math.abs(T - targetT) ** 2) * 2000 + Math.max(0, Number(phys.penalty || 0));
-        return invalidEval(score, lensShift, phys.penalty);
+        return invalidEval(score, lensShift, phys.penalty, {
+          mPhys: phys.penalty,
+          mT: (Math.abs(T - targetT) ** 2) * 2000,
+          mHard: MERIT_CFG.hardInvalidPenalty * 0.35 + 40_000,
+        });
       }
     }
 
@@ -3282,19 +3299,32 @@
     if (Number.isFinite(req) && Number.isFinite(maxField) && maxField < req * 0.70) {
       const short = Math.max(0, req - maxField);
       const score = MERIT_CFG.hardInvalidPenalty * 0.3 + 30_000 + short * short * 2200 + Math.max(0, Number(phys.penalty || 0));
-      return invalidEval(score, lensShift, phys.penalty);
+      return invalidEval(score, lensShift, phys.penalty, {
+        mPhys: phys.penalty,
+        mIc: short * short * 2200,
+        mCov: short * short * 600,
+        mHard: MERIT_CFG.hardInvalidPenalty * 0.3 + 30_000,
+      });
     }
     if (Number.isFinite(icDiagEval) && Number.isFinite(icTargetEval) && icDiagEval < icTargetEval * 0.70) {
       const shortMm = Math.max(0, icTargetEval - icDiagEval);
       const score = MERIT_CFG.hardInvalidPenalty * 0.3 + 30_000 + shortMm * shortMm * 1200 + Math.max(0, Number(phys.penalty || 0));
-      return invalidEval(score, lensShift, phys.penalty);
+      return invalidEval(score, lensShift, phys.penalty, {
+        mPhys: phys.penalty,
+        mIc: shortMm * shortMm * 1200,
+        mHard: MERIT_CFG.hardInvalidPenalty * 0.3 + 30_000,
+      });
     }
 
     const rearVx = lastPhysicalVertexX(surfaces);
     const intrusion = rearVx - (-PL_FFD);
     if (intrusion > MERIT_CFG.maxRearIntrusion) {
       const score = MERIT_CFG.hardInvalidPenalty * 0.5 + 90_000 + intrusion * intrusion * 6000 + Math.max(0, Number(phys.penalty || 0));
-      const bad = invalidEval(score, lensShift, phys.penalty);
+      const bad = invalidEval(score, lensShift, phys.penalty, {
+        mPhys: phys.penalty,
+        mIntr: intrusion * intrusion * 6000,
+        mHard: MERIT_CFG.hardInvalidPenalty * 0.5 + 90_000,
+      });
       bad.intrusion = intrusion;
       return bad;
     }
@@ -3334,12 +3364,10 @@
   function evalIsUsable(ev, opts = {}) {
     const targetEfl = Number(opts?.targetEfl);
     const targetT = Number(opts?.targetT);
-    const bflMountMin = Math.max(MERIT_CFG.bflMin, PL_FFD - 0.25);
     if (!ev || !Number.isFinite(ev.score)) return false;
     if (!Number.isFinite(ev.efl) || ev.efl <= 1) return false;
     if (!Number.isFinite(ev.T) || ev.T <= 0) return false;
     if (!Number.isFinite(ev.bfl)) return false;
-    if (ev.bfl < bflMountMin) return false;
     if (ev.covers !== true) return false;
     if ((ev.breakdown?.hardInvalid) === true) return false;
     const ic = Number(ev.breakdown?.imageCircleDiag);
@@ -3396,11 +3424,8 @@
 
     const userUsable = isUsable(userEval);
     const baseUsable = isUsable(baseEval);
-    const bflMountMin = Math.max(MERIT_CFG.bflMin, PL_FFD - 0.25);
     const isMountLegal = (ev) =>
       !!ev &&
-      Number.isFinite(ev.bfl) &&
-      ev.bfl >= bflMountMin &&
       Number.isFinite(ev.intrusion) &&
       ev.intrusion <= MERIT_CFG.maxRearIntrusion + 1e-6;
 
