@@ -1588,9 +1588,9 @@
     fieldWeights: [1.0, 1.5, 2.0],
 
     // target terms (optimizer uses these)
-    eflWeight: 0.35,          // penalty per mm error (squared)
-    tWeight: 24.0,            // penalty per T error (squared)
-    tSlowWeight: 64.0,        // extra penalty when T is slower than target
+    eflWeight: 2.0,           // penalty per mm error (squared)
+    tWeight: 32.0,            // penalty per T error (squared)
+    tSlowWeight: 140.0,       // extra penalty when T is slower than target
     bflMin: 52.0,             // for PL: discourage too-short backfocus
     bflWeight: 6.0,
     lowValidPenalty: 450.0,
@@ -2910,6 +2910,35 @@
   function evalLensMerit(lensObj, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH}){
     const tmp = clone(lensObj);
     const surfaces = tmp.surfaces;
+    const invalidEval = (score, lensShift, physPenalty = 0) => ({
+      score,
+      efl: null,
+      T: null,
+      bfl: null,
+      covers: false,
+      intrusion: 0,
+      vigFrac: 1,
+      lensShift,
+      rms0: null,
+      rmsE: null,
+      breakdown: {
+        rmsCenter: null,
+        rmsEdge: null,
+        vigPct: 100,
+        covers: false,
+        coversStrict: false,
+        intrusion: null,
+        fields: [0, 0, 0],
+        imageCircleDiag: null,
+        imageCircleTarget: null,
+        imageCircleOk: false,
+        reqVigPct: null,
+        reqValidPct: null,
+        centerVigOk: false,
+        physPenalty: Number(physPenalty || 0),
+        hardInvalid: true,
+      },
+    });
 
     // IMS ap = half height
     const halfH = Math.max(0.1, sensorH * 0.5);
@@ -2926,28 +2955,19 @@
 
     if (phys.hardFail) {
       const score = MERIT_CFG.hardInvalidPenalty + Math.max(0, Number(phys.penalty || 0));
-      return {
-        score,
-        efl: null,
-        T: null,
-        bfl: null,
-        covers: false,
-        intrusion: 0,
-        vigFrac: 1,
-        lensShift,
-        rms0: null,
-        rmsE: null,
-        breakdown: {
-          rmsCenter: null,
-          rmsEdge: null,
-          vigPct: 100,
-          covers: false,
-          intrusion: null,
-          fields: [0, 0, 0],
-          physPenalty: Number(phys.penalty || 0),
-          hardInvalid: true,
-        },
-      };
+      return invalidEval(score, lensShift, phys.penalty);
+    }
+
+    const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
+    if (!Number.isFinite(efl) || efl <= 1) {
+      const score = MERIT_CFG.hardInvalidPenalty * 0.5 + 80_000 + Math.max(0, Number(phys.penalty || 0));
+      return invalidEval(score, lensShift, phys.penalty);
+    }
+
+    const T = estimateTStopApprox(efl, surfaces, wavePreset);
+    if (Number.isFinite(targetT) && targetT > 0 && (!Number.isFinite(T) || T <= 0)) {
+      const score = MERIT_CFG.hardInvalidPenalty * 0.5 + 50_000 + Math.max(0, Number(phys.penalty || 0));
+      return invalidEval(score, lensShift, phys.penalty);
     }
 
     const rays = buildRays(surfaces, fieldAngle, rayCount);
@@ -2955,9 +2975,6 @@
 
     const vCount = traces.filter(t=>t.vignetted).length;
     const vigFrac = traces.length ? (vCount / traces.length) : 1;
-
-    const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
-    const T = estimateTStopApprox(efl, surfaces, wavePreset);
 
     const fov = computeFovDeg(efl, sensorW, sensorH);
     const covMode = COVERAGE_CFG.mode;
