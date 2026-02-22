@@ -1714,7 +1714,17 @@
     const fields = [f0, f1, f2];
     const fieldWeights = MERIT_CFG.fieldWeights;
 
-    let merit = 0;
+    let mSharp = 0;
+    let mVig = 0;
+    let mCov = 0;
+    let mIc = 0;
+    let mIntr = 0;
+    let mBfl = 0;
+    let mEfl = 0;
+    let mT = 0;
+    let mValid = 0;
+    let mPhys = 0;
+    let mHard = 0;
     let rmsCenter = null, rmsEdge = null;
     let vigAvg = 0;
     let vigCenter = 1;
@@ -1735,16 +1745,16 @@
       if (k === 1) vigMid = pack.vigFrac;
 
       const rn = rms / MERIT_CFG.rmsNorm;
-      merit += fieldWeights[k] * (rn * rn);
+      mSharp += fieldWeights[k] * (rn * rn);
     }
 
-    merit += MERIT_CFG.vigWeight * (vigAvg * vigAvg);
-    merit += MERIT_CFG.centerVigWeight * (vigCenter * vigCenter);
-    merit += MERIT_CFG.midVigWeight * (vigMid * vigMid);
-    if (!covers) merit += MERIT_CFG.covPenalty;
+    mVig += MERIT_CFG.vigWeight * (vigAvg * vigAvg);
+    mVig += MERIT_CFG.centerVigWeight * (vigCenter * vigCenter);
+    mVig += MERIT_CFG.midVigWeight * (vigMid * vigMid);
+    if (!covers) mCov += MERIT_CFG.covPenalty;
     if (Number.isFinite(req) && Number.isFinite(maxField) && maxField < req) {
       const d = req - maxField;
-      merit += MERIT_CFG.covShortfallWeight * (d * d);
+      mCov += MERIT_CFG.covShortfallWeight * (d * d);
     }
 
     const imageCircleDiag = imageCircleDiagFromHalfFieldMm(efl, maxField);
@@ -1753,7 +1763,7 @@
       ? Math.max(0, imageCircleTarget - imageCircleDiag)
       : null;
     if (Number.isFinite(imageCircleShortfall) && imageCircleShortfall > 0) {
-      merit += MERIT_CFG.imageCircleShortfallWeight * (imageCircleShortfall * imageCircleShortfall);
+      mIc += MERIT_CFG.imageCircleShortfallWeight * (imageCircleShortfall * imageCircleShortfall);
     }
 
     let reqVigFrac = null;
@@ -1764,49 +1774,51 @@
       reqValidFrac = (packReq.n || 0) / Math.max(1, rayCount);
       if (Number.isFinite(reqVigFrac) && reqVigFrac > IMAGE_CIRCLE_CFG.maxReqVigFrac) {
         const d = reqVigFrac - IMAGE_CIRCLE_CFG.maxReqVigFrac;
-        merit += MERIT_CFG.imageCircleReqVigWeight * (d * d);
+        mIc += MERIT_CFG.imageCircleReqVigWeight * (d * d);
       }
       if (Number.isFinite(reqValidFrac) && reqValidFrac < IMAGE_CIRCLE_CFG.minReqValidFrac) {
         const d = IMAGE_CIRCLE_CFG.minReqValidFrac - reqValidFrac;
-        merit += MERIT_CFG.imageCircleReqValidWeight * (d * d);
+        mIc += MERIT_CFG.imageCircleReqValidWeight * (d * d);
       }
     }
 
     if (Number.isFinite(intrusion) && intrusion > 0){
       const x = intrusion / 1.0;
-      merit += MERIT_CFG.intrusionWeight * (x * x);
+      mIntr += MERIT_CFG.intrusionWeight * (x * x);
     }
 
     // BFL soft-constraint (paraxial) – helps keep designs physically plausible
     if (Number.isFinite(bfl) && bfl < MERIT_CFG.bflMin){
       const d = (MERIT_CFG.bflMin - bfl);
-      merit += MERIT_CFG.bflWeight * (d * d);
+      mBfl += MERIT_CFG.bflWeight * (d * d);
     }
 
     // Targets (optional)
     if (Number.isFinite(targetEfl) && Number.isFinite(efl)){
       const d = (efl - targetEfl);
       const ad = Math.abs(d);
-      merit += MERIT_CFG.eflWeight * (d * d);
+      mEfl += MERIT_CFG.eflWeight * (d * d);
       if (ad > MERIT_CFG.eflFarThresh) {
         const x = ad - MERIT_CFG.eflFarThresh;
-        merit += MERIT_CFG.eflFarWeight * (x * x);
+        mEfl += MERIT_CFG.eflFarWeight * (x * x);
       }
     }
     if (Number.isFinite(targetT) && Number.isFinite(T)){
       const d = (T - targetT);
-      merit += MERIT_CFG.tWeight * (d * d);
-      if (d > 0) merit += MERIT_CFG.tSlowWeight * (d * d);
+      mT += MERIT_CFG.tWeight * (d * d);
+      if (d > 0) mT += MERIT_CFG.tSlowWeight * (d * d);
     }
 
     const minValidTarget = Math.max(7, Math.floor(rayCount * 0.45));
     if (validMin < minValidTarget) {
       const d = (minValidTarget - validMin);
-      merit += MERIT_CFG.lowValidPenalty + 32.0 * d * d;
+      mValid += MERIT_CFG.lowValidPenalty + 32.0 * d * d;
     }
 
-    if (Number.isFinite(physPenalty) && physPenalty > 0) merit += physPenalty;
-    if (hardInvalid) merit += MERIT_CFG.hardInvalidPenalty;
+    if (Number.isFinite(physPenalty) && physPenalty > 0) mPhys += physPenalty;
+    if (hardInvalid) mHard += MERIT_CFG.hardInvalidPenalty;
+
+    const merit = mSharp + mVig + mCov + mIc + mIntr + mBfl + mEfl + mT + mValid + mPhys + mHard;
 
     const imageCircleOk =
       Number.isFinite(imageCircleDiag) &&
@@ -1833,6 +1845,7 @@
       reqValidPct: Number.isFinite(reqValidFrac) ? Math.round(reqValidFrac * 100) : null,
       centerVigOk,
       physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
+      mSharp, mVig, mCov, mIc, mIntr, mBfl, mEfl, mT, mValid, mPhys, mHard,
       hardInvalid: !!hardInvalid,
     };
 
@@ -2390,6 +2403,7 @@
       `${Number.isFinite(bd.imageCircleDiag) ? ` • IC ${bd.imageCircleDiag.toFixed(1)}mm` : ""}` +
       `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""}` +
       `${bd.physPenalty > 0 ? ` • PHYS +${bd.physPenalty.toFixed(1)}` : ""}` +
+      `${Number.isFinite(bd.mSharp) ? ` • M{S ${bd.mSharp.toFixed(1)} FL ${bd.mEfl?.toFixed?.(1) ?? "—"} T ${bd.mT?.toFixed?.(1) ?? "—"} V ${bd.mVig?.toFixed?.(1) ?? "—"} IC ${bd.mIc?.toFixed?.(1) ?? "—"} I ${bd.mIntr?.toFixed?.(1) ?? "—"} P ${bd.mPhys?.toFixed?.(1) ?? "—"}}` : ""}` +
       `${bd.hardInvalid ? " • INVALID ❌" : ""})`;
 
     if (ui.merit) ui.merit.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
@@ -2443,7 +2457,12 @@
       ui.status.textContent =
         `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${covTxt} • ${meritTxt}`;
     }
-    if (ui.metaInfo) ui.metaInfo.textContent = `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm`;
+    if (ui.metaInfo) {
+      ui.metaInfo.textContent =
+        `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm • ` +
+        `Sharp ${fmtOptScore(bd.mSharp)} • FL ${fmtOptScore(bd.mEfl)} • T ${fmtOptScore(bd.mT)} • ` +
+        `Vig ${fmtOptScore(bd.mVig)} • IC ${fmtOptScore(bd.mIc)} • Intr ${fmtOptScore(bd.mIntr)} • Phys ${fmtOptScore(bd.mPhys)}`;
+    }
 
     resizeCanvasToCSS();
     const r = canvas.getBoundingClientRect();
@@ -2880,6 +2899,19 @@
     return Number.isFinite(x) ? x.toFixed(2) : "—";
   }
 
+  function fmtOptScore(x) {
+    return Number.isFinite(x) ? x.toFixed(1) : "—";
+  }
+
+  function meritPartsLine(bd) {
+    if (!bd) return "Mparts: —";
+    return (
+      `Mparts: Sharp ${fmtOptScore(bd.mSharp)} • FL ${fmtOptScore(bd.mEfl)} • ` +
+      `T ${fmtOptScore(bd.mT)} • Vig ${fmtOptScore(bd.mVig)} • ` +
+      `IC ${fmtOptScore(bd.mIc)} • Intr ${fmtOptScore(bd.mIntr)} • Phys ${fmtOptScore(bd.mPhys)}`
+    );
+  }
+
   function randn(){
     // Box–Muller
     let u = 0, v = 0;
@@ -3153,6 +3185,17 @@
         reqValidPct: null,
         centerVigOk: false,
         physPenalty: Number(physPenalty || 0),
+        mSharp: null,
+        mVig: null,
+        mCov: null,
+        mIc: null,
+        mIntr: null,
+        mBfl: null,
+        mEfl: null,
+        mT: null,
+        mValid: null,
+        mPhys: Number(physPenalty || 0),
+        mHard: score,
         hardInvalid: true,
       },
     });
@@ -3188,6 +3231,12 @@
     const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
     if (!Number.isFinite(efl) || efl <= 1) {
       const score = MERIT_CFG.hardInvalidPenalty * 0.5 + 80_000 + Math.max(0, Number(phys.penalty || 0));
+      return invalidEval(score, lensShift, phys.penalty);
+    }
+    const bflMountMin = Math.max(MERIT_CFG.bflMin, PL_FFD - 0.25);
+    if (!Number.isFinite(bfl) || bfl < bflMountMin) {
+      const d = Number.isFinite(bfl) ? (bflMountMin - bfl) : 40;
+      const score = MERIT_CFG.hardInvalidPenalty * 0.4 + 60_000 + d * d * 1800 + Math.max(0, Number(phys.penalty || 0));
       return invalidEval(score, lensShift, phys.penalty);
     }
     if (Number.isFinite(targetEfl) && targetEfl > 1) {
@@ -3285,16 +3334,19 @@
   function evalIsUsable(ev, opts = {}) {
     const targetEfl = Number(opts?.targetEfl);
     const targetT = Number(opts?.targetT);
+    const bflMountMin = Math.max(MERIT_CFG.bflMin, PL_FFD - 0.25);
     if (!ev || !Number.isFinite(ev.score)) return false;
     if (!Number.isFinite(ev.efl) || ev.efl <= 1) return false;
     if (!Number.isFinite(ev.T) || ev.T <= 0) return false;
     if (!Number.isFinite(ev.bfl)) return false;
+    if (ev.bfl < bflMountMin) return false;
     if (ev.covers !== true) return false;
     if ((ev.breakdown?.hardInvalid) === true) return false;
     const ic = Number(ev.breakdown?.imageCircleDiag);
     const icTarget = Number(ev.breakdown?.imageCircleTarget);
     if (Number.isFinite(ic) && Number.isFinite(icTarget) && ic + 0.2 < icTarget) return false;
-    if (Number.isFinite(ev.intrusion) && ev.intrusion > MERIT_CFG.maxRearIntrusion + 1e-6) return false;
+    if (!Number.isFinite(ev.intrusion)) return false;
+    if (ev.intrusion > MERIT_CFG.maxRearIntrusion + 1e-6) return false;
     if (Number.isFinite(targetEfl) && targetEfl > 1 && Math.abs(ev.efl - targetEfl) > 6.0) return false;
     if (Number.isFinite(targetT) && targetT > 0) {
       if (ev.T > targetT * 1.45) return false;
@@ -3344,6 +3396,13 @@
 
     const userUsable = isUsable(userEval);
     const baseUsable = isUsable(baseEval);
+    const bflMountMin = Math.max(MERIT_CFG.bflMin, PL_FFD - 0.25);
+    const isMountLegal = (ev) =>
+      !!ev &&
+      Number.isFinite(ev.bfl) &&
+      ev.bfl >= bflMountMin &&
+      Number.isFinite(ev.intrusion) &&
+      ev.intrusion <= MERIT_CFG.maxRearIntrusion + 1e-6;
 
     // Always optimize from the standard/base seed so search stays in a sane family.
     let cur = baseStart;
@@ -3352,6 +3411,7 @@
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
     let bestUsable = isUsable(best.eval);
     let bestSoft = { lens: clone(cur), eval: curEval, iter: 0 };
+    let bestSoftMount = isMountLegal(curEval) ? { lens: clone(cur), eval: curEval, iter: 0 } : null;
     const logCtx = { wavePreset, sensorW, sensorH, rayCount };
     const icText = (v) => {
       const ic = v?.icDiag;
@@ -3407,6 +3467,7 @@
             `EFL ${fmtOptMm(bestView.efl)} (target ${targetEfl})\n` +
             `T ${fmtOptNum(bestView.T)} (target ${targetT})\n` +
             `COV ${bestView.covers?"YES":"NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n` +
+            `${meritPartsLine(best.eval?.breakdown)}\n` +
             `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
           );
         }
@@ -3414,6 +3475,9 @@
 
       if (candEval.score < bestSoft.eval.score) {
         bestSoft = { lens: clone(cand), eval: candEval, iter: i };
+      }
+      if (isMountLegal(candEval) && (!bestSoftMount || candEval.score < bestSoftMount.eval.score)) {
+        bestSoftMount = { lens: clone(cand), eval: candEval, iter: i };
       }
 
       if (i % BATCH === 0){
@@ -3428,8 +3492,10 @@
           setOptLog(
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
             `current ${curEval.score.toFixed(2)} • EFL ${fmtOptMm(curView.efl)} • T ${fmtOptNum(curView.T)} • ${icText(curView)}\n` +
+            `${meritPartsLine(curEval?.breakdown)}\n` +
             `${bestLabel} ${bestRef.eval.score.toFixed(2)} @${bestRef.iter}\n` +
-            `best: EFL ${fmtOptMm(bestView.efl)} • T ${fmtOptNum(bestView.T)} • COV ${bestView.covers?"YES":"NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n`
+            `best: EFL ${fmtOptMm(bestView.efl)} • T ${fmtOptNum(bestView.T)} • COV ${bestView.covers?"YES":"NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n` +
+            `${meritPartsLine(bestRef.eval?.breakdown)}\n`
           );
         }
         // yield to UI
@@ -3444,25 +3510,46 @@
     }
 
     if (!bestUsable) {
-      const fallback = bestSoft || best;
-      const fallbackView = evalViewForLog(fallback?.lens, fallback?.eval, logCtx);
-      optBest = fallback;
+      const fallbackCandidates = [];
+      if (bestSoftMount) fallbackCandidates.push(bestSoftMount);
+      if (isMountLegal(baseEval)) fallbackCandidates.push({ lens: clone(baseStart), eval: baseEval, iter: 0 });
+      if (isMountLegal(userEval)) fallbackCandidates.push({ lens: clone(userStart), eval: userEval, iter: 0 });
+
+      const fallback = fallbackCandidates.sort((a, b) => a.eval.score - b.eval.score)[0] || null;
       optRunning = false;
 
       const tEnd = performance.now();
       const sec = (tEnd - tStart) / 1000;
+      if (!fallback) {
+        optBest = null;
+        if (ui.optLog){
+          const curView = evalViewForLog(cur, curEval, logCtx);
+          setOptLog(
+            `done ${iters}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
+            `NO mount-legal design found (everything ends behind PL flange).\n` +
+            `Current: EFL ${fmtOptMm(curView.efl)} • T ${fmtOptNum(curView.T)} • ${icText(curView)} • INTR ${fmtOptMm(curView.intrusion)}\n` +
+            `${meritPartsLine(curEval?.breakdown)}\n`
+          );
+        }
+        toast("Optimize done: no mount-legal candidate");
+        return;
+      }
+
+      const fallbackView = evalViewForLog(fallback.lens, fallback.eval, logCtx);
+      optBest = fallback;
       if (ui.optLog){
         setOptLog(
           `done ${iters}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
-          `NO fully valid design found for current constraints.\n` +
-          `Closest candidate:\n` +
+          `NO fully valid design found for current constraints (but mount-legal fallback found).\n` +
+          `Closest mount-legal candidate:\n` +
           `EFL ${fmtOptMm(fallbackView.efl)} (target ${targetEfl})\n` +
           `T ${fmtOptNum(fallbackView.T)} (target ${targetT})\n` +
           `COV ${fallbackView.covers?"YES":"NO"} • ${icText(fallbackView)} • INTR ${fmtOptMm(fallbackView.intrusion)}\n` +
+          `${meritPartsLine(fallback.eval?.breakdown)}\n` +
           `You can still click “Apply best” to inspect this closest candidate.\n`
         );
       }
-      toast("Optimize done: closest candidate saved");
+      toast("Optimize done: mount-legal fallback saved");
       return;
     }
 
@@ -3479,6 +3566,7 @@
         `EFL ${fmtOptMm(bestView.efl)} (target ${targetEfl})\n` +
         `T ${fmtOptNum(bestView.T)} (target ${targetT})\n` +
         `COV ${bestView.covers?"YES":"NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n` +
+        `${meritPartsLine(best.eval?.breakdown)}\n` +
         `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
         `Click “Apply best” to load.`
       );
