@@ -1385,7 +1385,13 @@
       if (!Number.isFinite(desiredStopAp) || desiredStopAp <= AP_MIN) break;
       surfaces[stopIdx].ap = desiredStopAp;
 
-      expandMiddleApertures(surfaces, { targetStopAp: desiredStopAp });
+      expandMiddleApertures(surfaces, {
+        targetStopAp: desiredStopAp,
+        minMiddleVsEdge: 0.98,
+        minStopVsEdge: 1.05,
+        stopHeadroom: 1.12,
+        nearStopHeadroom: 1.26,
+      });
       clampAllApertures(surfaces);
 
       const tNow = estimateTStopApprox(eflNow, surfaces, wavePreset);
@@ -1398,8 +1404,91 @@
       }
     }
 
-    expandMiddleApertures(surfaces);
+    expandMiddleApertures(surfaces, {
+      minMiddleVsEdge: 0.96,
+      minStopVsEdge: 1.02,
+      stopHeadroom: 1.10,
+      nearStopHeadroom: 1.20,
+    });
     clampAllApertures(surfaces);
+  }
+
+  function nudgeForImageCircleAndCoverage(surfaces, opts = {}) {
+    if (!Array.isArray(surfaces) || surfaces.length < 4) return;
+
+    const targetT = Number(opts.targetT);
+    const wavePreset = String(opts.wavePreset || "d");
+    const icShortMm = Math.max(0, Number(opts.icShortMm || 0));
+    const strength = clamp(0.25 + icShortMm / 24, 0.25, 1.50);
+
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    computeVertices(surfaces, 0, 0);
+    const para = estimateEflBflParaxial(surfaces, wavePreset);
+    const eflNow = Number(para?.efl);
+    const desiredStopAp = (Number.isFinite(targetT) && targetT > 0.2 && Number.isFinite(eflNow) && eflNow > 1)
+      ? (eflNow / (2 * targetT))
+      : null;
+
+    const physIdx = [];
+    for (let i = 0; i < surfaces.length; i++) {
+      const t = String(surfaces[i]?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      physIdx.push(i);
+    }
+    if (physIdx.length < 3) return;
+
+    // Open clear apertures with emphasis on stop vicinity + edges (entrance/exit pupils).
+    for (let k = 0; k < physIdx.length; k++) {
+      const i = physIdx[k];
+      const s = surfaces[i];
+
+      const pos = physIdx.length <= 1 ? 0.5 : (k / (physIdx.length - 1));
+      const centerBias = 1 - Math.abs(pos * 2 - 1); // 0..1
+      const distStop = stopIdx >= 0 ? Math.abs(i - stopIdx) : 99;
+
+      const stopBias =
+        distStop === 0 ? (1 + 0.35 * strength) :
+        distStop === 1 ? (1 + 0.24 * strength) :
+        distStop === 2 ? (1 + 0.14 * strength) :
+        1.0;
+      const edgeBias = (k === 0 || k === physIdx.length - 1) ? (1 + 0.28 * strength) : 1.0;
+      const centerMul = 1 + centerBias * 0.22 * strength;
+      const baseMul = 1 + 0.10 * strength;
+      const mul = baseMul * centerMul * stopBias * edgeBias;
+
+      s.ap = clamp(Number(s.ap || AP_MIN) * mul, AP_MIN, PHYS_CFG.maxAperture);
+      clampSurfaceAp(s);
+    }
+
+    if (stopIdx >= 0 && Number.isFinite(desiredStopAp) && desiredStopAp > AP_MIN) {
+      const sStop = surfaces[stopIdx];
+      sStop.ap = Math.max(Number(sStop.ap || 0), desiredStopAp * (1.05 + 0.20 * strength));
+      clampSurfaceAp(sStop);
+    }
+
+    expandMiddleApertures(surfaces, {
+      targetStopAp: Number.isFinite(desiredStopAp) ? desiredStopAp : null,
+      minMiddleVsEdge: 1.00,
+      minStopVsEdge: 1.08,
+      stopHeadroom: 1.15,
+      nearStopHeadroom: 1.32,
+    });
+
+    // Slightly increase air around stop and central section to help off-axis rays clear.
+    for (let k = 0; k < physIdx.length; k++) {
+      const i = physIdx[k];
+      const s = surfaces[i];
+      const mediumAfter = String(resolveGlassName(s?.glass || "AIR")).toUpperCase();
+      if (mediumAfter !== "AIR") continue;
+      const distStop = stopIdx >= 0 ? Math.abs(i - stopIdx) : 99;
+      const localMul = distStop <= 2 ? (1 + 0.30 * strength) : (1 + 0.12 * strength);
+      const tMin = PHYS_CFG.minAirGap;
+      const tMax = Math.max(tMin, Math.min(PHYS_CFG.maxThickness, 20.0));
+      s.t = clamp(Number(s.t || tMin) * localMul, tMin, tMax);
+    }
+
+    clampAllApertures(surfaces);
+    enforcePairGapByAperture(surfaces, { usePreferredAir: true });
   }
 
   // -------------------- FOV --------------------
@@ -2938,9 +3027,9 @@
 
   const OPT_PRIORITY_ORDER_CFG = {
     // "Tie" windows before we look at the next priority axis.
-    flTieMm: 0.08,
-    tTie: 0.04,
-    icTieMm: 0.25,
+    flTieMm: 0.20,
+    tTie: 0.08,
+    icTieMm: 0.35,
   };
 
   function evalPriorityMetrics(ev, { targetEfl = null, targetT = null } = {}) {
@@ -3038,6 +3127,21 @@
     const ic = Number.isFinite(m.icShort) ? `${m.icShort.toFixed(2)}mm` : "—";
     const cov = m.covFail ? "COV miss" : "COV ok";
     return `Perr: FL ${fl} • T ${t} • ICshort ${ic} • ${cov}`;
+  }
+
+  function optimizerPhaseFromEval(ev, opts = {}) {
+    const m = evalPriorityMetrics(ev, opts);
+    if (!Number.isFinite(m.flErr) || m.flErr > 0.35) return "fl";
+    if (!Number.isFinite(m.tErr) || m.tErr > 0.22) return "t";
+    if (!Number.isFinite(m.icShort) || m.icShort > 1.50 || m.covFail > 0) return "ic";
+    return "refine";
+  }
+
+  function optimizerPhaseLabel(phase) {
+    if (phase === "fl") return "FL-lock";
+    if (phase === "t") return "T-tune";
+    if (phase === "ic") return "IC-boost";
+    return "Refine";
   }
 
   function randn(){
@@ -3165,6 +3269,7 @@
     L.name = baseLens.name;
 
     const s = L.surfaces;
+    const phaseHint = String(target?.phase || "");
 
     // occasionally: add/remove a surface (wild mode)
     if (!topo && mode === "wild" && Math.random() < 0.03){
@@ -3198,7 +3303,11 @@
       const choice = Math.random();
       if (choice < 0.45){
         // radius tweak
-        const scale = topo ? (mode === "wild" ? 0.16 : 0.08) : (mode === "wild" ? 0.35 : 0.18);
+        const scale = topo
+          ? (phaseHint === "fl"
+              ? (mode === "wild" ? 0.20 : 0.10)
+              : (mode === "wild" ? 0.15 : 0.07))
+          : (mode === "wild" ? 0.35 : 0.18);
         const d = randn() * scale;
         const R = Number(ss.R || 0);
         const absR = Math.max(PHYS_CFG.minRadius, Math.abs(R));
@@ -3206,14 +3315,26 @@
         ss.R = (R >= 0 ? 1 : -1) * clamp(newAbs, PHYS_CFG.minRadius, 450);
       } else if (choice < 0.70){
         // thickness tweak
-        const scale = topo ? (mode === "wild" ? 0.20 : 0.10) : (mode === "wild" ? 0.55 : 0.25);
+        const scale = topo
+          ? (phaseHint === "ic"
+              ? (mode === "wild" ? 0.32 : 0.18)
+              : phaseHint === "t"
+                ? (mode === "wild" ? 0.24 : 0.13)
+                : (mode === "wild" ? 0.18 : 0.09))
+          : (mode === "wild" ? 0.55 : 0.25);
         const d = randn() * scale;
         const mediumAfter = String(resolveGlassName(ss.glass || "AIR")).toUpperCase();
         const minT = (mediumAfter === "AIR") ? PHYS_CFG.optMinAirGap : PHYS_CFG.minGlassCT;
         ss.t = clamp(Number(ss.t||0) * (1 + d), minT, 42);
       } else if (choice < 0.88){
         // aperture tweak
-        const scale = topo ? (mode === "wild" ? 0.18 : 0.10) : (mode === "wild" ? 0.45 : 0.20);
+        const scale = topo
+          ? (phaseHint === "ic"
+              ? (mode === "wild" ? 0.42 : 0.24)
+              : phaseHint === "t"
+                ? (mode === "wild" ? 0.30 : 0.18)
+                : (mode === "wild" ? 0.16 : 0.09))
+          : (mode === "wild" ? 0.45 : 0.20);
         const d = randn() * scale;
         ss.ap = clamp(Number(ss.ap||0) * (1 + d), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
       } else {
@@ -3244,15 +3365,32 @@
     if (s.length) s[0].type = "OBJ";
     if (s.length) s[s.length-1].type = "IMS";
 
-    if (topo && target && Math.random() < 0.30) {
+    if (topo && target) {
       const tgtEfl = Number(target.efl);
       const tgtT = Number(target.t);
+      const icShortNow = Number(target.icShortNow || 0);
       const wp = String(target.wavePreset || "d");
-      if (Number.isFinite(tgtEfl) && tgtEfl > 1) nudgeSurfacesToTargetEfl(s, tgtEfl, wp);
-      if (Number.isFinite(tgtT) && tgtT > 0.2) nudgeStopToTargetT(s, tgtT, wp);
+      const guideP = phaseHint === "ic" ? 0.90 : phaseHint === "t" ? 0.82 : 0.68;
+      if (Math.random() < guideP) {
+        if (phaseHint === "fl") {
+          if (Number.isFinite(tgtEfl) && tgtEfl > 1) nudgeSurfacesToTargetEfl(s, tgtEfl, wp);
+          if (Number.isFinite(tgtT) && tgtT > 0.2 && Math.random() < 0.30) nudgeStopToTargetT(s, tgtT, wp);
+        } else if (phaseHint === "t") {
+          if (Number.isFinite(tgtT) && tgtT > 0.2) nudgeStopToTargetT(s, tgtT, wp);
+          if (Number.isFinite(tgtEfl) && tgtEfl > 1) nudgeSurfacesToTargetEfl(s, tgtEfl, wp);
+        } else {
+          // ic/refine: keep T near target and aggressively open coverage.
+          if (Number.isFinite(tgtT) && tgtT > 0.2) nudgeStopToTargetT(s, tgtT, wp);
+          nudgeForImageCircleAndCoverage(s, { targetT: tgtT, wavePreset: wp, icShortMm: icShortNow });
+          if (Number.isFinite(tgtEfl) && tgtEfl > 1) nudgeSurfacesToTargetEfl(s, tgtEfl, wp);
+        }
+      }
     }
 
     if (topo?.anchors?.length === s.length) {
+      const apHiMul = phaseHint === "ic" ? 2.60 : phaseHint === "t" ? 2.25 : 1.95;
+      const airTHiMul = phaseHint === "ic" ? 2.80 : phaseHint === "t" ? 2.25 : 1.70;
+      const glassTHiMul = phaseHint === "ic" ? 2.25 : phaseHint === "t" ? 1.95 : 1.55;
       for (let i = 0; i < s.length; i++) {
         const si = s[i];
         const ti = String(si?.type || "").toUpperCase();
@@ -3275,10 +3413,11 @@
         const mediumAfter = String(resolveGlassName(si.glass || "AIR")).toUpperCase();
         const minT = (mediumAfter === "AIR") ? PHYS_CFG.optMinAirGap : PHYS_CFG.minGlassCT;
         const aT = Math.max(minT, Number(a.t || minT));
-        si.t = clamp(Number(si.t || aT), Math.max(minT, aT * 0.65), Math.max(minT, aT * 1.55));
+        const tHiMul = (mediumAfter === "AIR") ? airTHiMul : glassTHiMul;
+        si.t = clamp(Number(si.t || aT), Math.max(minT, aT * 0.58), Math.max(minT, aT * tHiMul));
 
         const aAp = Math.max(PHYS_CFG.minAperture, Number(a.ap || PHYS_CFG.minAperture));
-        si.ap = clamp(Number(si.ap || aAp), Math.max(PHYS_CFG.minAperture, aAp * 0.70), Math.min(PHYS_CFG.maxAperture, aAp * 1.50));
+        si.ap = clamp(Number(si.ap || aAp), Math.max(PHYS_CFG.minAperture, aAp * 0.68), Math.min(PHYS_CFG.maxAperture, aAp * apHiMul));
 
         const wantMedium = topo.media?.[i];
         if (wantMedium === "AIR") si.glass = "AIR";
@@ -3528,8 +3667,19 @@
 
       const a = i / iters;
       const temp = temp0 * (1 - a) + temp1 * a;
+      const phaseNow = optimizerPhaseFromEval(curEval, priOpts);
+      const icShortNow = Math.max(
+        0,
+        Number(curEval?.breakdown?.imageCircleTarget || 0) - Number(curEval?.breakdown?.imageCircleDiag || 0)
+      );
 
-      const cand = mutateLens(cur, mode, topo, { efl: targetEfl, t: targetT, wavePreset });
+      const cand = mutateLens(cur, mode, topo, {
+        efl: targetEfl,
+        t: targetT,
+        wavePreset,
+        phase: phaseNow,
+        icShortNow,
+      });
       const candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
       const candUsable = isUsable(candEval);
       const curUsable = isUsable(curEval);
@@ -3564,8 +3714,10 @@
         // UI update (rare)
         if (ui.optLog){
           const bestView = evalViewForLog(best.lens, best.eval, logCtx);
+          const bestPhase = optimizerPhaseLabel(optimizerPhaseFromEval(best.eval, priOpts));
           setOptLog(
             `best @${i}/${iters}\n` +
+            `phase ${bestPhase}\n` +
             `score ${best.eval.score.toFixed(2)}\n` +
             `EFL ${fmtOptMm(bestView.efl)} (target ${targetEfl})\n` +
             `T ${fmtOptNum(bestView.T)} (target ${targetT})\n` +
@@ -3593,12 +3745,16 @@
           const bestLabel = bestUsable ? "best" : "best (no valid yet)";
           const bestView = evalViewForLog(bestRef.lens, bestRef.eval, logCtx);
           const curView = evalViewForLog(cur, curEval, logCtx);
+          const curPhase = optimizerPhaseLabel(optimizerPhaseFromEval(curEval, priOpts));
+          const bestPhase = optimizerPhaseLabel(optimizerPhaseFromEval(bestRef.eval, priOpts));
           setOptLog(
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
+            `phase ${curPhase}\n` +
             `current ${curEval.score.toFixed(2)} • EFL ${fmtOptMm(curView.efl)} • T ${fmtOptNum(curView.T)} • ${icText(curView)}\n` +
             `${priorityLine(curEval, priOpts)}\n` +
             `${meritPartsLine(curEval?.breakdown)}\n` +
             `${bestLabel} ${bestRef.eval.score.toFixed(2)} @${bestRef.iter}\n` +
+            `${bestLabel}-phase ${bestPhase}\n` +
             `best: EFL ${fmtOptMm(bestView.efl)} • T ${fmtOptNum(bestView.T)} • COV ${bestView.covers?"YES":"NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n` +
             `${priorityLine(bestRef.eval, priOpts)}\n` +
             `${meritPartsLine(bestRef.eval?.breakdown)}\n`
@@ -3635,9 +3791,11 @@
         optBest = null;
         if (ui.optLog){
           const curView = evalViewForLog(cur, curEval, logCtx);
+          const curPhase = optimizerPhaseLabel(optimizerPhaseFromEval(curEval, priOpts));
           setOptLog(
             `done ${iters}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
             `NO mount-legal design found (everything ends behind PL flange).\n` +
+            `phase ${curPhase}\n` +
             `Current: EFL ${fmtOptMm(curView.efl)} • T ${fmtOptNum(curView.T)} • ${icText(curView)} • INTR ${fmtOptMm(curView.intrusion)}\n` +
             `${priorityLine(curEval, priOpts)}\n` +
             `${meritPartsLine(curEval?.breakdown)}\n`
@@ -3650,10 +3808,12 @@
       const fallbackView = evalViewForLog(fallback.lens, fallback.eval, logCtx);
       optBest = fallback;
       if (ui.optLog){
+        const fbPhase = optimizerPhaseLabel(optimizerPhaseFromEval(fallback.eval, priOpts));
         setOptLog(
           `done ${iters}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
           `NO fully valid design found for current constraints (but mount-legal fallback found).\n` +
           `Closest mount-legal candidate:\n` +
+          `phase ${fbPhase}\n` +
           `EFL ${fmtOptMm(fallbackView.efl)} (target ${targetEfl})\n` +
           `T ${fmtOptNum(fallbackView.T)} (target ${targetT})\n` +
           `COV ${fallbackView.covers?"YES":"NO"} • ${icText(fallbackView)} • INTR ${fmtOptMm(fallbackView.intrusion)}\n` +
@@ -3673,8 +3833,10 @@
     const sec = (tEnd - tStart) / 1000;
     if (ui.optLog){
       const bestView = evalViewForLog(best.lens, best.eval, logCtx);
+      const bestPhase = optimizerPhaseLabel(optimizerPhaseFromEval(best.eval, priOpts));
       setOptLog(
         `done ${best.iter}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
+        `phase ${bestPhase}\n` +
         `BEST score ${best.eval.score.toFixed(2)}\n` +
         `EFL ${fmtOptMm(bestView.efl)} (target ${targetEfl})\n` +
         `T ${fmtOptNum(bestView.T)} (target ${targetT})\n` +
