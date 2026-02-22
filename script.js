@@ -3863,7 +3863,8 @@
     let cur = sanitizeLens(clone(seedItem?.eval?.lens || seedItem.lens));
     let curEval = adEvaluateCandidate(cur, cfg, { quick: false });
     cur = curEval.lens;
-    let best = curEval.valid ? { lens: clone(curEval.lens), eval: curEval, iter: 0 } : null;
+    let bestValid = curEval.valid ? { lens: clone(curEval.lens), eval: curEval, iter: 0 } : null;
+    let bestAny = { lens: clone(curEval.lens), eval: curEval, iter: 0 };
     let topo = adCaptureTopology(cur);
     let invalidStreak = curEval.valid ? 0 : 1;
 
@@ -3903,17 +3904,23 @@
         if (m.topologyChanged) topo = adCaptureTopology(cur);
       }
 
-      if (candEval.valid && (!best || candEval.score < best.eval.score)) {
-        best = { lens: clone(candEval.lens), eval: candEval, iter };
+      if (candEval.valid && (!bestValid || candEval.score < bestValid.eval.score)) {
+        bestValid = { lens: clone(candEval.lens), eval: candEval, iter };
       }
 
-      if (curEval.valid && (!best || curEval.score < best.eval.score)) {
-        best = { lens: clone(curEval.lens), eval: curEval, iter };
+      if (curEval.score < bestAny.eval.score) {
+        bestAny = { lens: clone(curEval.lens), eval: curEval, iter };
+      }
+
+      if (curEval.valid && (!bestValid || curEval.score < bestValid.eval.score)) {
+        bestValid = { lens: clone(curEval.lens), eval: curEval, iter };
       }
 
       invalidStreak = curEval.valid ? 0 : (invalidStreak + 1);
       if (invalidStreak >= cfg.invalidRestartEvery) {
-        const seedBase = best?.lens ? clone(best.lens) : clone(seedItem.lens);
+        const seedBase = bestValid?.lens
+          ? clone(bestValid.lens)
+          : (bestAny?.lens ? clone(bestAny.lens) : clone(seedItem.lens));
         cur = adConditionSeedLens(seedBase, cfg);
         curEval = adEvaluateCandidate(cur, cfg, { quick: true });
         cur = curEval.lens;
@@ -3922,13 +3929,15 @@
       }
 
       if (iter % cfg.logEvery === 0) {
-        const bestTxt = best?.eval ? best.eval.score.toFixed(2) : "—";
+        const bestTxt = bestValid?.eval
+          ? bestValid.eval.score.toFixed(2)
+          : (bestAny?.eval ? bestAny.eval.score.toFixed(2) : "—");
         appendADLog(`Opt ${seedRank}/${totalSeeds} • ${iter}/${cfg.optimizeIters} • cur ${curEval.score.toFixed(2)} • best ${bestTxt}`);
         await adYield();
       }
     }
 
-    return best || { lens: clone(curEval.lens || cur), eval: curEval, iter: cfg.optimizeIters };
+    return bestValid || bestAny || { lens: clone(curEval.lens || cur), eval: curEval, iter: cfg.optimizeIters };
   }
 
   function adFormatEval(ev) {
@@ -4073,7 +4082,11 @@
     scheduleAutosave();
     renderAll();
 
-    appendADLog(`Preview Best loaded (${modeTxt}).`);
+    appendADLog(
+      `Preview Best loaded (${modeTxt}, shift ${shift.toFixed(2)}mm, ` +
+      `EFL ${Number.isFinite(adBest.eval?.efl) ? adBest.eval.efl.toFixed(2) : "—"}mm, ` +
+      `BFL ${Number.isFinite(adBest.eval?.bfl) ? adBest.eval.bfl.toFixed(2) : "—"}mm).`
+    );
     toast("Preview Best loaded");
   }
 
