@@ -865,9 +865,9 @@
   }
 
   const PHYS_CFG = {
-    minAirGap: 0.12,
-    optMinAirGap: 0.45,
-    prefAirGap: 0.60,
+    minAirGap: 0.20,
+    optMinAirGap: 0.70,
+    prefAirGap: 1.10,
     minGlassCT: 0.35,
     prefGlassCT: 1.20,
     // Radius limits kept extremely wide to avoid constraining exploration.
@@ -879,7 +879,7 @@
     maxThickness: 55.0,
     minStopToApertureRatio: 0.76,
     maxNegOverlap: 0.05,
-    gapWeightAir: 1200.0,
+    gapWeightAir: 1400.0,
     gapWeightGlass: 2600.0,
     overlapWeight: 3200.0,
     tinyApWeight: 120.0,
@@ -887,11 +887,11 @@
     pinchWeight: 220.0,
     stopOversizeWeight: 240.0,
     stopTooTinyWeight: 200.0,
-    minAirGapsPreferred: 3,
+    minAirGapsPreferred: 4,
     tooFewAirGapsWeight: 260.0,
-    shortAirGapWeight: 190.0,
+    shortAirGapWeight: 260.0,
     thinGlassWeight: 150.0,
-    minStopSideAirGap: 0.35,
+    minStopSideAirGap: 0.60,
     stopAirSideWeight: 1200.0,
     stopAirGapWeight: 900.0,
     planeRefractiveWeight: 520.0,
@@ -1266,6 +1266,27 @@
     }
     return Number.isFinite(maxX) ? maxX : 0;
   }
+
+  function lastPhysicalEnvelopeX(surfaces, samplesPerSurface = 19) {
+    let maxX = -Infinity;
+    const n = Math.max(5, samplesPerSurface | 0);
+    for (const s of surfaces || []) {
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      if (!Number.isFinite(s?.vx)) continue;
+
+      const apLim = Math.max(AP_MIN, maxApForSurface(s));
+      const ap = clamp(Math.abs(Number(s?.ap || 0)), AP_MIN, apLim);
+      for (let k = 0; k < n; k++) {
+        const y = ap * (k / (n - 1));
+        const x = surfaceXatY(s, y);
+        if (Number.isFinite(x)) maxX = Math.max(maxX, x);
+      }
+      maxX = Math.max(maxX, Number(s.vx));
+    }
+    if (!Number.isFinite(maxX)) return lastPhysicalVertexX(surfaces);
+    return maxX;
+  }
   function firstPhysicalVertexX(surfaces) {
     if (!surfaces?.length) return 0;
     let minX = Infinity;
@@ -1403,14 +1424,15 @@
 
       const desiredStopAp = eflNow / (2 * targetT);
       if (!Number.isFinite(desiredStopAp) || desiredStopAp <= AP_MIN) break;
-      surfaces[stopIdx].ap = desiredStopAp;
+      surfaces[stopIdx].ap = desiredStopAp * 1.12;
+      ensureRadiusSupportsAperture(surfaces[stopIdx], surfaces[stopIdx].ap, { margin: 1.16 });
 
       expandMiddleApertures(surfaces, {
         targetStopAp: desiredStopAp,
-        minMiddleVsEdge: 0.98,
-        minStopVsEdge: 1.05,
-        stopHeadroom: 1.12,
-        nearStopHeadroom: 1.26,
+        minMiddleVsEdge: 1.04,
+        minStopVsEdge: 1.14,
+        stopHeadroom: 1.24,
+        nearStopHeadroom: 1.52,
       });
       clampAllApertures(surfaces);
 
@@ -1425,10 +1447,10 @@
     }
 
     expandMiddleApertures(surfaces, {
-      minMiddleVsEdge: 0.96,
-      minStopVsEdge: 1.02,
-      stopHeadroom: 1.10,
-      nearStopHeadroom: 1.20,
+      minMiddleVsEdge: 1.00,
+      minStopVsEdge: 1.10,
+      stopHeadroom: 1.18,
+      nearStopHeadroom: 1.40,
     });
     clampAllApertures(surfaces);
   }
@@ -1451,7 +1473,10 @@
       : null;
     const icSemiTarget = Number.isFinite(icTargetMm) ? Math.max(0.5, icTargetMm * 0.5) : null;
     const baseFloorFromIc = Number.isFinite(icSemiTarget)
-      ? clamp(icSemiTarget * (0.60 + 0.22 * strength), 4.0, PHYS_CFG.maxAperture * 0.92)
+      ? clamp(icSemiTarget * (0.78 + 0.28 * strength), 7.0, PHYS_CFG.maxAperture * 0.95)
+      : null;
+    const stopDrivenFloor = Number.isFinite(desiredStopAp)
+      ? clamp(desiredStopAp * (1.08 + 0.28 * strength), 6.0, PHYS_CFG.maxAperture * 0.95)
       : null;
 
     const physIdx = [];
@@ -1484,8 +1509,12 @@
       const localIcFloor = Number.isFinite(baseFloorFromIc)
         ? baseFloorFromIc * (k === 0 || k === physIdx.length - 1 ? 1.08 : 1.0)
         : null;
+      const localStopFloor = Number.isFinite(stopDrivenFloor)
+        ? stopDrivenFloor * (distStop <= 1 ? 1.12 : distStop <= 2 ? 1.06 : 1.0)
+        : null;
       let targetAp = Number(s.ap || AP_MIN) * mul;
       if (Number.isFinite(localIcFloor)) targetAp = Math.max(targetAp, localIcFloor);
+      if (Number.isFinite(localStopFloor)) targetAp = Math.max(targetAp, localStopFloor);
       s.ap = clamp(targetAp, AP_MIN, PHYS_CFG.maxAperture);
       ensureRadiusSupportsAperture(s, s.ap, { margin: 1.10 + 0.15 * strength });
       clampSurfaceAp(s);
@@ -1500,23 +1529,61 @@
 
     expandMiddleApertures(surfaces, {
       targetStopAp: Number.isFinite(desiredStopAp) ? desiredStopAp : null,
-      minMiddleVsEdge: 1.06,
-      minStopVsEdge: 1.12,
-      stopHeadroom: 1.20,
-      nearStopHeadroom: 1.40,
+      minMiddleVsEdge: 1.12,
+      minStopVsEdge: 1.22,
+      stopHeadroom: 1.34,
+      nearStopHeadroom: 1.68,
     });
 
-    // Slightly increase air around stop and central section to help off-axis rays clear.
+    // Increase gap budget around stop and central section to help off-axis rays clear.
     for (let k = 0; k < physIdx.length; k++) {
       const i = physIdx[k];
       const s = surfaces[i];
       const mediumAfter = String(resolveGlassName(s?.glass || "AIR")).toUpperCase();
-      if (mediumAfter !== "AIR") continue;
       const distStop = stopIdx >= 0 ? Math.abs(i - stopIdx) : 99;
-      const localMul = distStop <= 2 ? (1 + 0.30 * strength) : (1 + 0.12 * strength);
-      const tMin = PHYS_CFG.minAirGap;
-      const tMax = Math.max(tMin, Math.min(PHYS_CFG.maxThickness, 20.0));
-      s.t = clamp(Number(s.t || tMin) * localMul, tMin, tMax);
+      if (mediumAfter === "AIR") {
+        const localMul = distStop <= 2 ? (1 + 0.44 * strength) : (1 + 0.20 * strength);
+        const tMin = PHYS_CFG.minAirGap;
+        const tMax = Math.max(tMin, Math.min(PHYS_CFG.maxThickness, 30.0));
+        s.t = clamp(Number(s.t || tMin) * localMul, tMin, tMax);
+      } else {
+        const localMul = distStop <= 2 ? (1 + 0.20 * strength) : (1 + 0.08 * strength);
+        const tMin = PHYS_CFG.minGlassCT;
+        const tMax = Math.max(tMin, Math.min(PHYS_CFG.maxThickness, 20.0));
+        s.t = clamp(Number(s.t || tMin) * localMul, tMin, tMax);
+      }
+    }
+
+    // If pair overlap caps apertures, grow radius/thickness budget first instead of shrinking apertures.
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 0; i < surfaces.length - 1; i++) {
+        const sA = surfaces[i];
+        const sB = surfaces[i + 1];
+        const tA = String(sA?.type || "").toUpperCase();
+        const tB = String(sB?.type || "").toUpperCase();
+        if (tA === "OBJ" || tA === "IMS" || tB === "OBJ" || tB === "IMS") continue;
+
+        computeVertices(surfaces, 0, 0);
+        const mediumAfterA = String(resolveGlassName(sA?.glass || "AIR")).toUpperCase();
+        const reqGap = mediumAfterA === "AIR" ? PHYS_CFG.minAirGap : PHYS_CFG.minGlassCT;
+        const noAp = maxNonOverlappingSemiDiameter(sA, sB, reqGap);
+        const pairAp = Math.min(Number(sA.ap || 0), Number(sB.ap || 0));
+        if (!Number.isFinite(noAp) || !Number.isFinite(pairAp) || pairAp <= AP_MIN) continue;
+        if (noAp + 0.05 >= pairAp) continue;
+
+        const wantAp = Math.min(PHYS_CFG.maxAperture, pairAp * 1.03);
+        ensureRadiusSupportsAperture(sA, wantAp, { margin: 1.26 });
+        ensureRadiusSupportsAperture(sB, wantAp, { margin: 1.26 });
+
+        const shortfall = pairAp - noAp;
+        const gain = Math.max(0.10, shortfall);
+        const tMax = mediumAfterA === "AIR" ? 30.0 : 20.0;
+        sA.t = clamp(
+          Number(sA.t || reqGap) + gain * (mediumAfterA === "AIR" ? 0.70 : 0.45),
+          reqGap,
+          Math.min(PHYS_CFG.maxThickness, tMax)
+        );
+      }
     }
 
     clampAllApertures(surfaces);
@@ -1783,7 +1850,7 @@
     centerVigWeight: 180.0,
     midVigWeight: 60.0,
     covPenalty: 180.0,
-    intrusionWeight: 16.0,
+    intrusionWeight: 48.0,
     fieldWeights: [1.0, 1.5, 2.0],
 
     // target terms (optimizer uses these)
@@ -1802,7 +1869,7 @@
     imageCircleReqValidWeight: 900.0,
     maxTRatio: 1.6,          // hard gate: reject candidates far slower than target T
     minTRatio: 0.45,         // hard gate: reject unrealistically fast candidates vs target
-    maxRearIntrusion: 0.0,   // hard gate: no lens intrusion into PL side
+    maxRearIntrusion: -0.80, // hard gate: keep at least 0.8mm clear in front of PL flange
   };
   const PRIORITY_CFG = {
     // Lexicographic-like target priority: FL >> T >> IC >> all other terms.
@@ -1915,8 +1982,8 @@
       }
     }
 
-    if (Number.isFinite(intrusion) && intrusion > 0){
-      const x = intrusion / 1.0;
+    if (Number.isFinite(intrusion) && intrusion > MERIT_CFG.maxRearIntrusion){
+      const x = (intrusion - MERIT_CFG.maxRearIntrusion) / 1.0;
       mIntr += MERIT_CFG.intrusionWeight * (x * x);
     }
 
@@ -2509,8 +2576,8 @@
       : `COV(D): ±${maxField.toFixed(1)}° • REQ(D): ${(req ?? 0).toFixed(1)}° • ${covers ? "COVERS ✅" : "NO ❌"}`;
     const distPct = estimateDistortionPct(lens.surfaces, wavePreset, sensorX, sensorW, sensorH, efl, covMode);
 
-    const rearVx = lastPhysicalVertexX(lens.surfaces);
-    const intrusion = rearVx - plX;
+    const rearEnvX = lastPhysicalEnvelopeX(lens.surfaces);
+    const intrusion = rearEnvX - plX;
     const phys = evaluatePhysicalConstraints(lens.surfaces);
 
     const meritRes = computeMeritV1({
@@ -2543,7 +2610,7 @@
       `${Number.isFinite(bd.vigMidPct) ? ` • Vmid ${bd.vigMidPct}%` : ""}` +
       `${Number.isFinite(bd.reqVigPct) ? ` • Vreq ${bd.reqVigPct}%` : ""}` +
       `${Number.isFinite(bd.imageCircleDiag) ? ` • IC ${bd.imageCircleDiag.toFixed(1)}mm` : ""}` +
-      `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""}` +
+      `${bd.intrusion != null && bd.intrusion > MERIT_CFG.maxRearIntrusion ? ` • INTR +${(bd.intrusion - MERIT_CFG.maxRearIntrusion).toFixed(2)}mm` : ""}` +
       `${bd.physPenalty > 0 ? ` • PHYS +${bd.physPenalty.toFixed(1)}` : ""}` +
       `${Number.isFinite(bd.mSharp) ? ` • Mprio{FL ${bd.mPriFL?.toFixed?.(1) ?? "—"} T ${bd.mPriT?.toFixed?.(1) ?? "—"} IC ${bd.mPriIC?.toFixed?.(1) ?? "—"}}` : ""}` +
       `${Number.isFinite(bd.mSharp) ? ` • M{S ${bd.mSharp.toFixed(1)} FL ${bd.mEfl?.toFixed?.(1) ?? "—"} T ${bd.mT?.toFixed?.(1) ?? "—"} V ${bd.mVig?.toFixed?.(1) ?? "—"} IC ${bd.mIc?.toFixed?.(1) ?? "—"} I ${bd.mIntr?.toFixed?.(1) ?? "—"} P ${bd.mPhys?.toFixed?.(1) ?? "—"}}` : ""}` +
@@ -2552,9 +2619,9 @@
     if (ui.merit) ui.merit.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
     if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
 
-    const rearTxt = (intrusion > 0)
-      ? `REAR INTRUSION: +${intrusion.toFixed(2)}mm ❌`
-      : `REAR CLEAR: ${Math.abs(intrusion).toFixed(2)}mm ✅`;
+    const rearTxt = (intrusion > MERIT_CFG.maxRearIntrusion)
+      ? `REAR INTRUSION: +${(intrusion - MERIT_CFG.maxRearIntrusion).toFixed(2)}mm ❌`
+      : `REAR CLEAR: ${(MERIT_CFG.maxRearIntrusion - intrusion).toFixed(2)}mm ✅`;
 
     const frontVx = firstPhysicalVertexX(lens.surfaces);
     const lenToFlange = plX - frontVx;
@@ -3027,7 +3094,7 @@
       const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
       const icDiag = imageCircleDiagFromHalfFieldMm(efl, maxField);
       const icTarget = imageCircleDiagFromHalfFieldMm(efl, req);
-      const intrusion = lastPhysicalVertexX(s) - (-PL_FFD);
+      const intrusion = lastPhysicalEnvelopeX(s) - (-PL_FFD);
 
       return { efl, T, bfl, covers, icDiag, icTarget, intrusion };
     } catch (_) {
@@ -3217,6 +3284,7 @@
       const mediumAfter = String(s.glass || "AIR").toUpperCase();
       const minT = (mediumAfter === "AIR") ? PHYS_CFG.optMinAirGap : PHYS_CFG.minGlassCT;
       s.t = Math.max(minT, Number(s.t || 0));
+      ensureRadiusSupportsAperture(s, s.ap, { margin: 1.06 });
       clampSurfaceAp(s);
     }
 
@@ -3228,8 +3296,9 @@
         const s = surfaces[i];
         const t = String(s?.type || "").toUpperCase();
         if (t === "OBJ" || t === "IMS") continue;
-        const floor = stopAp * 0.82;
+        const floor = stopAp * 0.95;
         if (Number(s.ap || 0) < floor) s.ap = floor;
+        ensureRadiusSupportsAperture(s, s.ap, { margin: 1.08 });
         clampSurfaceAp(s);
       }
     }
@@ -3243,7 +3312,8 @@
       if (ta === "OBJ" || tb === "OBJ" || tc === "OBJ") continue;
       if (ta === "IMS" || tb === "IMS" || tc === "IMS") continue;
       const ref = Math.min(Number(a.ap || 0), Number(c.ap || 0));
-      if (ref > 0.5 && Number(b.ap || 0) < 0.45 * ref) b.ap = 0.45 * ref;
+      if (ref > 0.5 && Number(b.ap || 0) < 0.70 * ref) b.ap = 0.70 * ref;
+      ensureRadiusSupportsAperture(b, b.ap, { margin: 1.08 });
       clampSurfaceAp(b);
     }
     enforcePairGapByAperture(surfaces, { usePreferredAir: true });
@@ -3476,6 +3546,20 @@
 
     if (topo) enforceTopology(s, topo);
     quickSanity(s);
+    if (topo && (phaseHint === "t" || phaseHint === "ic" || phaseHint === "refine")) {
+      const tgtT = Number(target?.t);
+      const icShortNow = Number(target?.icShortNow || 0);
+      const icTargetNow = Number(target?.icTargetNow);
+      const wp = String(target?.wavePreset || "d");
+      nudgeForImageCircleAndCoverage(s, {
+        targetT: tgtT,
+        wavePreset: wp,
+        icShortMm: Math.max(0, icShortNow),
+        icTargetMm: icTargetNow,
+      });
+      if (Number.isFinite(tgtT) && tgtT > 0.2) nudgeStopToTargetT(s, tgtT, wp);
+      quickSanity(s);
+    }
     if (topo) enforceTopology(s, topo);
     return sanitizeLens(L);
   }
@@ -3542,17 +3626,17 @@
     computeVertices(surfaces, lensShift, sensorX);
     let phys = evaluatePhysicalConstraints(surfaces);
     // If rear still intrudes into PL side, push full block further front when possible.
-    let rearVxNow = lastPhysicalVertexX(surfaces);
+    let rearVxNow = lastPhysicalEnvelopeX(surfaces);
     let intrusionNow = rearVxNow - (-PL_FFD);
-    if (intrusionNow > 0.0 && lensShift > -30.0) {
+    if (intrusionNow > MERIT_CFG.maxRearIntrusion && lensShift > -30.0) {
       const avail = Math.max(0, 30.0 + lensShift);
-      const need = intrusionNow + 0.10;
+      const need = (intrusionNow - MERIT_CFG.maxRearIntrusion) + 0.10;
       const extra = Math.min(avail, need);
       if (extra > 1e-6) {
         lensShift -= extra;
         computeVertices(surfaces, lensShift, sensorX);
         phys = evaluatePhysicalConstraints(surfaces);
-        rearVxNow = lastPhysicalVertexX(surfaces);
+        rearVxNow = lastPhysicalEnvelopeX(surfaces);
         intrusionNow = rearVxNow - (-PL_FFD);
       }
     }
@@ -3592,13 +3676,14 @@
     const req = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
     const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
 
-    const rearVx = lastPhysicalVertexX(surfaces);
+    const rearVx = lastPhysicalEnvelopeX(surfaces);
     const intrusion = rearVx - (-PL_FFD);
     if (intrusion > MERIT_CFG.maxRearIntrusion) {
-      const score = MERIT_CFG.hardInvalidPenalty * 0.5 + 90_000 + intrusion * intrusion * 6000 + Math.max(0, Number(phys.penalty || 0));
+      const intrOver = intrusion - MERIT_CFG.maxRearIntrusion;
+      const score = MERIT_CFG.hardInvalidPenalty * 0.5 + 90_000 + intrOver * intrOver * 6000 + Math.max(0, Number(phys.penalty || 0));
       const bad = invalidEval(score, lensShift, phys.penalty, {
         mPhys: phys.penalty,
-        mIntr: intrusion * intrusion * 6000,
+        mIntr: intrOver * intrOver * 6000,
         mHard: MERIT_CFG.hardInvalidPenalty * 0.5 + 90_000,
       });
       bad.intrusion = intrusion;
