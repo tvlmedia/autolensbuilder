@@ -661,10 +661,10 @@
   const AP_MAX_PLANE = 30.0;
   const AP_MIN = 0.01;
   const MID_AP_CFG = {
-    minMiddleVsEdge: 1.00,
-    minStopVsEdge: 0.96,
+    minMiddleVsEdge: 0.92,
+    minStopVsEdge: 0.85,
     stopHeadroom: 1.00,
-    nearStopHeadroom: 1.18,
+    nearStopHeadroom: 1.10,
   };
 
   function maxApForSurface(s) {
@@ -733,6 +733,25 @@
       const stopTarget = Math.max(targetStopAp * stopHeadroom, stopFloorBase);
       if (Number(sStop?.ap || 0) < stopTarget) sStop.ap = stopTarget;
       clampSurfaceAp(sStop);
+    }
+
+    // Safety: never let a boosted glass pair exceed its non-overlapping semi-diameter.
+    for (let i = 0; i < surfaces.length - 1; i++) {
+      const sA = surfaces[i];
+      const sB = surfaces[i + 1];
+      const tA = String(sA?.type || "").toUpperCase();
+      const tB = String(sB?.type || "").toUpperCase();
+      if (tA === "OBJ" || tA === "IMS" || tB === "OBJ" || tB === "IMS") continue;
+      const mediumAfterA = String(sA?.glass || "AIR").toUpperCase();
+      if (mediumAfterA === "AIR") continue;
+
+      const noAp = maxNonOverlappingSemiDiameter(sA, sB, PHYS_CFG.minGlassCT);
+      if (!Number.isFinite(noAp) || noAp <= AP_MIN) continue;
+
+      if (Number(sA.ap || 0) > noAp) sA.ap = noAp;
+      if (Number(sB.ap || 0) > noAp) sB.ap = noAp;
+      clampSurfaceAp(sA);
+      clampSurfaceAp(sB);
     }
   }
 
@@ -1136,16 +1155,6 @@
     const maxVigFrac = Number.isFinite(opts.maxVigFrac) ? opts.maxVigFrac : IMAGE_CIRCLE_CFG.maxReqVigFrac;
     const minValidFrac = Number.isFinite(opts.minValidFrac) ? opts.minValidFrac : IMAGE_CIRCLE_CFG.minReqValidFrac;
 
-    const centerPack = traceBundleAtField(surfaces, 0, rayCount, wavePreset, sensorX);
-    const centerVig = Number(centerPack?.vigFrac);
-    const centerValid = Number(centerPack?.n || 0) / Math.max(1, rayCount);
-    const centerOk =
-      Number.isFinite(centerVig) &&
-      centerVig <= maxVigFrac &&
-      Number.isFinite(centerValid) &&
-      centerValid >= minValidFrac;
-    if (!centerOk) return 0;
-
     let lo = 0, hi = 60, best = 0;
     for (let iter = 0; iter < 18; iter++) {
       const mid = (lo + hi) * 0.5;
@@ -1297,12 +1306,12 @@
   };
   const IMAGE_CIRCLE_CFG = {
     minDiagMm: 45.0,        // full-frame coverage floor with small margin
-    targetGuardMm: 1.0,     // extra diagonal guard so corners stay clean in practice
-    maxReqVigFrac: 0.05,    // optimizer edge requirement at requested field
-    minReqValidFrac: 0.78,  // optimizer minimum valid traced rays at req field
-    maxIcVigFrac: 0.02,     // strict vignette limit for reported "usable IC"
-    minIcValidFrac: 0.90,   // strict valid-ray limit for reported "usable IC"
-    maxCenterVigFrac: 0.005,// center field should be essentially clean
+    targetGuardMm: 0.5,     // extra diagonal guard so corners stay clean in practice
+    maxReqVigFrac: 0.08,    // optimizer edge requirement at requested field
+    minReqValidFrac: 0.70,  // optimizer minimum valid traced rays at req field
+    maxIcVigFrac: 0.05,     // strict vignette limit for reported "usable IC"
+    minIcValidFrac: 0.80,   // strict valid-ray limit for reported "usable IC"
+    maxCenterVigFrac: 0.03, // center field should stay very low vignette
   };
 
   function halfFieldFromDiagDeg(efl, diagMm) {
@@ -2731,7 +2740,6 @@
       if (ref > 0.5 && Number(b.ap || 0) < 0.45 * ref) b.ap = 0.45 * ref;
       clampSurfaceAp(b);
     }
-    expandMiddleApertures(surfaces);
   }
 
   function captureTopology(lensObj) {
