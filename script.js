@@ -329,14 +329,14 @@
         { type: "OBJ", R: 0.0, t: 0.0, ap: 60.0, glass: "AIR", stop: false },
         { type: "1", R: 37.4501, t: 4.49102, ap: 16.46707, glass: "N-LAK9", stop: false },
         { type: "2", R: 135.07984, t: 0.0499, ap: 16.46707, glass: "AIR", stop: false },
-        { type: "3", R: 19.59581, t: 8.23852, ap: 13.72255, glass: "N-BAK4", stop: false },
-        { type: "4", R: 0.0, t: 0.998, ap: 12.22555, glass: "N-SF5", stop: false },
-        { type: "5", R: 12.7994, t: 5.48403, ap: 9.73054, glass: "AIR", stop: false },
-        { type: "STOP", R: 0.0, t: 6.48703, ap: 9.28144, glass: "AIR", stop: true },
-        { type: "7", R: -15.90319, t: 3.50798, ap: 9.23154, glass: "N-SF5", stop: false },
-        { type: "8", R: 0.0, t: 4.48104, ap: 10.47904, glass: "N-LAK9", stop: false },
-        { type: "9", R: -21.71158, t: 0.0499, ap: 10.47904, glass: "AIR", stop: false },
-        { type: "10", R: 110.3493, t: 3.98204, ap: 11.47705, glass: "N-BAK4", stop: false },
+        { type: "3", R: 19.59581, t: 8.23852, ap: 13.97206, glass: "N-BAK4", stop: false },
+        { type: "4", R: 0.0, t: 0.998, ap: 13.97206, glass: "N-SF5", stop: false },
+        { type: "5", R: 12.7994, t: 5.48403, ap: 11.51946, glass: "AIR", stop: false },
+        { type: "STOP", R: 0.0, t: 6.48703, ap: 13.97206, glass: "AIR", stop: true },
+        { type: "7", R: -15.90319, t: 3.50798, ap: 13.97206, glass: "N-SF5", stop: false },
+        { type: "8", R: 0.0, t: 4.48104, ap: 13.97206, glass: "N-LAK9", stop: false },
+        { type: "9", R: -21.71158, t: 0.0499, ap: 13.97206, glass: "AIR", stop: false },
+        { type: "10", R: 110.3493, t: 3.98204, ap: 13.97206, glass: "N-BAK4", stop: false },
         { type: "11", R: -44.30639, t: 30.6477, ap: 11.47705, glass: "AIR", stop: false },
         { type: "IMS", R: 0.0, t: 0.0, ap: 12.77, glass: "AIR", stop: false },
       ],
@@ -1649,16 +1649,16 @@
     eflFarThresh: 8.0,        // extra penalty starts beyond this FL error (mm)
     eflFarWeight: 80.0,       // extra strong penalty for large FL mismatch
     tWeight: 32.0,            // penalty per T error (squared)
-    tSlowWeight: 140.0,       // extra penalty when T is slower than target
+    tSlowWeight: 260.0,       // extra penalty when T is slower than target
     bflMin: 52.0,             // for PL: discourage too-short backfocus
     bflWeight: 6.0,
     lowValidPenalty: 450.0,
-    hardInvalidPenalty: 1_000_000.0,
+    hardInvalidPenalty: 10_000_000.0,
     covShortfallWeight: 180.0,
     imageCircleShortfallWeight: 180.0,
     imageCircleReqVigWeight: 1400.0,
     imageCircleReqValidWeight: 900.0,
-    maxTRatio: 2.4,          // hard gate: reject candidates far slower than target T
+    maxTRatio: 2.0,          // hard gate: reject candidates far slower than target T
     minTRatio: 0.45,         // hard gate: reject unrealistically fast candidates vs target
     maxRearIntrusion: 0.0,   // hard gate: no lens intrusion into PL side
   };
@@ -3054,7 +3054,7 @@
     }
     if (Number.isFinite(targetEfl) && targetEfl > 1) {
       const farMm = Math.abs(efl - targetEfl);
-      if (farMm > 45) {
+      if (farMm > 25) {
         const score = MERIT_CFG.hardInvalidPenalty * 0.25 + 20_000 + farMm * farMm * 40 + Math.max(0, Number(phys.penalty || 0));
         return invalidEval(score, lensShift, phys.penalty);
       }
@@ -3132,6 +3132,16 @@
     };
   }
 
+  function evalIsUsable(ev) {
+    if (!ev || !Number.isFinite(ev.score)) return false;
+    if (!Number.isFinite(ev.efl) || ev.efl <= 1) return false;
+    if (!Number.isFinite(ev.T) || ev.T <= 0) return false;
+    if (!Number.isFinite(ev.bfl)) return false;
+    if ((ev.breakdown?.hardInvalid) === true) return false;
+    if (Number.isFinite(ev.intrusion) && ev.intrusion > MERIT_CFG.maxRearIntrusion + 1e-6) return false;
+    return true;
+  }
+
   async function runOptimizer(){
     if (optRunning) return;
     optRunning = true;
@@ -3148,18 +3158,49 @@
     const wavePreset = ui.wavePreset?.value || "d";
 
     const userStart = sanitizeLens(lens);
-    const baseStart = sanitizeLens(omit50ConceptV1());
-    nudgeSurfacesToTargetEfl(baseStart.surfaces, targetEfl, wavePreset);
-    nudgeStopToTargetT(baseStart.surfaces, targetT, wavePreset);
-    quickSanity(baseStart.surfaces);
+    const baseSeed = sanitizeLens(omit50ConceptV1());
+    quickSanity(baseSeed.surfaces);
+
+    const baseNudged = sanitizeLens(baseSeed);
+    nudgeSurfacesToTargetEfl(baseNudged.surfaces, targetEfl, wavePreset);
+    nudgeStopToTargetT(baseNudged.surfaces, targetT, wavePreset);
+    quickSanity(baseNudged.surfaces);
 
     const userEval = evalLensMerit(userStart, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
-    const baseEval = evalLensMerit(baseStart, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+    const baseSeedEval = evalLensMerit(baseSeed, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+    const baseNudgedEval = evalLensMerit(baseNudged, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
 
-    let cur = (baseEval.score < userEval.score) ? baseStart : userStart;
-    let curEval = (baseEval.score < userEval.score) ? baseEval : userEval;
-    const topo = captureTopology(cur);
+    const baseSeedUsable = evalIsUsable(baseSeedEval);
+    const baseNudgedUsable = evalIsUsable(baseNudgedEval);
+    const useNudgedBase = baseNudgedUsable && (!baseSeedUsable || baseNudgedEval.score <= baseSeedEval.score);
+    const baseStart = useNudgedBase ? baseNudged : baseSeed;
+    const baseEval = useNudgedBase ? baseNudgedEval : baseSeedEval;
+
+    // Keep optimizer around a sane Double-Gauss-like base topology.
+    const topo = captureTopology(baseStart);
+
+    const userUsable = evalIsUsable(userEval);
+    const baseUsable = evalIsUsable(baseEval);
+    const nearTarget = (ev) => {
+      if (!ev) return false;
+      const eflOk = Number.isFinite(ev.efl) && Number.isFinite(targetEfl)
+        ? Math.abs(ev.efl - targetEfl) <= 8.0
+        : true;
+      const tOk = Number.isFinite(ev.T) && Number.isFinite(targetT) && targetT > 0
+        ? ev.T <= targetT * 1.6
+        : true;
+      return eflOk && tOk;
+    };
+    const allowUserSeed =
+      userUsable &&
+      nearTarget(userEval) &&
+      (!baseUsable || userEval.score <= baseEval.score * 0.98);
+
+    let cur = allowUserSeed ? userStart : baseStart;
+    let curEval = allowUserSeed ? userEval : baseEval;
+
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
+    let bestUsable = evalIsUsable(best.eval);
     const icText = (ev) => {
       const ic = ev?.breakdown?.imageCircleDiag;
       const tgt = ev?.breakdown?.imageCircleTarget;
@@ -3184,16 +3225,26 @@
 
       const cand = mutateLens(cur, mode, topo);
       const candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+      const candUsable = evalIsUsable(candEval);
+      const curUsable = evalIsUsable(curEval);
 
-      const d = candEval.score - curEval.score;
-      const accept = (d <= 0) || (Math.random() < Math.exp(-d / Math.max(1e-9, temp)));
+      let accept = false;
+      if (candUsable && !curUsable) {
+        accept = true;
+      } else if (!candUsable && curUsable) {
+        accept = false;
+      } else {
+        const d = candEval.score - curEval.score;
+        accept = (d <= 0) || (Math.random() < Math.exp(-d / Math.max(1e-9, temp)));
+      }
       if (accept){
         cur = cand;
         curEval = candEval;
       }
 
-      if (candEval.score < best.eval.score){
+      if ((!bestUsable && candUsable) || (candUsable && candEval.score < best.eval.score)){
         best = { lens: clone(cand), eval: candEval, iter: i };
+        bestUsable = true;
 
         // UI update (rare)
         if (ui.optLog){
@@ -3213,15 +3264,21 @@
         const dt = (tNow - tStart) / 1000;
         const ips = i / Math.max(1e-6, dt);
         if (ui.optLog){
+          const bestLabel = bestUsable ? "best" : "best (no valid yet)";
           setOptLog(
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
-            `current ${curEval.score.toFixed(2)} • best ${best.eval.score.toFixed(2)} @${best.iter}\n` +
+            `current ${curEval.score.toFixed(2)} • ${bestLabel} ${best.eval.score.toFixed(2)} @${best.iter}\n` +
             `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • INTR ${best.eval.intrusion.toFixed(2)}mm\n`
           );
         }
         // yield to UI
         await new Promise(r => setTimeout(r, 0));
       }
+    }
+
+    if (!bestUsable) {
+      if (baseUsable) best = { lens: clone(baseStart), eval: baseEval, iter: 0 };
+      else if (userUsable) best = { lens: clone(userStart), eval: userEval, iter: 0 };
     }
 
     optBest = best;
