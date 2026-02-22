@@ -682,6 +682,38 @@
     s.ap = Math.max(AP_MIN, Math.min(ap, lim));
   }
 
+  function minRequiredGapForPair(sFront, opts = {}) {
+    const usePreferredAir = !!opts.usePreferredAir;
+    const mediumAfterFront = String(resolveGlassName(sFront?.glass || "AIR")).toUpperCase();
+    if (mediumAfterFront === "AIR") {
+      return usePreferredAir ? PHYS_CFG.optMinAirGap : PHYS_CFG.minAirGap;
+    }
+    return PHYS_CFG.minGlassCT;
+  }
+
+  function enforcePairGapByAperture(surfaces, opts = {}) {
+    if (!Array.isArray(surfaces) || surfaces.length < 2) return;
+    computeVertices(surfaces, 0, 0);
+
+    for (let i = 0; i < surfaces.length - 1; i++) {
+      const sA = surfaces[i];
+      const sB = surfaces[i + 1];
+      const tA = String(sA?.type || "").toUpperCase();
+      const tB = String(sB?.type || "").toUpperCase();
+      if (tA === "OBJ" || tA === "IMS" || tB === "OBJ" || tB === "IMS") continue;
+
+      const reqGap = minRequiredGapForPair(sA, opts);
+      const noAp = maxNonOverlappingSemiDiameter(sA, sB, reqGap);
+      if (!Number.isFinite(noAp) || noAp <= AP_MIN) continue;
+
+      const cap = Math.max(AP_MIN, noAp);
+      if (Number(sA.ap || 0) > cap) sA.ap = cap;
+      if (Number(sB.ap || 0) > cap) sB.ap = cap;
+      clampSurfaceAp(sA);
+      clampSurfaceAp(sB);
+    }
+  }
+
   function expandMiddleApertures(surfaces, opts = {}) {
     if (!Array.isArray(surfaces) || surfaces.length < 4) return;
 
@@ -758,6 +790,7 @@
   function clampAllApertures(surfaces) {
     if (!Array.isArray(surfaces)) return;
     for (const s of surfaces) clampSurfaceAp(s);
+    enforcePairGapByAperture(surfaces, { usePreferredAir: false });
   }
 
   function surfaceXatY(s, y) {
@@ -795,6 +828,7 @@
 
   const PHYS_CFG = {
     minAirGap: 0.12,
+    optMinAirGap: 0.45,
     prefAirGap: 0.60,
     minGlassCT: 0.35,
     prefGlassCT: 1.20,
@@ -948,6 +982,10 @@
         penalty += PHYS_CFG.thinGlassWeight * d * d;
       }
 
+      const eps = 1e-4;
+      if (minGap < -eps) hardFail = true;
+      if (mediumAfterA === "AIR" && minGap + eps < PHYS_CFG.minAirGap) hardFail = true;
+      if (mediumAfterA !== "AIR" && minGap + eps < PHYS_CFG.minGlassCT) hardFail = true;
       if (minGap < -PHYS_CFG.maxNegOverlap) hardFail = true;
       if (minGap < 0) worstOverlap = Math.max(worstOverlap, -minGap);
 
@@ -2722,9 +2760,11 @@
     for (const s of surfaces){
       const t = String(s.type || "").toUpperCase();
       if (t === "OBJ" || t === "IMS") continue;
-      s.t = Math.max(PHYS_CFG.minThickness, Number(s.t || 0));
       s.ap = Math.max(PHYS_CFG.minAperture, Number(s.ap || 0));
       s.glass = resolveGlassName(s.glass);
+      const mediumAfter = String(s.glass || "AIR").toUpperCase();
+      const minT = (mediumAfter === "AIR") ? PHYS_CFG.optMinAirGap : PHYS_CFG.minGlassCT;
+      s.t = Math.max(minT, Number(s.t || 0));
       clampSurfaceAp(s);
     }
 
@@ -2740,6 +2780,7 @@
       if (ref > 0.5 && Number(b.ap || 0) < 0.45 * ref) b.ap = 0.45 * ref;
       clampSurfaceAp(b);
     }
+    enforcePairGapByAperture(surfaces, { usePreferredAir: true });
   }
 
   function captureTopology(lensObj) {
@@ -2829,7 +2870,9 @@
         // thickness tweak
         const scale = mode === "wild" ? 0.55 : 0.25;
         const d = randn() * scale;
-        ss.t = clamp(Number(ss.t||0) * (1 + d), PHYS_CFG.minThickness, 42);
+        const mediumAfter = String(resolveGlassName(ss.glass || "AIR")).toUpperCase();
+        const minT = (mediumAfter === "AIR") ? PHYS_CFG.optMinAirGap : PHYS_CFG.minGlassCT;
+        ss.t = clamp(Number(ss.t||0) * (1 + d), minT, 42);
       } else if (choice < 0.88){
         // aperture tweak
         const scale = mode === "wild" ? 0.45 : 0.20;
