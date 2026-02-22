@@ -1658,7 +1658,7 @@
     imageCircleShortfallWeight: 180.0,
     imageCircleReqVigWeight: 1400.0,
     imageCircleReqValidWeight: 900.0,
-    maxTRatio: 2.0,          // hard gate: reject candidates far slower than target T
+    maxTRatio: 1.6,          // hard gate: reject candidates far slower than target T
     minTRatio: 0.45,         // hard gate: reject unrealistically fast candidates vs target
     maxRearIntrusion: 0.0,   // hard gate: no lens intrusion into PL side
   };
@@ -3054,7 +3054,7 @@
     }
     if (Number.isFinite(targetEfl) && targetEfl > 1) {
       const farMm = Math.abs(efl - targetEfl);
-      if (farMm > 25) {
+      if (farMm > 10) {
         const score = MERIT_CFG.hardInvalidPenalty * 0.25 + 20_000 + farMm * farMm * 40 + Math.max(0, Number(phys.penalty || 0));
         return invalidEval(score, lensShift, phys.penalty);
       }
@@ -3090,6 +3090,18 @@
     const maxField = Math.min(maxFieldGeom, maxFieldBundleIc);
     const req = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
     const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
+    const icDiagEval = imageCircleDiagFromHalfFieldMm(efl, maxField);
+    const icTargetEval = imageCircleDiagFromHalfFieldMm(efl, req);
+    if (Number.isFinite(req) && Number.isFinite(maxField) && maxField < req * 0.70) {
+      const short = Math.max(0, req - maxField);
+      const score = MERIT_CFG.hardInvalidPenalty * 0.3 + 30_000 + short * short * 2200 + Math.max(0, Number(phys.penalty || 0));
+      return invalidEval(score, lensShift, phys.penalty);
+    }
+    if (Number.isFinite(icDiagEval) && Number.isFinite(icTargetEval) && icDiagEval < icTargetEval * 0.70) {
+      const shortMm = Math.max(0, icTargetEval - icDiagEval);
+      const score = MERIT_CFG.hardInvalidPenalty * 0.3 + 30_000 + shortMm * shortMm * 1200 + Math.max(0, Number(phys.penalty || 0));
+      return invalidEval(score, lensShift, phys.penalty);
+    }
 
     const rearVx = lastPhysicalVertexX(surfaces);
     const intrusion = rearVx - (-PL_FFD);
@@ -3132,13 +3144,24 @@
     };
   }
 
-  function evalIsUsable(ev) {
+  function evalIsUsable(ev, opts = {}) {
+    const targetEfl = Number(opts?.targetEfl);
+    const targetT = Number(opts?.targetT);
     if (!ev || !Number.isFinite(ev.score)) return false;
     if (!Number.isFinite(ev.efl) || ev.efl <= 1) return false;
     if (!Number.isFinite(ev.T) || ev.T <= 0) return false;
     if (!Number.isFinite(ev.bfl)) return false;
+    if (ev.covers !== true) return false;
     if ((ev.breakdown?.hardInvalid) === true) return false;
+    const ic = Number(ev.breakdown?.imageCircleDiag);
+    const icTarget = Number(ev.breakdown?.imageCircleTarget);
+    if (Number.isFinite(ic) && Number.isFinite(icTarget) && ic + 0.2 < icTarget) return false;
     if (Number.isFinite(ev.intrusion) && ev.intrusion > MERIT_CFG.maxRearIntrusion + 1e-6) return false;
+    if (Number.isFinite(targetEfl) && targetEfl > 1 && Math.abs(ev.efl - targetEfl) > 6.0) return false;
+    if (Number.isFinite(targetT) && targetT > 0) {
+      if (ev.T > targetT * 1.45) return false;
+      if (ev.T < targetT * 0.5) return false;
+    }
     return true;
   }
 
@@ -3170,8 +3193,9 @@
     const baseSeedEval = evalLensMerit(baseSeed, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
     const baseNudgedEval = evalLensMerit(baseNudged, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
 
-    const baseSeedUsable = evalIsUsable(baseSeedEval);
-    const baseNudgedUsable = evalIsUsable(baseNudgedEval);
+    const isUsable = (ev) => evalIsUsable(ev, { targetEfl, targetT });
+    const baseSeedUsable = isUsable(baseSeedEval);
+    const baseNudgedUsable = isUsable(baseNudgedEval);
     const useNudgedBase = baseNudgedUsable && (!baseSeedUsable || baseNudgedEval.score <= baseSeedEval.score);
     const baseStart = useNudgedBase ? baseNudged : baseSeed;
     const baseEval = useNudgedBase ? baseNudgedEval : baseSeedEval;
@@ -3179,8 +3203,8 @@
     // Keep optimizer around a sane Double-Gauss-like base topology.
     const topo = captureTopology(baseStart);
 
-    const userUsable = evalIsUsable(userEval);
-    const baseUsable = evalIsUsable(baseEval);
+    const userUsable = isUsable(userEval);
+    const baseUsable = isUsable(baseEval);
     const nearTarget = (ev) => {
       if (!ev) return false;
       const eflOk = Number.isFinite(ev.efl) && Number.isFinite(targetEfl)
@@ -3200,7 +3224,7 @@
     let curEval = allowUserSeed ? userEval : baseEval;
 
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
-    let bestUsable = evalIsUsable(best.eval);
+    let bestUsable = isUsable(best.eval);
     const icText = (ev) => {
       const ic = ev?.breakdown?.imageCircleDiag;
       const tgt = ev?.breakdown?.imageCircleTarget;
@@ -3225,8 +3249,8 @@
 
       const cand = mutateLens(cur, mode, topo);
       const candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
-      const candUsable = evalIsUsable(candEval);
-      const curUsable = evalIsUsable(curEval);
+      const candUsable = isUsable(candEval);
+      const curUsable = isUsable(curEval);
 
       let accept = false;
       if (candUsable && !curUsable) {
@@ -3279,6 +3303,24 @@
     if (!bestUsable) {
       if (baseUsable) best = { lens: clone(baseStart), eval: baseEval, iter: 0 };
       else if (userUsable) best = { lens: clone(userStart), eval: userEval, iter: 0 };
+      bestUsable = isUsable(best?.eval);
+    }
+
+    if (!bestUsable) {
+      optBest = null;
+      optRunning = false;
+
+      const tEnd = performance.now();
+      const sec = (tEnd - tStart) / 1000;
+      if (ui.optLog){
+        setOptLog(
+          `done ${iters}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
+          `NO valid design found for current constraints.\n` +
+          `Try: higher iterations, target T less aggressive, or load base preset first.\n`
+        );
+      }
+      toast("Optimize done: no valid design");
+      return;
     }
 
     optBest = best;
