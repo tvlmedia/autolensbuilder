@@ -1299,6 +1299,16 @@
     return 2 * Math.abs(efl * Math.tan(deg2rad(halfFieldDeg)));
   }
 
+  function imageCircleDiagFromChiefAtField(surfaces, wavePreset, sensorX, fieldDeg) {
+    if (!Array.isArray(surfaces) || !Number.isFinite(fieldDeg) || fieldDeg < 0) return null;
+    const chief = buildChiefRay(surfaces, fieldDeg);
+    const tr = traceRayForward(clone(chief), surfaces, wavePreset);
+    if (!tr || tr.vignetted || tr.tir || !tr.endRay) return null;
+    const y = rayHitYAtX(tr.endRay, sensorX);
+    if (!Number.isFinite(y)) return null;
+    return 2 * Math.abs(y);
+  }
+
   function targetImageCircleDiagMm(sensorW, sensorH) {
     const sensorDiag = Math.hypot(sensorW, sensorH);
     return Math.max(sensorDiag, IMAGE_CIRCLE_CFG.minDiagMm);
@@ -1601,7 +1611,9 @@
       merit += MERIT_CFG.covShortfallWeight * (d * d);
     }
 
-    const imageCircleDiag = imageCircleDiagFromHalfFieldMm(efl, maxField);
+    const imageCircleDiagMeasured = imageCircleDiagFromChiefAtField(surfaces, wavePreset, sensorX, maxField);
+    const imageCircleDiagFallback = imageCircleDiagFromHalfFieldMm(efl, maxField);
+    const imageCircleDiag = Number.isFinite(imageCircleDiagMeasured) ? imageCircleDiagMeasured : imageCircleDiagFallback;
     const imageCircleTarget = imageCircleDiagFromHalfFieldMm(efl, req);
     const imageCircleShortfall = (Number.isFinite(imageCircleDiag) && Number.isFinite(imageCircleTarget))
       ? Math.max(0, imageCircleTarget - imageCircleDiag)
