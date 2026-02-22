@@ -1645,6 +1645,7 @@
     eflWeight: 0.35,          // penalty per mm error (squared)
     tWeight: 24.0,            // penalty per T error (squared)
     tSlowWeight: 64.0,        // extra penalty when T is slower than target
+    tFastWeight: 6.0,         // mild penalty when much faster than target
     bflMin: 52.0,             // for PL: discourage too-short backfocus
     bflWeight: 6.0,
     lowValidPenalty: 450.0,
@@ -1656,7 +1657,58 @@
     invalidEflPenalty: 25000.0,
     invalidTPenalty: 16000.0,
     invalidCoveragePenalty: 6000.0,
+    guardFailPenalty: 3_000_000.0,
   };
+
+  const OPT_GUARD_CFG = {
+    eflTolFrac: 0.10,         // absolute FL tolerance around target
+    tMaxOverFrac: 0.003,      // allow tiny numeric slack above target T
+    minImageCircleMm: 45.0,   // hard floor; larger is always fine
+    invalidRestartEvery: 120, // force exploration reset on long invalid streak
+  };
+
+  function assessOptimizerConstraints(ev, { targetEfl, targetT, sensorW, sensorH }) {
+    const reasons = [];
+    const efl = Number(ev?.efl);
+    const T = Number(ev?.T);
+    const ic = Number(ev?.breakdown?.imageCircleDiag);
+    const coversOk = !!ev?.covers;
+
+    const reqIc = Math.max(
+      OPT_GUARD_CFG.minImageCircleMm,
+      targetImageCircleDiagMm(sensorW, sensorH) || OPT_GUARD_CFG.minImageCircleMm,
+    );
+
+    let eflErrFrac = null;
+    let eflOk = Number.isFinite(efl) && efl > 0;
+    if (eflOk && Number.isFinite(targetEfl) && targetEfl > 0) {
+      eflErrFrac = Math.abs(efl - targetEfl) / targetEfl;
+      eflOk = eflErrFrac <= OPT_GUARD_CFG.eflTolFrac;
+    }
+
+    const tCeil = (Number.isFinite(targetT) && targetT > 0)
+      ? targetT * (1 + OPT_GUARD_CFG.tMaxOverFrac)
+      : null;
+    let tOk = Number.isFinite(T) && T > 0;
+    if (tOk && Number.isFinite(tCeil)) tOk = T <= tCeil;
+
+    const icOk = Number.isFinite(ic) && ic + 1e-6 >= reqIc;
+
+    if (ev?.breakdown?.hardInvalid) reasons.push("PHYS");
+    if (!eflOk) reasons.push(`EFL±${Math.round(OPT_GUARD_CFG.eflTolFrac * 100)}%`);
+    if (!tOk) reasons.push("T too slow");
+    if (!icOk) reasons.push(`IC<${reqIc.toFixed(1)}mm`);
+    if (!coversOk) reasons.push("COV NO");
+
+    return {
+      ok: reasons.length === 0,
+      reasons,
+      reqIc,
+      tCeil,
+      eflErrFrac,
+      ic,
+    };
+  }
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
     const rays = buildRays(surfaces, fieldDeg, rayCount);
@@ -1774,8 +1826,13 @@
     }
     if (Number.isFinite(targetT) && Number.isFinite(T)){
       const d = (T - targetT);
-      merit += MERIT_CFG.tWeight * (d * d);
-      if (d > 0) merit += MERIT_CFG.tSlowWeight * (d * d);
+      if (d > 0) {
+        merit += MERIT_CFG.tWeight * (d * d);
+        merit += MERIT_CFG.tSlowWeight * (d * d);
+      } else {
+        const fast = -d;
+        merit += MERIT_CFG.tFastWeight * (fast * fast);
+      }
     } else if (Number.isFinite(targetT) && !Number.isFinite(T)) {
       merit += MERIT_CFG.invalidTPenalty;
     }
@@ -3014,9 +3071,19 @@
     const phys = evaluatePhysicalConstraints(surfaces);
 
     if (phys.hardFail) {
-      const score = MERIT_CFG.hardInvalidPenalty + Math.max(0, Number(phys.penalty || 0));
-      return {
-        score,
+      const baseScore = MERIT_CFG.hardInvalidPenalty + Math.max(0, Number(phys.penalty || 0));
+      const baseBreakdown = {
+        rmsCenter: null,
+        rmsEdge: null,
+        vigPct: 100,
+        covers: false,
+        intrusion: null,
+        fields: [0, 0, 0],
+        physPenalty: Number(phys.penalty || 0),
+        hardInvalid: true,
+      };
+      const baseEval = {
+        score: baseScore,
         efl: null,
         T: null,
         bfl: null,
@@ -3026,15 +3093,20 @@
         lensShift,
         rms0: null,
         rmsE: null,
+        breakdown: baseBreakdown,
+      };
+      const guard = assessOptimizerConstraints(baseEval, { targetEfl, targetT, sensorW, sensorH });
+      const score = baseScore + MERIT_CFG.guardFailPenalty * Math.max(1, guard.reasons.length);
+      return {
+        ...baseEval,
+        score,
+        validDesign: false,
+        guard,
         breakdown: {
-          rmsCenter: null,
-          rmsEdge: null,
-          vigPct: 100,
-          covers: false,
-          intrusion: null,
-          fields: [0, 0, 0],
-          physPenalty: Number(phys.penalty || 0),
-          hardInvalid: true,
+          ...baseBreakdown,
+          guardOk: false,
+          guardReasons: guard.reasons.join(" | "),
+          guardReqIcMm: guard.reqIc,
         },
       };
     }
@@ -3074,21 +3146,36 @@
       hardInvalid: phys.hardFail,
     });
 
-    // tiny extra: hard fail if NaNs
-    const score = Number.isFinite(meritRes.merit) ? meritRes.merit : 1e9;
-
-    return {
+    let score = Number.isFinite(meritRes.merit) ? meritRes.merit : 1e9;
+    const baseBreakdown = meritRes.breakdown || {};
+    const baseEval = {
       score,
       efl,
       T,
       bfl,
-      covers: !!meritRes.breakdown?.coversStrict,
+      covers: !!baseBreakdown.coversStrict,
       intrusion,
       vigFrac,
       lensShift,
-      rms0: meritRes.breakdown.rmsCenter,
-      rmsE: meritRes.breakdown.rmsEdge,
-      breakdown: meritRes.breakdown,
+      rms0: baseBreakdown.rmsCenter,
+      rmsE: baseBreakdown.rmsEdge,
+      breakdown: baseBreakdown,
+    };
+
+    const guard = assessOptimizerConstraints(baseEval, { targetEfl, targetT, sensorW, sensorH });
+    if (!guard.ok) score += MERIT_CFG.guardFailPenalty * Math.max(1, guard.reasons.length);
+
+    return {
+      ...baseEval,
+      score,
+      validDesign: guard.ok,
+      guard,
+      breakdown: {
+        ...baseBreakdown,
+        guardOk: guard.ok,
+        guardReasons: guard.reasons.join(" | "),
+        guardReqIcMm: guard.reqIc,
+      },
     };
   }
 
@@ -3106,6 +3193,13 @@
     const fieldAngle = num(ui.fieldAngle?.value, 0);
     const rayCount = Math.max(9, Math.min(61, (num(ui.rayCount?.value, 31) | 0))); // limit for speed
     const wavePreset = ui.wavePreset?.value || "d";
+    const hardReqIc = Math.max(
+      OPT_GUARD_CFG.minImageCircleMm,
+      targetImageCircleDiagMm(sensorW, sensorH) || OPT_GUARD_CFG.minImageCircleMm,
+    );
+    const rulesTxt =
+      `Rules: EFL ±${Math.round(OPT_GUARD_CFG.eflTolFrac * 100)}% • ` +
+      `T <= ${targetT.toFixed(2)} • IC >= ${hardReqIc.toFixed(1)}mm • COV YES`;
 
     const startLens = sanitizeLens(lens);
     const topo = captureTopology(startLens);
@@ -3140,7 +3234,8 @@
 
     let cur = startLens;
     let curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
-    let best = { lens: clone(cur), eval: curEval, iter: 0 };
+    let best = curEval.validDesign ? { lens: clone(cur), eval: curEval, iter: 0 } : null;
+    let invalidStreak = curEval.validDesign ? 0 : 1;
     const icText = (ev) => {
       const ic = ev?.breakdown?.imageCircleDiag;
       const tgt = ev?.breakdown?.imageCircleTarget;
@@ -3148,6 +3243,29 @@
       const tgtStr = Number.isFinite(tgt) ? `${tgt.toFixed(1)}mm` : "—";
       return `IC ${icStr}/${tgtStr}`;
     };
+    const evalState = (ev) => {
+      if (!ev) return "—";
+      if (ev.validDesign) return "VALID";
+      const why = ev.guard?.reasons?.length ? ev.guard.reasons.join(", ") : "constraints";
+      return `INVALID (${why})`;
+    };
+    const bestLine = () => {
+      if (!best?.eval) return `best: — (nog geen valide design)\n${rulesTxt}\n`;
+      return (
+        `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • ` +
+        `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • ` +
+        `COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • ` +
+        `INTR ${best.eval.intrusion.toFixed(2)}mm • ${evalState(best.eval)}\n`
+      );
+    };
+
+    if (ui.optLog) {
+      setOptLog(
+        `running… 0/${iters}\n` +
+        `current ${curEval.score.toFixed(2)} • ${evalState(curEval)}\n` +
+        bestLine()
+      );
+    }
 
     // annealing-ish
     let temp0 = mode === "wild" ? 3.5 : 1.8;
@@ -3166,14 +3284,28 @@
       const cand = mutateLens(cur, mode, topoForOptimize);
       const candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
 
-      const d = candEval.score - curEval.score;
-      const accept = (d <= 0) || (Math.random() < Math.exp(-d / Math.max(1e-9, temp)));
+      let accept = false;
+      if (candEval.validDesign) {
+        invalidStreak = 0;
+        if (!curEval.validDesign) {
+          accept = true;
+        } else {
+          const d = candEval.score - curEval.score;
+          accept = (d <= 0) || (Math.random() < Math.exp(-d / Math.max(1e-9, temp)));
+        }
+      } else {
+        invalidStreak += 1;
+        if (!curEval.validDesign) {
+          const d = candEval.score - curEval.score;
+          accept = (d <= 0) || (Math.random() < Math.exp(-d / Math.max(1e-9, temp)));
+        }
+      }
       if (accept){
         cur = cand;
         curEval = candEval;
       }
 
-      if (candEval.score < best.eval.score){
+      if (candEval.validDesign && (!best || candEval.score < best.eval.score)){
         best = { lens: clone(cand), eval: candEval, iter: i };
 
         // UI update (rare)
@@ -3184,9 +3316,21 @@
             `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
             `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
             `COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
-            `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
+            `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
+            `${rulesTxt}\n`
           );
         }
+      }
+
+      if (curEval.validDesign && (!best || curEval.score < best.eval.score)) {
+        best = { lens: clone(cur), eval: curEval, iter: i };
+      }
+
+      if (invalidStreak >= OPT_GUARD_CFG.invalidRestartEvery) {
+        const seedLens = best?.lens ? clone(best.lens) : clone(startLens);
+        cur = mutateLens(seedLens, "wild", topoForOptimize);
+        curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+        invalidStreak = curEval.validDesign ? 0 : 1;
       }
 
       if (i % BATCH === 0){
@@ -3194,10 +3338,12 @@
         const dt = (tNow - tStart) / 1000;
         const ips = i / Math.max(1e-6, dt);
         if (ui.optLog){
+          const bestScoreTxt = best?.eval ? best.eval.score.toFixed(2) : "—";
+          const bestIterTxt = best ? String(best.iter) : "—";
           setOptLog(
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
-            `current ${curEval.score.toFixed(2)} • best ${best.eval.score.toFixed(2)} @${best.iter}\n` +
-            `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • INTR ${best.eval.intrusion.toFixed(2)}mm\n`
+            `current ${curEval.score.toFixed(2)} • ${evalState(curEval)} • best ${bestScoreTxt} @${bestIterTxt}\n` +
+            bestLine()
           );
         }
         // yield to UI
@@ -3205,24 +3351,34 @@
       }
     }
 
-    optBest = best;
+    optBest = best || null;
     optRunning = false;
 
     const tEnd = performance.now();
     const sec = (tEnd - tStart) / 1000;
     if (ui.optLog){
-      setOptLog(
-        `done ${best.iter}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
-        `BEST score ${best.eval.score.toFixed(2)}\n` +
-        `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
-        `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
-        `COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
-        `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
-        `Click “Apply best” to load.`
-      );
+      if (best?.eval) {
+        setOptLog(
+          `done ${best.iter}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
+          `BEST score ${best.eval.score.toFixed(2)}\n` +
+          `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
+          `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
+          `COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
+          `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
+          `${rulesTxt}\n` +
+          `Click “Apply best” to load.`
+        );
+      } else {
+        setOptLog(
+          `done 0/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
+          `Geen valide design gevonden binnen constraints.\n` +
+          `${rulesTxt}\n` +
+          `Tip: start met Load OMIT 50 preset of voeg extra element/air-gap toe en probeer opnieuw.`
+        );
+      }
     }
 
-    toast(optBest ? `Optimize done. Best merit ${optBest.eval.score.toFixed(2)}` : "Optimize stopped");
+    toast(optBest ? `Optimize done. Best merit ${optBest.eval.score.toFixed(2)}` : "Optimize done: geen valide design");
   }
 
   function stopOptimizer(){
