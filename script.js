@@ -3819,20 +3819,25 @@
       seed = adConditionSeedLens(seed, cfg);
 
       let evalRes = adEvaluateCandidate(seed, cfg, { quick: true });
+      seed = evalRes.lens;
       if (!evalRes.valid) {
         for (let t = 0; t < 3; t++) {
           const m = adMutateLens(seed, cfg, null, {});
           seed = adConditionSeedLens(m.lens, cfg);
           const eTry = adEvaluateCandidate(seed, cfg, { quick: true });
-          if (eTry.score < evalRes.score) evalRes = eTry;
+          if (eTry.score < evalRes.score) {
+            evalRes = eTry;
+            seed = eTry.lens;
+          }
           if (eTry.valid) {
             evalRes = eTry;
+            seed = eTry.lens;
             break;
           }
         }
       }
 
-      const item = { family, lens: seed, eval: evalRes };
+      const item = { family, lens: clone(evalRes.lens || seed), eval: evalRes };
       if (evalRes.valid) valid.push(item);
       else near.push(item);
 
@@ -3855,9 +3860,10 @@
   }
 
   async function adOptimizeSeed(seedItem, cfg, seedRank, totalSeeds) {
-    let cur = sanitizeLens(clone(seedItem.lens));
+    let cur = sanitizeLens(clone(seedItem?.eval?.lens || seedItem.lens));
     let curEval = adEvaluateCandidate(cur, cfg, { quick: false });
-    let best = curEval.valid ? { lens: clone(cur), eval: curEval, iter: 0 } : null;
+    cur = curEval.lens;
+    let best = curEval.valid ? { lens: clone(curEval.lens), eval: curEval, iter: 0 } : null;
     let topo = adCaptureTopology(cur);
     let invalidStreak = curEval.valid ? 0 : 1;
 
@@ -3892,17 +3898,17 @@
       }
 
       if (accept) {
-        cur = cand;
+        cur = candEval.lens;
         curEval = candEval;
         if (m.topologyChanged) topo = adCaptureTopology(cur);
       }
 
       if (candEval.valid && (!best || candEval.score < best.eval.score)) {
-        best = { lens: clone(cand), eval: candEval, iter };
+        best = { lens: clone(candEval.lens), eval: candEval, iter };
       }
 
       if (curEval.valid && (!best || curEval.score < best.eval.score)) {
-        best = { lens: clone(cur), eval: curEval, iter };
+        best = { lens: clone(curEval.lens), eval: curEval, iter };
       }
 
       invalidStreak = curEval.valid ? 0 : (invalidStreak + 1);
@@ -3910,6 +3916,7 @@
         const seedBase = best?.lens ? clone(best.lens) : clone(seedItem.lens);
         cur = adConditionSeedLens(seedBase, cfg);
         curEval = adEvaluateCandidate(cur, cfg, { quick: true });
+        cur = curEval.lens;
         topo = adCaptureTopology(cur);
         invalidStreak = curEval.valid ? 0 : 1;
       }
@@ -3921,7 +3928,7 @@
       }
     }
 
-    return best || { lens: cur, eval: curEval, iter: cfg.optimizeIters };
+    return best || { lens: clone(curEval.lens || cur), eval: curEval, iter: cfg.optimizeIters };
   }
 
   function adFormatEval(ev) {
