@@ -2778,7 +2778,9 @@
     seedGlassMax: 12.0,
     seedAirMin: 0.2,
     seedAirMax: 25.0,
-    maxThicknessMm: 50.0,
+    maxGlassThicknessMm: 22.0,
+    maxAirGapMm: 140.0,
+    minRearGapMm: 52.5,
     seedCount: 56,
     minValidSeeds: 8,
     topK: 5,
@@ -2912,6 +2914,39 @@
     return s * clamp(Math.abs(x), minAbs, maxAbs);
   }
 
+  function adMaxThicknessForSurface(s) {
+    return airOrGlass(s?.glass) === "AIR"
+      ? Number(AD_CFG.maxAirGapMm || 120)
+      : Number(AD_CFG.maxGlassThicknessMm || 24);
+  }
+
+  function adClampThicknessForSurface(s, value, minThickness = PHYS_CFG.minThickness) {
+    const lo = Number(minThickness || PHYS_CFG.minThickness);
+    const hi = Math.max(lo, adMaxThicknessForSurface(s));
+    return clamp(Number(value || 0), lo, hi);
+  }
+
+  function adRearSurfaceIndex(surfaces) {
+    if (!Array.isArray(surfaces)) return -1;
+    for (let i = surfaces.length - 1; i >= 0; i--) {
+      const t = String(surfaces[i]?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      return i;
+    }
+    return -1;
+  }
+
+  function adEnforceRearGap(surfaces, minRearGapMm) {
+    if (!Array.isArray(surfaces) || !surfaces.length) return;
+    const gapMin = Number(minRearGapMm || 0);
+    if (!(gapMin > 0)) return;
+    const rearIdx = adRearSurfaceIndex(surfaces);
+    if (rearIdx < 0) return;
+    const rear = surfaces[rearIdx];
+    rear.glass = "AIR";
+    rear.t = adClampThicknessForSurface(rear, Math.max(Number(rear.t || 0), gapMin), Math.max(PHYS_CFG.minStopSideAirGap, PHYS_CFG.minThickness));
+  }
+
   function airOrGlass(g) {
     return String(resolveGlassName(g || "AIR")).toUpperCase() === "AIR" ? "AIR" : "GLASS";
   }
@@ -2999,6 +3034,18 @@
     }
 
     function finish() {
+      const rearGapMin = Math.max(AD_CFG.bflMinMm + 0.25, Number(AD_CFG.minRearGapMm || 0));
+      const rearGapSeed = rearGapMin + randRange(0.0, 8.0);
+      const rearIdx = surfaces.length - 1;
+      if (rearIdx >= 1) {
+        const rear = surfaces[rearIdx];
+        rear.glass = "AIR";
+        rear.t = adClampThicknessForSurface(
+          rear,
+          Math.max(Number(rear.t || 0), rearGapSeed),
+          Math.max(PHYS_CFG.minStopSideAirGap, PHYS_CFG.minThickness),
+        );
+      }
       surfaces.push({
         type: "IMS",
         R: 0.0,
@@ -3156,6 +3203,7 @@
   function adQuickSanity(surfaces, opts = {}) {
     if (!Array.isArray(surfaces)) return;
     const targetStopAp = Number.isFinite(opts.targetStopAp) ? Number(opts.targetStopAp) : null;
+    const minRearGap = Number.isFinite(opts.minRearGap) ? Number(opts.minRearGap) : 0;
     for (let i = 0; i < surfaces.length; i++) {
       const s = surfaces[i];
       const t = String(s?.type || "").toUpperCase();
@@ -3174,20 +3222,28 @@
         s.stop = false;
         continue;
       }
-      s.t = clamp(Number(s.t || 0), PHYS_CFG.minThickness, AD_CFG.maxThicknessMm);
+      const minT = t === "STOP" ? PHYS_CFG.minStopSideAirGap : PHYS_CFG.minThickness;
+      s.t = adClampThicknessForSurface(s, Number(s.t || 0), minT);
       s.ap = clamp(Number(s.ap || 0), PHYS_CFG.minAperture * 0.8, PHYS_CFG.maxAperture);
       s.glass = resolveGlassName(s.glass);
       if (Math.abs(Number(s.R || 0)) >= 1e-9) s.R = clampSignedRadius(Number(s.R || 0));
     }
+
+    adEnforceRearGap(surfaces, minRearGap);
 
     const stopIdx = adEnsureSingleStop(surfaces);
     if (stopIdx >= 0) {
       const sStop = surfaces[stopIdx];
       if (targetStopAp != null) sStop.ap = Math.max(Number(sStop.ap || 0), targetStopAp * 0.94);
       sStop.ap = clamp(Number(sStop.ap || 0), PHYS_CFG.minAperture, PHYS_CFG.maxAperture * 0.92);
-      if (stopIdx > 0) surfaces[stopIdx - 1].t = Math.max(PHYS_CFG.minStopSideAirGap, Number(surfaces[stopIdx - 1]?.t || 0));
-      sStop.t = Math.max(PHYS_CFG.minStopSideAirGap, Number(sStop.t || 0));
+      if (stopIdx > 0) {
+        const sPrev = surfaces[stopIdx - 1];
+        sPrev.t = adClampThicknessForSurface(sPrev, Number(sPrev.t || 0), PHYS_CFG.minStopSideAirGap);
+      }
+      sStop.t = adClampThicknessForSurface(sStop, Number(sStop.t || 0), PHYS_CFG.minStopSideAirGap);
     }
+
+    adEnforceRearGap(surfaces, minRearGap);
 
     clampAllApertures(surfaces);
     clampGlassPairClearApertures(surfaces, PHYS_CFG.minGlassCT, 0.985);
@@ -3208,7 +3264,8 @@
       const t = String(s?.type || "").toUpperCase();
       if (t === "OBJ" || t === "IMS") continue;
       if (Math.abs(Number(s.R || 0)) >= 1e-9) s.R = clampSignedRadius(Number(s.R || 0) * k);
-      s.t = clamp(Number(s.t || 0) * k, PHYS_CFG.minThickness, AD_CFG.maxThicknessMm);
+      const minT = t === "STOP" ? PHYS_CFG.minStopSideAirGap : PHYS_CFG.minThickness;
+      s.t = adClampThicknessForSurface(s, Number(s.t || 0) * k, minT);
       s.ap = clamp(Number(s.ap || 0) * Math.sqrt(k), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
     }
     clampAllApertures(surfaces);
@@ -3257,8 +3314,12 @@
       s.ap = clamp(Number(s.ap || 0) * gain, PHYS_CFG.minAperture, maxApForSurface(s));
     }
     if (stopIdx >= 0) {
-      if (stopIdx > 0) surfaces[stopIdx - 1].t = clamp(Number(surfaces[stopIdx - 1]?.t || 0) * 1.10, PHYS_CFG.minStopSideAirGap, AD_CFG.maxThicknessMm);
-      surfaces[stopIdx].t = clamp(Number(surfaces[stopIdx]?.t || 0) * 1.10, PHYS_CFG.minStopSideAirGap, AD_CFG.maxThicknessMm);
+      if (stopIdx > 0) {
+        const sPrev = surfaces[stopIdx - 1];
+        sPrev.t = adClampThicknessForSurface(sPrev, Number(sPrev.t || 0) * 1.10, PHYS_CFG.minStopSideAirGap);
+      }
+      const sStop = surfaces[stopIdx];
+      sStop.t = adClampThicknessForSurface(sStop, Number(sStop.t || 0) * 1.10, PHYS_CFG.minStopSideAirGap);
     }
     clampAllApertures(surfaces);
   }
@@ -3268,17 +3329,36 @@
     const s = tmp.surfaces;
     const stopApTarget = adStopApFromTarget(cfg.targetEfl, cfg.targetT);
     for (let i = 0; i < 3; i++) {
-      adQuickSanity(s, { targetStopAp: stopApTarget });
+      adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm });
       adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset);
       adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset);
       adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount);
-      adQuickSanity(s, { targetStopAp: stopApTarget });
+      adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm });
     }
     return sanitizeLens(tmp);
   }
 
   function adIsInfinityDistance(d) {
     return !Number.isFinite(d) || d >= 1e8;
+  }
+
+  function adRearIntrusionAtShift(surfaces, shiftMm) {
+    computeVertices(surfaces, Number(shiftMm || 0), 0);
+    return lastPhysicalVertexX(surfaces) - (-PL_FFD);
+  }
+
+  function adRearSafeMaxPositiveShift(surfaces, marginMm = 0) {
+    computeVertices(surfaces, 0, 0);
+    const rearVx = lastPhysicalVertexX(surfaces);
+    const limitX = -PL_FFD - Math.max(0, Number(marginMm || 0));
+    return limitX - rearVx;
+  }
+
+  function adClampShiftForRearClearance(surfaces, desiredShiftMm, marginMm = 0) {
+    const wanted = Number(desiredShiftMm || 0);
+    const maxPos = adRearSafeMaxPositiveShift(surfaces, marginMm);
+    if (!Number.isFinite(maxPos)) return wanted;
+    return Math.min(wanted, maxPos);
   }
 
   function adBuildRaysForDistance(surfaces, fieldAngleDeg, count, objectDistanceMm) {
@@ -3310,9 +3390,14 @@
     return { traces, rms, n, vigFrac, vCount };
   }
 
-  function adBestLensShiftForDistance(surfaces, objectDistanceMm, rayCount, wavePreset, shiftMaxMm, focusFieldDeg = 0) {
+  function adBestLensShiftForDistance(surfaces, objectDistanceMm, rayCount, wavePreset, shiftMaxMm, focusFieldDeg = 0, maxPositiveShiftMm = null) {
     const sensorX = 0.0;
     const shiftMax = Math.max(1.0, Number(shiftMaxMm || AD_CFG.shiftMaxMm));
+    const hiCap = Number.isFinite(maxPositiveShiftMm) ? Number(maxPositiveShiftMm) : shiftMax;
+    const scanHi = Math.min(shiftMax, hiCap);
+    if (scanHi < -shiftMax + 1e-9) {
+      return { ok: false, shift: 0, rms: null, n: 0 };
+    }
     const coarseStep = Math.max(0.25, shiftMax / 24);
     const fineStep = Math.max(0.05, shiftMax / 90);
     const minValid = Math.max(5, Math.floor(rayCount * 0.30));
@@ -3332,9 +3417,11 @@
       }
     }
 
-    scan(-shiftMax, shiftMax, coarseStep);
+    scan(-shiftMax, scanHi, coarseStep);
     if (Number.isFinite(best.rms)) {
-      scan(best.shift - 1.2, best.shift + 1.2, fineStep);
+      const loFine = Math.max(-shiftMax, best.shift - 1.2);
+      const hiFine = Math.min(scanHi, best.shift + 1.2);
+      if (hiFine >= loFine - 1e-9) scan(loFine, hiFine, fineStep);
     }
 
     if (!Number.isFinite(best.rms) || best.n < minValid) {
@@ -3351,6 +3438,7 @@
       cfg.wavePreset,
       cfg.shiftMaxMm,
       0,
+      cfg.maxPositiveShiftMm,
     );
     if (!focus.ok) {
       return {
@@ -3432,7 +3520,10 @@
 
     const tmp = sanitizeLens(clone(lensObj));
     const surfaces = tmp.surfaces;
-    adQuickSanity(surfaces, { targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT) });
+    adQuickSanity(surfaces, {
+      targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
+      minRearGap: cfg.minRearGapMm,
+    });
     computeVertices(surfaces, 0, 0);
 
     const phys = evaluatePhysicalConstraints(surfaces);
@@ -3451,6 +3542,7 @@
     const icDiag = imageCircleDiagFromChiefAtField(surfaces, cfg.wavePreset, 0, maxField) ?? imageCircleDiagFromHalfFieldMm(efl, maxField);
     const icTarget = targetImageCircleDiagMm(cfg.sensorW, cfg.sensorH);
     const icOk = Number.isFinite(icDiag) && icDiag + 0.25 >= icTarget;
+    const maxPosShift = adRearSafeMaxPositiveShift(surfaces, 0);
 
     const focusInf = adEvalDistanceMerit(surfaces, {
       objectDistanceMm: Infinity,
@@ -3458,6 +3550,7 @@
       rayCount,
       wavePreset: cfg.wavePreset,
       shiftMaxMm: cfg.shiftMaxMm,
+      maxPositiveShiftMm: maxPosShift,
     });
     const focusNear = adEvalDistanceMerit(surfaces, {
       objectDistanceMm: cfg.focusNearMm,
@@ -3465,6 +3558,7 @@
       rayCount,
       wavePreset: cfg.wavePreset,
       shiftMaxMm: cfg.shiftMaxMm,
+      maxPositiveShiftMm: maxPosShift,
     });
 
     const focusTarget = adNormalizeFocusTarget(cfg.focusTarget);
@@ -3480,9 +3574,16 @@
     const eflOk = Number.isFinite(efl) && eflErrFrac <= eflTol;
     const tOk = Number.isFinite(T) && T <= cfg.targetT * (1 + tSlack);
     const bflOk = Number.isFinite(bfl) && bfl >= cfg.bflMinMm;
-    const intrusionOk = intrusion <= 1e-6;
-    const focusInfOk = focusInf.ok && Math.abs(focusInf.shift) <= cfg.shiftMaxMm + 1e-6;
-    const focusNearOk = focusNear.ok && Math.abs(focusNear.shift) <= cfg.shiftMaxMm + 1e-6;
+    const intrusionInfShift = focusInf.ok ? adRearIntrusionAtShift(surfaces, focusInf.shift) : Infinity;
+    const intrusionNearShift = focusNear.ok ? adRearIntrusionAtShift(surfaces, focusNear.shift) : Infinity;
+    const focusInfIntrusionOk = !focusInf.ok || intrusionInfShift <= 1e-6;
+    const focusNearIntrusionOk = !focusNear.ok || intrusionNearShift <= 1e-6;
+    const focusIntrusionOk = focusTarget === "both"
+      ? (focusInfIntrusionOk && focusNearIntrusionOk)
+      : (focusTarget === "near" ? focusNearIntrusionOk : focusInfIntrusionOk);
+    const intrusionOk = intrusion <= 1e-6 && focusIntrusionOk;
+    const focusInfOk = focusInf.ok && Math.abs(focusInf.shift) <= cfg.shiftMaxMm + 1e-6 && focusInfIntrusionOk;
+    const focusNearOk = focusNear.ok && Math.abs(focusNear.shift) <= cfg.shiftMaxMm + 1e-6 && focusNearIntrusionOk;
     const focusOk = focusTarget === "both"
       ? (focusInfOk && focusNearOk)
       : (focusTarget === "near" ? focusNearOk : focusInfOk);
@@ -3538,6 +3639,9 @@
     }
 
     if (Number.isFinite(bfl) && bfl < cfg.bflMinMm) score += cfg.bflWeight * (cfg.bflMinMm - bfl) ** 2;
+    if (Number.isFinite(intrusion) && intrusion > 0) score += cfg.bflWeight * intrusion * intrusion;
+    if (Number.isFinite(intrusionInfShift) && intrusionInfShift > 0) score += cfg.bflWeight * intrusionInfShift * intrusionInfShift;
+    if (Number.isFinite(intrusionNearShift) && intrusionNearShift > 0) score += cfg.bflWeight * intrusionNearShift * intrusionNearShift;
     if (Number.isFinite(req) && Number.isFinite(maxField) && maxField < req) score += cfg.covWeight * (req - maxField) ** 2;
     if (!icOk) score += cfg.covWeight * Math.max(1, (icTarget - Number(icDiag || 0)) ** 2);
     if (focusTarget === "both" && focusInf.ok && focusNear.ok) {
@@ -3561,6 +3665,8 @@
       icTarget,
       distPct,
       intrusion,
+      intrusionInfShift: Number.isFinite(intrusionInfShift) ? intrusionInfShift : null,
+      intrusionNearShift: Number.isFinite(intrusionNearShift) ? intrusionNearShift : null,
       phys,
       focusInf,
       focusNear,
@@ -3653,7 +3759,7 @@
     const stopIdx = findStopSurfaceIndex(surfaces);
     const nearStop = stopIdx >= 0 && Math.abs(i - stopIdx) <= 2;
     const delta = nearStop ? randRange(-0.45, 0.45) : randRange(-1.0, 1.0);
-    surfaces[i].t = clamp(Number(surfaces[i].t || 0) + delta, PHYS_CFG.minThickness, AD_CFG.maxThicknessMm);
+    surfaces[i].t = adClampThicknessForSurface(surfaces[i], Number(surfaces[i].t || 0) + delta, PHYS_CFG.minThickness);
     return true;
   }
 
@@ -3788,9 +3894,15 @@
       const changed = op.fn();
       if (!changed) continue;
 
-      adQuickSanity(s, { targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT) });
+      adQuickSanity(s, {
+        targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
+        minRearGap: cfg.minRearGapMm,
+      });
       if (topo && !op.topoChange) adEnforceTopology(s, topo);
-      adQuickSanity(s, { targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT) });
+      adQuickSanity(s, {
+        targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
+        minRearGap: cfg.minRearGapMm,
+      });
       return {
         lens: sanitizeLens(L),
         op: op.id,
@@ -3798,7 +3910,10 @@
       };
     }
 
-    adQuickSanity(s, { targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT) });
+    adQuickSanity(s, {
+      targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
+      minRearGap: cfg.minRearGapMm,
+    });
     if (topo) adEnforceTopology(s, topo);
     return {
       lens: sanitizeLens(L),
@@ -3974,6 +4089,7 @@
       sensorW: AD_CFG.sensorW,
       sensorH: AD_CFG.sensorH,
       wavePreset: "d",
+      minRearGapMm: Math.max(AD_CFG.minRearGapMm, AD_CFG.bflMinMm + 0.25),
       seedCount: clamp(Math.round(AD_CFG.seedCount * effort), 24, 600),
       topK: clamp(Math.round(AD_CFG.topK + (effort - 1) * 1.3), 3, 12),
       optimizeIters: clamp(Math.round(AD_CFG.optimizeIters * effort), 120, 5200),
@@ -3992,6 +4108,7 @@
         `Focus target: ${focusTarget === "near" ? "2000mm" : focusTarget === "inf" ? "infinity" : "infinity + 2000mm"}\n` +
         `Effort: ${attempts}x (seeds ${cfg.seedCount}, iters ${cfg.optimizeIters}, topK ${cfg.topK})\n` +
         `Sensor ${cfg.sensorW.toFixed(2)}x${cfg.sensorH.toFixed(2)}mm • PL BFL>=${cfg.bflMinMm.toFixed(1)}\n` +
+        `Rear gap guard: >=${cfg.minRearGapMm.toFixed(1)}mm\n` +
         `Focus near distance: ${cfg.focusNearMm.toFixed(0)}mm\n`
       );
 
@@ -4044,7 +4161,8 @@
       const previewShift = focusTarget === "near"
         ? Number(globalBest.eval.focusNear?.shift || 0)
         : Number(globalBest.eval.focusInf?.shift || 0);
-      if (ui.lensFocus) ui.lensFocus.value = previewShift.toFixed(2);
+      const safePreviewShift = adClampShiftForRearClearance(globalBest.lens?.surfaces || [], previewShift, 0);
+      if (ui.lensFocus) ui.lensFocus.value = safePreviewShift.toFixed(2);
       scheduleAutosave();
       renderAll();
 
@@ -4069,6 +4187,7 @@
     const shift = mode === "near"
       ? Number(adBest.eval?.focusNear?.shift || 0)
       : Number(adBest.eval?.focusInf?.shift || 0);
+    const safeShift = adClampShiftForRearClearance(adBest.lens?.surfaces || [], shift, 0);
     const modeTxt = mode === "near"
       ? "focus 2000mm"
       : mode === "inf"
@@ -4078,12 +4197,16 @@
     loadLens(adBest.lens);
     if (ui.focusMode) ui.focusMode.value = "lens";
     if (ui.sensorOffset) ui.sensorOffset.value = "0";
-    if (ui.lensFocus) ui.lensFocus.value = shift.toFixed(2);
+    if (ui.lensFocus) ui.lensFocus.value = safeShift.toFixed(2);
     scheduleAutosave();
     renderAll();
 
+    if (Math.abs(safeShift - shift) > 1e-4) {
+      appendADLog(`Preview shift clamped ${shift.toFixed(2)}mm -> ${safeShift.toFixed(2)}mm (rear must stay in front of PL flange).`);
+    }
+
     appendADLog(
-      `Preview Best loaded (${modeTxt}, shift ${shift.toFixed(2)}mm, ` +
+      `Preview Best loaded (${modeTxt}, shift ${safeShift.toFixed(2)}mm, ` +
       `EFL ${Number.isFinite(adBest.eval?.efl) ? adBest.eval.efl.toFixed(2) : "—"}mm, ` +
       `BFL ${Number.isFinite(adBest.eval?.bfl) ? adBest.eval.bfl.toFixed(2) : "—"}mm).`
     );
