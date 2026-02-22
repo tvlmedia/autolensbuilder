@@ -1546,6 +1546,9 @@
     imageCircleShortfallWeight: 180.0,
     imageCircleReqVigWeight: 1400.0,
     imageCircleReqValidWeight: 900.0,
+    invalidEflPenalty: 25000.0,
+    invalidTPenalty: 16000.0,
+    invalidCoveragePenalty: 6000.0,
   };
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
@@ -1606,13 +1609,19 @@
     merit += MERIT_CFG.centerVigWeight * (vigCenter * vigCenter);
     merit += MERIT_CFG.midVigWeight * (vigMid * vigMid);
     if (!covers) merit += MERIT_CFG.covPenalty;
+    if (!Number.isFinite(maxField) || !Number.isFinite(req)) merit += MERIT_CFG.invalidCoveragePenalty;
     if (Number.isFinite(req) && Number.isFinite(maxField) && maxField < req) {
       const d = req - maxField;
       merit += MERIT_CFG.covShortfallWeight * (d * d);
     }
 
-    const imageCircleDiagMeasured = imageCircleDiagFromChiefAtField(surfaces, wavePreset, sensorX, maxField);
-    const imageCircleDiagFallback = imageCircleDiagFromHalfFieldMm(efl, maxField);
+    const canEvalImageCircle = Number.isFinite(efl) && efl > 0 && Number.isFinite(req) && req >= 0;
+    const imageCircleDiagMeasured = canEvalImageCircle
+      ? imageCircleDiagFromChiefAtField(surfaces, wavePreset, sensorX, maxField)
+      : null;
+    const imageCircleDiagFallback = canEvalImageCircle
+      ? imageCircleDiagFromHalfFieldMm(efl, maxField)
+      : null;
     const imageCircleDiag = Number.isFinite(imageCircleDiagMeasured) ? imageCircleDiagMeasured : imageCircleDiagFallback;
     const imageCircleTarget = imageCircleDiagFromHalfFieldMm(efl, req);
     const imageCircleShortfall = (Number.isFinite(imageCircleDiag) && Number.isFinite(imageCircleTarget))
@@ -1653,11 +1662,15 @@
     if (Number.isFinite(targetEfl) && Number.isFinite(efl)){
       const d = (efl - targetEfl);
       merit += MERIT_CFG.eflWeight * (d * d);
+    } else if (Number.isFinite(targetEfl) && !Number.isFinite(efl)) {
+      merit += MERIT_CFG.invalidEflPenalty;
     }
     if (Number.isFinite(targetT) && Number.isFinite(T)){
       const d = (T - targetT);
       merit += MERIT_CFG.tWeight * (d * d);
       if (d > 0) merit += MERIT_CFG.tSlowWeight * (d * d);
+    } else if (Number.isFinite(targetT) && !Number.isFinite(T)) {
+      merit += MERIT_CFG.invalidTPenalty;
     }
 
     const minValidTarget = Math.max(7, Math.floor(rayCount * 0.45));
@@ -2958,6 +2971,34 @@
 
     const startLens = sanitizeLens(lens);
     const topo = captureTopology(startLens);
+    const physicalCount = (startLens?.surfaces || []).filter((s) => {
+      const t = String(s?.type || "").toUpperCase();
+      return t !== "OBJ" && t !== "IMS";
+    }).length;
+    const hasStartGlass = (startLens?.surfaces || []).some((s) => {
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") return false;
+      return String(resolveGlassName(s?.glass)).toUpperCase() !== "AIR";
+    });
+    const topoForOptimize = hasStartGlass ? topo : null;
+
+    if (!hasStartGlass && physicalCount <= 1) {
+      setOptLog(
+        "Optimizer gestopt.\n" +
+        "Huidig ontwerp heeft geen glas-elementen (alleen stop/plane), daardoor zijn EFL/T niet oplosbaar.\n" +
+        "Voeg eerst minimaal 1 element toe met +Element of laad een preset-lens."
+      );
+      toast("Optimizer: voeg eerst een glas-element toe");
+      optRunning = false;
+      return;
+    }
+
+    if (!hasStartGlass && ui.optLog) {
+      setOptLog(
+        "Info: geen glas in startlens; topology-lock voor optimizer is uitgeschakeld.\n" +
+        "Optimizer mag media aanpassen om een valide lens te vinden.\n"
+      );
+    }
 
     let cur = startLens;
     let curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
@@ -2984,7 +3025,7 @@
       const a = i / iters;
       const temp = temp0 * (1 - a) + temp1 * a;
 
-      const cand = mutateLens(cur, mode, topo);
+      const cand = mutateLens(cur, mode, topoForOptimize);
       const candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
 
       const d = candEval.score - curEval.score;
