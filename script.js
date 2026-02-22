@@ -2781,6 +2781,8 @@
     maxGlassThicknessMm: 22.0,
     maxAirGapMm: 140.0,
     minRearGapMm: 52.5,
+    maxSurfaceApMm: 30.0,
+    maxRearSurfaceApMm: 16.0,
     seedCount: 56,
     minValidSeeds: 8,
     topK: 5,
@@ -2973,6 +2975,52 @@
     return clamp((f / t) * 0.5, PHYS_CFG.minAperture, PHYS_CFG.maxAperture * 0.86);
   }
 
+  function adClampElementAperturesByZone(surfaces, opts = {}) {
+    if (!Array.isArray(surfaces) || !surfaces.length) return;
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    const targetStopAp = Number.isFinite(opts.targetStopAp) ? Number(opts.targetStopAp) : null;
+    let stopAp = stopIdx >= 0 ? Number(surfaces[stopIdx]?.ap || 0) : 0;
+    if (!Number.isFinite(stopAp) || stopAp <= 0) stopAp = targetStopAp != null ? targetStopAp : 8;
+    if (!Number.isFinite(stopAp) || stopAp <= 0) return;
+
+    const targetEfl = Number(opts.targetEfl || 50);
+    const wide = targetEfl <= 28.5;
+    const apCapGlobal = Math.max(PHYS_CFG.minAperture, Number(AD_CFG.maxSurfaceApMm || 24));
+    const apCapRear = Math.max(PHYS_CFG.minAperture, Math.min(apCapGlobal, Number(AD_CFG.maxRearSurfaceApMm || 18)));
+
+    const physIdx = [];
+    for (let i = 0; i < surfaces.length; i++) {
+      const t = String(surfaces[i]?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      physIdx.push(i);
+    }
+    if (!physIdx.length) return;
+    const lastPhys = physIdx[physIdx.length - 1];
+
+    for (const i of physIdx) {
+      const s = surfaces[i];
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "STOP") continue;
+      const dist = stopIdx >= 0 ? Math.abs(i - stopIdx) : 99;
+      let mul = 1.85;
+      if (stopIdx >= 0) {
+        if (i < stopIdx) {
+          if (dist <= 1) mul = 1.9;
+          else if (dist <= 3) mul = wide ? 2.30 : 2.10;
+          else mul = wide ? 2.50 : 2.20;
+        } else if (i > stopIdx) {
+          if (dist <= 1) mul = 1.75;
+          else if (dist <= 3) mul = 1.62;
+          else mul = 1.50;
+        }
+      }
+
+      let cap = Math.min(apCapGlobal, stopAp * mul, maxApForSurface(s));
+      if (i === lastPhys) cap = Math.min(cap, apCapRear);
+      s.ap = clamp(Number(s.ap || 0), PHYS_CFG.minAperture, cap);
+    }
+  }
+
   function adForceFixedSensorPreset() {
     if (ui.sensorPreset) ui.sensorPreset.value = AD_CFG.sensorPresetName;
     applyPreset(AD_CFG.sensorPresetName);
@@ -3102,29 +3150,50 @@
 
   function adTemplateRetrofocus(cfg) {
     const b = adCreateBuilder("AD Seed • Retrofocus", cfg.targetEfl, cfg.targetT);
-    b.addSinglet("neg", { glassClass: "FLINT", r1Min: 0.35, r1Max: 0.75, r2Min: 0.40, r2Max: 0.95, apMin: 1.70, apMax: 2.35, tgMin: 0.06, tgMax: 0.16, taMin: 0.06, taMax: 0.22 });
-    b.addSinglet("neg", { glassClass: "FLINT", r1Min: 0.45, r1Max: 1.05, r2Min: 0.45, r2Max: 1.15, apMin: 1.60, apMax: 2.20, tgMin: 0.05, tgMax: 0.14, taMin: 0.05, taMax: 0.20 });
-    b.addStop({ apMin: 0.95, apMax: 1.03, taMin: 0.03, taMax: 0.11 });
-    b.addSinglet("pos", { glassClass: "HIGH_INDEX_CROWN", r1Min: 0.35, r1Max: 0.80, r2Min: 0.8, r2Max: 1.8, apMin: 1.35, apMax: 1.95, tgMin: 0.07, tgMax: 0.18, taMin: 0.04, taMax: 0.14 });
-    b.addSinglet("pos", { glassClass: "CROWN", r1Min: 0.60, r1Max: 1.40, r2Min: 1.4, r2Max: 3.2, apMin: 1.20, apMax: 1.70, tgMin: 0.05, tgMax: 0.13, taMin: 0.03, taMax: 0.12 });
-    b.addSinglet("pos", { glassClass: "CROWN", r1Min: 1.00, r1Max: 2.8, r2Min: 2.0, r2Max: 6.5, apMin: 1.10, apMax: 1.40, tgMin: 0.02, tgMax: 0.07, taMin: 0.03, taMax: 0.16 });
+    b.addSinglet("neg", { glassClass: "FLINT", r1Min: 0.22, r1Max: 0.58, r2Min: 0.24, r2Max: 0.72, apMin: 1.95, apMax: 2.80, tgMin: 0.08, tgMax: 0.22, taMin: 0.10, taMax: 0.34 });
+    b.addSinglet("neg", { glassClass: "FLINT", r1Min: 0.26, r1Max: 0.74, r2Min: 0.28, r2Max: 0.82, apMin: 1.85, apMax: 2.65, tgMin: 0.07, tgMax: 0.20, taMin: 0.09, taMax: 0.30 });
+    b.addStop({ apMin: 0.95, apMax: 1.04, taMin: 0.08, taMax: 0.26 });
+    b.addSinglet("pos", { glassClass: "HIGH_INDEX_CROWN", r1Min: 0.26, r1Max: 0.62, r2Min: 0.62, r2Max: 1.45, apMin: 1.45, apMax: 2.10, tgMin: 0.09, tgMax: 0.24, taMin: 0.06, taMax: 0.22 });
+    b.addSinglet("neg", { glassClass: "FLINT", r1Min: 0.70, r1Max: 1.65, r2Min: 0.70, r2Max: 1.70, apMin: 1.25, apMax: 1.90, tgMin: 0.05, tgMax: 0.14, taMin: 0.06, taMax: 0.22 });
+    b.addSinglet("pos", { glassClass: "CROWN", r1Min: 0.66, r1Max: 1.55, r2Min: 1.3, r2Max: 3.6, apMin: 1.18, apMax: 1.70, tgMin: 0.05, tgMax: 0.14, taMin: 0.06, taMax: 0.20 });
+    b.addSinglet("pos", { glassClass: "CROWN", r1Min: 1.10, r1Max: 3.20, r2Min: 2.0, r2Max: 7.5, apMin: 1.08, apMax: 1.45, tgMin: 0.03, tgMax: 0.09, taMin: 0.10, taMax: 0.34 });
     return b.finish();
   }
 
   function adTemplateDistagon(cfg) {
     const b = adCreateBuilder("AD Seed • Distagon", cfg.targetEfl, cfg.targetT);
-    b.addSinglet("neg", { glassClass: "FLINT", r1Min: 0.32, r1Max: 0.72, r2Min: 0.38, r2Max: 0.90, apMin: 1.75, apMax: 2.45, tgMin: 0.06, tgMax: 0.16, taMin: 0.06, taMax: 0.22 });
-    b.addSinglet("pos", { glassClass: "HIGH_INDEX_CROWN", r1Min: 0.55, r1Max: 1.10, r2Min: 1.3, r2Max: 2.7, apMin: 1.45, apMax: 2.00, tgMin: 0.06, tgMax: 0.16, taMin: 0.04, taMax: 0.14 });
-    b.addStop({ apMin: 0.95, apMax: 1.03, taMin: 0.03, taMax: 0.11 });
-    b.addSinglet("pos", { glassClass: "HIGH_INDEX_CROWN", r1Min: 0.40, r1Max: 0.95, r2Min: 0.9, r2Max: 2.1, apMin: 1.35, apMax: 1.90, tgMin: 0.06, tgMax: 0.16, taMin: 0.03, taMax: 0.12 });
-    b.addSinglet("neg", { glassClass: "FLINT", r1Min: 0.75, r1Max: 1.80, r2Min: 0.8, r2Max: 2.0, apMin: 1.20, apMax: 1.60, tgMin: 0.04, tgMax: 0.11, taMin: 0.03, taMax: 0.12 });
-    b.addSinglet("pos", { glassClass: "CROWN", r1Min: 1.10, r1Max: 3.00, r2Min: 2.3, r2Max: 7.5, apMin: 1.10, apMax: 1.45, tgMin: 0.02, tgMax: 0.07, taMin: 0.03, taMax: 0.16 });
+    b.addSinglet("neg", { glassClass: "FLINT", r1Min: 0.20, r1Max: 0.56, r2Min: 0.24, r2Max: 0.68, apMin: 2.00, apMax: 2.85, tgMin: 0.08, tgMax: 0.23, taMin: 0.10, taMax: 0.34 });
+    b.addSinglet("neg", { glassClass: "FLINT", r1Min: 0.28, r1Max: 0.82, r2Min: 0.30, r2Max: 0.90, apMin: 1.80, apMax: 2.50, tgMin: 0.07, tgMax: 0.19, taMin: 0.08, taMax: 0.26 });
+    b.addSinglet("pos", { glassClass: "HIGH_INDEX_CROWN", r1Min: 0.44, r1Max: 0.96, r2Min: 1.0, r2Max: 2.2, apMin: 1.55, apMax: 2.15, tgMin: 0.07, tgMax: 0.18, taMin: 0.05, taMax: 0.18 });
+    b.addStop({ apMin: 0.95, apMax: 1.04, taMin: 0.08, taMax: 0.24 });
+    b.addSinglet("pos", { glassClass: "HIGH_INDEX_CROWN", r1Min: 0.30, r1Max: 0.78, r2Min: 0.7, r2Max: 1.7, apMin: 1.40, apMax: 1.95, tgMin: 0.07, tgMax: 0.18, taMin: 0.05, taMax: 0.16 });
+    b.addSinglet("neg", { glassClass: "FLINT", r1Min: 0.70, r1Max: 1.70, r2Min: 0.70, r2Max: 1.90, apMin: 1.20, apMax: 1.70, tgMin: 0.05, tgMax: 0.13, taMin: 0.05, taMax: 0.16 });
+    b.addSinglet("pos", { glassClass: "CROWN", r1Min: 0.90, r1Max: 2.50, r2Min: 1.8, r2Max: 5.8, apMin: 1.10, apMax: 1.45, tgMin: 0.03, tgMax: 0.09, taMin: 0.10, taMax: 0.32 });
     return b.finish();
   }
 
-  function adFamilyPool(targetEfl, targetT) {
+  function adFamilyPool(targetEfl, targetT, bflMinMm = AD_CFG.bflMinMm) {
     const f = Number(targetEfl || 50);
     const t = Number(targetT || 2.0);
+    const bfl = Math.max(1, Number(bflMinMm || AD_CFG.bflMinMm || 52));
+    const retroPressure = bfl / Math.max(1, f);
+    if (retroPressure >= 1.12) {
+      if (f <= 50) {
+        return [
+          { id: "distagon", w: 9 },
+          { id: "retrofocus", w: 9 },
+          { id: "gauss", w: 1 },
+          { id: "biotar", w: 1 },
+        ];
+      }
+      return [
+        { id: "distagon", w: 7 },
+        { id: "retrofocus", w: 7 },
+        { id: "gauss", w: 2 },
+        { id: "sonnar", w: 2 },
+        { id: "telephoto", w: 1 },
+      ];
+    }
     if (f <= 28) {
       return [
         { id: "retrofocus", w: 6 },
@@ -3204,6 +3273,7 @@
     if (!Array.isArray(surfaces)) return;
     const targetStopAp = Number.isFinite(opts.targetStopAp) ? Number(opts.targetStopAp) : null;
     const minRearGap = Number.isFinite(opts.minRearGap) ? Number(opts.minRearGap) : 0;
+    const targetEfl = Number.isFinite(opts.targetEfl) ? Number(opts.targetEfl) : 50;
     for (let i = 0; i < surfaces.length; i++) {
       const s = surfaces[i];
       const t = String(s?.type || "").toUpperCase();
@@ -3244,6 +3314,7 @@
     }
 
     adEnforceRearGap(surfaces, minRearGap);
+    adClampElementAperturesByZone(surfaces, { targetStopAp, targetEfl });
 
     clampAllApertures(surfaces);
     clampGlassPairClearApertures(surfaces, PHYS_CFG.minGlassCT, 0.985);
@@ -3329,11 +3400,11 @@
     const s = tmp.surfaces;
     const stopApTarget = adStopApFromTarget(cfg.targetEfl, cfg.targetT);
     for (let i = 0; i < 3; i++) {
-      adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm });
+      adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm, targetEfl: cfg.targetEfl });
       adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset);
       adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset);
       adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount);
-      adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm });
+      adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm, targetEfl: cfg.targetEfl });
     }
     return sanitizeLens(tmp);
   }
@@ -3523,6 +3594,7 @@
     adQuickSanity(surfaces, {
       targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
       minRearGap: cfg.minRearGapMm,
+      targetEfl: cfg.targetEfl,
     });
     computeVertices(surfaces, 0, 0);
 
@@ -3897,11 +3969,13 @@
       adQuickSanity(s, {
         targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
         minRearGap: cfg.minRearGapMm,
+        targetEfl: cfg.targetEfl,
       });
       if (topo && !op.topoChange) adEnforceTopology(s, topo);
       adQuickSanity(s, {
         targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
         minRearGap: cfg.minRearGapMm,
+        targetEfl: cfg.targetEfl,
       });
       return {
         lens: sanitizeLens(L),
@@ -3913,6 +3987,7 @@
     adQuickSanity(s, {
       targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
       minRearGap: cfg.minRearGapMm,
+      targetEfl: cfg.targetEfl,
     });
     if (topo) adEnforceTopology(s, topo);
     return {
@@ -3923,13 +3998,22 @@
   }
 
   async function adGenerateSeeds(cfg) {
-    const pool = adFamilyPool(cfg.targetEfl, cfg.targetT);
+    const pool = adFamilyPool(cfg.targetEfl, cfg.targetT, cfg.bflMinMm);
     const valid = [];
     const near = [];
+    const retroPressure = Number(cfg.bflMinMm || AD_CFG.bflMinMm || 52) / Math.max(1, Number(cfg.targetEfl || 50));
+    const forceRetro = retroPressure >= 1.12;
+    const forcedPool = [
+      { id: "distagon", w: 1 },
+      { id: "retrofocus", w: 1 },
+    ];
 
     for (let i = 0; i < cfg.seedCount; i++) {
       if (!adRunning) break;
-      const family = pickWeighted(pool) || "gauss";
+      const inRescueBand = i >= Math.floor(cfg.seedCount * 0.25);
+      const family = (forceRetro && inRescueBand && valid.length === 0)
+        ? (pickWeighted(forcedPool) || "distagon")
+        : (pickWeighted(pool) || "gauss");
       let seed = adBuildTemplateByFamily(family, cfg);
       seed = adConditionSeedLens(seed, cfg);
 
@@ -4068,6 +4152,41 @@
     return `score ${ev.score.toFixed(2)} • EFL ${efl} • T ${t} • BFL ${bfl} • shift∞ ${infShift} • shift2m ${nearShift} • dist ${dist} • ${fmTxt}`;
   }
 
+  function adRefinePreviewShift(lensObj, focusTarget, fallbackShift = 0, targetEfl = 50, targetT = 2.0) {
+    const fm = adNormalizeFocusTarget(focusTarget || "inf");
+    const mode = fm === "both" ? "inf" : fm;
+    const tmp = sanitizeLens(clone(lensObj || lens));
+    const surfaces = tmp.surfaces;
+    const eflUse = Number.isFinite(targetEfl) ? Number(targetEfl) : 50;
+    const tUse = Number.isFinite(targetT) ? Number(targetT) : 2.0;
+    adQuickSanity(surfaces, {
+      targetStopAp: adStopApFromTarget(eflUse, tUse),
+      minRearGap: Math.max(AD_CFG.minRearGapMm, AD_CFG.bflMinMm + 0.25),
+      targetEfl: eflUse,
+    });
+
+    const wavePreset = ui.wavePreset?.value || "d";
+    const rayCount = clamp(Math.round(num(ui.rayCount?.value, AD_CFG.fullRayCount)), 17, 81);
+    const focusFieldDeg = Math.abs(num(ui.fieldAngle?.value, 0));
+    const maxPosShift = adRearSafeMaxPositiveShift(surfaces, 0);
+    const objectDistanceMm = mode === "near" ? AD_CFG.focusNearMm : Infinity;
+
+    const res = adBestLensShiftForDistance(
+      surfaces,
+      objectDistanceMm,
+      rayCount,
+      wavePreset,
+      AD_CFG.shiftMaxMm,
+      focusFieldDeg,
+      maxPosShift,
+    );
+
+    let shift = res.ok ? Number(res.shift || 0) : Number(fallbackShift || 0);
+    shift = adClampShiftForRearClearance(surfaces, shift, 0);
+    shift = clamp(shift, -AD_CFG.shiftMaxMm, AD_CFG.shiftMaxMm);
+    return { shift, refined: !!res.ok };
+  }
+
   async function runAutodesignPrime() {
     if (adRunning) return;
 
@@ -4158,13 +4277,22 @@
       loadLens(globalBest.lens);
       if (ui.focusMode) ui.focusMode.value = "lens";
       if (ui.sensorOffset) ui.sensorOffset.value = "0";
-      const previewShift = focusTarget === "near"
+      const previewShiftRaw = focusTarget === "near"
         ? Number(globalBest.eval.focusNear?.shift || 0)
         : Number(globalBest.eval.focusInf?.shift || 0);
-      const safePreviewShift = adClampShiftForRearClearance(globalBest.lens?.surfaces || [], previewShift, 0);
-      if (ui.lensFocus) ui.lensFocus.value = safePreviewShift.toFixed(2);
+      const refinedPreview = adRefinePreviewShift(
+        globalBest.lens,
+        focusTarget,
+        previewShiftRaw,
+        Number(globalBest.eval?.efl || targetEfl),
+        targetT,
+      );
+      if (ui.lensFocus) ui.lensFocus.value = refinedPreview.shift.toFixed(2);
       scheduleAutosave();
       renderAll();
+      if (Math.abs(refinedPreview.shift - previewShiftRaw) > 0.05) {
+        appendADLog(`Preview focus refined: ${previewShiftRaw.toFixed(2)}mm -> ${refinedPreview.shift.toFixed(2)}mm.`);
+      }
 
       appendADLog("Done: valid prime generated.");
       appendADLog(adFormatEval(globalBest.eval));
@@ -4184,10 +4312,17 @@
     if (!adBest?.lens) return toast("No best design yet");
 
     const mode = adNormalizeFocusTarget(ui.adFocusTarget?.value || adBest?.eval?.focusTarget || "both");
-    const shift = mode === "near"
+    const shiftRaw = mode === "near"
       ? Number(adBest.eval?.focusNear?.shift || 0)
       : Number(adBest.eval?.focusInf?.shift || 0);
-    const safeShift = adClampShiftForRearClearance(adBest.lens?.surfaces || [], shift, 0);
+    const refined = adRefinePreviewShift(
+      adBest.lens,
+      mode,
+      shiftRaw,
+      Number(adBest.eval?.efl || num(ui.adTargetEFL?.value, 50)),
+      num(ui.adTargetT?.value, 2.0),
+    );
+    const safeShift = refined.shift;
     const modeTxt = mode === "near"
       ? "focus 2000mm"
       : mode === "inf"
@@ -4201,8 +4336,8 @@
     scheduleAutosave();
     renderAll();
 
-    if (Math.abs(safeShift - shift) > 1e-4) {
-      appendADLog(`Preview shift clamped ${shift.toFixed(2)}mm -> ${safeShift.toFixed(2)}mm (rear must stay in front of PL flange).`);
+    if (Math.abs(safeShift - shiftRaw) > 1e-4) {
+      appendADLog(`Preview focus refined ${shiftRaw.toFixed(2)}mm -> ${safeShift.toFixed(2)}mm.`);
     }
 
     appendADLog(
