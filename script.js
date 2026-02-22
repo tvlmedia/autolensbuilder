@@ -1683,6 +1683,15 @@
     minTRatio: 0.45,         // hard gate: reject unrealistically fast candidates vs target
     maxRearIntrusion: 0.0,   // hard gate: no lens intrusion into PL side
   };
+  const PRIORITY_CFG = {
+    // Lexicographic-like target priority: FL >> T >> IC >> all other terms.
+    flTolMm: 0.50,
+    tTol: 0.15,
+    icTolMm: 0.90,
+    flWeight: 400_000.0,
+    tWeight: 20_000.0,
+    icWeight: 2_500.0,
+  };
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
     const rays = buildRays(surfaces, fieldDeg, rayCount);
@@ -1725,6 +1734,9 @@
     let mValid = 0;
     let mPhys = 0;
     let mHard = 0;
+    let mPriFL = 0;
+    let mPriT = 0;
+    let mPriIC = 0;
     let rmsCenter = null, rmsEdge = null;
     let vigAvg = 0;
     let vigCenter = 1;
@@ -1802,11 +1814,19 @@
         const x = ad - MERIT_CFG.eflFarThresh;
         mEfl += MERIT_CFG.eflFarWeight * (x * x);
       }
+      const flNorm = ad / Math.max(1e-6, PRIORITY_CFG.flTolMm);
+      mPriFL += PRIORITY_CFG.flWeight * (flNorm * flNorm);
     }
     if (Number.isFinite(targetT) && Number.isFinite(T)){
       const d = (T - targetT);
       mT += MERIT_CFG.tWeight * (d * d);
       if (d > 0) mT += MERIT_CFG.tSlowWeight * (d * d);
+      const tNorm = Math.abs(d) / Math.max(1e-6, PRIORITY_CFG.tTol);
+      mPriT += PRIORITY_CFG.tWeight * (tNorm * tNorm);
+    }
+    if (Number.isFinite(imageCircleShortfall) && imageCircleShortfall > 0) {
+      const icNorm = imageCircleShortfall / Math.max(1e-6, PRIORITY_CFG.icTolMm);
+      mPriIC += PRIORITY_CFG.icWeight * (icNorm * icNorm);
     }
 
     const minValidTarget = Math.max(7, Math.floor(rayCount * 0.45));
@@ -1818,7 +1838,7 @@
     if (Number.isFinite(physPenalty) && physPenalty > 0) mPhys += physPenalty;
     if (hardInvalid) mHard += MERIT_CFG.hardInvalidPenalty;
 
-    const merit = mSharp + mVig + mCov + mIc + mIntr + mBfl + mEfl + mT + mValid + mPhys + mHard;
+    const merit = mPriFL + mPriT + mPriIC + mSharp + mVig + mCov + mIc + mIntr + mBfl + mEfl + mT + mValid + mPhys + mHard;
 
     const imageCircleOk =
       Number.isFinite(imageCircleDiag) &&
@@ -1846,6 +1866,7 @@
       centerVigOk,
       physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
       mSharp, mVig, mCov, mIc, mIntr, mBfl, mEfl, mT, mValid, mPhys, mHard,
+      mPriFL, mPriT, mPriIC,
       hardInvalid: !!hardInvalid,
     };
 
@@ -2403,6 +2424,7 @@
       `${Number.isFinite(bd.imageCircleDiag) ? ` • IC ${bd.imageCircleDiag.toFixed(1)}mm` : ""}` +
       `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""}` +
       `${bd.physPenalty > 0 ? ` • PHYS +${bd.physPenalty.toFixed(1)}` : ""}` +
+      `${Number.isFinite(bd.mSharp) ? ` • Mprio{FL ${bd.mPriFL?.toFixed?.(1) ?? "—"} T ${bd.mPriT?.toFixed?.(1) ?? "—"} IC ${bd.mPriIC?.toFixed?.(1) ?? "—"}}` : ""}` +
       `${Number.isFinite(bd.mSharp) ? ` • M{S ${bd.mSharp.toFixed(1)} FL ${bd.mEfl?.toFixed?.(1) ?? "—"} T ${bd.mT?.toFixed?.(1) ?? "—"} V ${bd.mVig?.toFixed?.(1) ?? "—"} IC ${bd.mIc?.toFixed?.(1) ?? "—"} I ${bd.mIntr?.toFixed?.(1) ?? "—"} P ${bd.mPhys?.toFixed?.(1) ?? "—"}}` : ""}` +
       `${bd.hardInvalid ? " • INVALID ❌" : ""})`;
 
@@ -2460,6 +2482,7 @@
     if (ui.metaInfo) {
       ui.metaInfo.textContent =
         `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm • ` +
+        `PriFL ${fmtOptScore(bd.mPriFL)} • PriT ${fmtOptScore(bd.mPriT)} • PriIC ${fmtOptScore(bd.mPriIC)} • ` +
         `Sharp ${fmtOptScore(bd.mSharp)} • FL ${fmtOptScore(bd.mEfl)} • T ${fmtOptScore(bd.mT)} • ` +
         `Vig ${fmtOptScore(bd.mVig)} • IC ${fmtOptScore(bd.mIc)} • Intr ${fmtOptScore(bd.mIntr)} • Phys ${fmtOptScore(bd.mPhys)}`;
     }
@@ -2906,10 +2929,115 @@
   function meritPartsLine(bd) {
     if (!bd) return "Mparts: —";
     return (
+      `Mprio: FL ${fmtOptScore(bd.mPriFL)} • T ${fmtOptScore(bd.mPriT)} • IC ${fmtOptScore(bd.mPriIC)} || ` +
       `Mparts: Sharp ${fmtOptScore(bd.mSharp)} • FL ${fmtOptScore(bd.mEfl)} • ` +
       `T ${fmtOptScore(bd.mT)} • Vig ${fmtOptScore(bd.mVig)} • ` +
       `IC ${fmtOptScore(bd.mIc)} • Intr ${fmtOptScore(bd.mIntr)} • Phys ${fmtOptScore(bd.mPhys)}`
     );
+  }
+
+  const OPT_PRIORITY_ORDER_CFG = {
+    // "Tie" windows before we look at the next priority axis.
+    flTieMm: 0.08,
+    tTie: 0.04,
+    icTieMm: 0.25,
+  };
+
+  function evalPriorityMetrics(ev, { targetEfl = null, targetT = null } = {}) {
+    const efl = Number(ev?.efl);
+    const T = Number(ev?.T);
+    const icDiag = Number(ev?.breakdown?.imageCircleDiag);
+    const icTarget = Number(ev?.breakdown?.imageCircleTarget);
+    const intrusion = Number(ev?.intrusion);
+    const hardInvalid = !!ev?.breakdown?.hardInvalid;
+
+    const flErr = (Number.isFinite(targetEfl) && targetEfl > 1 && Number.isFinite(efl) && efl > 0)
+      ? Math.abs(efl - targetEfl)
+      : Number.POSITIVE_INFINITY;
+    const tErr = (Number.isFinite(targetT) && targetT > 0 && Number.isFinite(T) && T > 0)
+      ? Math.abs(T - targetT)
+      : Number.POSITIVE_INFINITY;
+    const icShort = (Number.isFinite(icDiag) && Number.isFinite(icTarget))
+      ? Math.max(0, icTarget - icDiag)
+      : Number.POSITIVE_INFINITY;
+    const covFail = ev?.covers ? 0 : 1;
+    const intrOver = Number.isFinite(intrusion)
+      ? Math.max(0, intrusion - MERIT_CFG.maxRearIntrusion)
+      : Number.POSITIVE_INFINITY;
+
+    return {
+      flErr,
+      tErr,
+      icShort,
+      covFail,
+      intrOver,
+      hardInvalid: hardInvalid ? 1 : 0,
+      score: Number(ev?.score),
+    };
+  }
+
+  function compareEvalByPriority(a, b, opts = {}) {
+    if (!a && !b) return 0;
+    if (!a) return 1;
+    if (!b) return -1;
+
+    const ma = evalPriorityMetrics(a, opts);
+    const mb = evalPriorityMetrics(b, opts);
+
+    const cmp = (x, y, tie = 0) => {
+      const xf = Number.isFinite(x);
+      const yf = Number.isFinite(y);
+      if (!xf && !yf) return 0;
+      if (!xf) return 1;
+      if (!yf) return -1;
+      if (Math.abs(x - y) <= tie) return 0;
+      return x < y ? -1 : 1;
+    };
+
+    // Hard validity + mount legality first, then strict user priorities.
+    let c = cmp(ma.hardInvalid, mb.hardInvalid, 0);
+    if (c) return c;
+    c = cmp(ma.intrOver, mb.intrOver, 1e-6);
+    if (c) return c;
+
+    c = cmp(ma.flErr, mb.flErr, OPT_PRIORITY_ORDER_CFG.flTieMm);
+    if (c) return c;
+    c = cmp(ma.tErr, mb.tErr, OPT_PRIORITY_ORDER_CFG.tTie);
+    if (c) return c;
+    c = cmp(ma.icShort, mb.icShort, OPT_PRIORITY_ORDER_CFG.icTieMm);
+    if (c) return c;
+    c = cmp(ma.covFail, mb.covFail, 0);
+    if (c) return c;
+
+    // Finally resolve ties with legacy scalar merit.
+    return cmp(ma.score, mb.score, 1e-9);
+  }
+
+  function priorityScoreForAnneal(ev, opts = {}) {
+    const m = evalPriorityMetrics(ev, opts);
+    const flN = Number.isFinite(m.flErr) ? (m.flErr / Math.max(1e-6, PRIORITY_CFG.flTolMm)) : 1e6;
+    const tN = Number.isFinite(m.tErr) ? (m.tErr / Math.max(1e-6, PRIORITY_CFG.tTol)) : 1e6;
+    const icN = Number.isFinite(m.icShort) ? (m.icShort / Math.max(1e-6, PRIORITY_CFG.icTolMm)) : 1e6;
+    const intrN = Number.isFinite(m.intrOver) ? (m.intrOver / 0.1) : 1e6;
+    const meritN = Number.isFinite(m.score) ? (m.score * 0.0002) : 1e6;
+    return (
+      m.hardInvalid * 1_000_000 +
+      intrN * 50_000 +
+      flN * 3000 +
+      tN * 200 +
+      icN * 30 +
+      m.covFail * 10 +
+      meritN
+    );
+  }
+
+  function priorityLine(ev, opts = {}) {
+    const m = evalPriorityMetrics(ev, opts);
+    const fl = Number.isFinite(m.flErr) ? `${m.flErr.toFixed(2)}mm` : "—";
+    const t = Number.isFinite(m.tErr) ? m.tErr.toFixed(2) : "—";
+    const ic = Number.isFinite(m.icShort) ? `${m.icShort.toFixed(2)}mm` : "—";
+    const cov = m.covFail ? "COV miss" : "COV ok";
+    return `Perr: FL ${fl} • T ${t} • ICshort ${ic} • ${cov}`;
   }
 
   function randn(){
@@ -3032,7 +3160,7 @@
     return true;
   }
 
-  function mutateLens(baseLens, mode, topo = null){
+  function mutateLens(baseLens, mode, topo = null, target = null){
     const L = clone(baseLens);
     L.name = baseLens.name;
 
@@ -3116,6 +3244,14 @@
     if (s.length) s[0].type = "OBJ";
     if (s.length) s[s.length-1].type = "IMS";
 
+    if (topo && target && Math.random() < 0.30) {
+      const tgtEfl = Number(target.efl);
+      const tgtT = Number(target.t);
+      const wp = String(target.wavePreset || "d");
+      if (Number.isFinite(tgtEfl) && tgtEfl > 1) nudgeSurfacesToTargetEfl(s, tgtEfl, wp);
+      if (Number.isFinite(tgtT) && tgtT > 0.2) nudgeStopToTargetT(s, tgtT, wp);
+    }
+
     if (topo?.anchors?.length === s.length) {
       for (let i = 0; i < s.length; i++) {
         const si = s[i];
@@ -3196,6 +3332,9 @@
         mValid: Number(parts.mValid ?? 0),
         mPhys: Number(parts.mPhys ?? physPenalty ?? 0),
         mHard: Number(parts.mHard ?? Math.max(0, score - Number(physPenalty || 0))),
+        mPriFL: Number(parts.mPriFL ?? 0),
+        mPriT: Number(parts.mPriT ?? 0),
+        mPriIC: Number(parts.mPriIC ?? 0),
         hardInvalid: true,
       },
     });
@@ -3345,6 +3484,9 @@
     const baseEval = evalLensMerit(baseStart, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
 
     const isUsable = (ev) => evalIsUsable(ev, { targetEfl, targetT });
+    const priOpts = { targetEfl, targetT };
+    const betterByPriority = (a, b) => compareEvalByPriority(a, b, priOpts) < 0;
+    const priorityScore = (ev) => priorityScoreForAnneal(ev, priOpts);
 
     // Keep optimizer around a sane Double-Gauss-like base topology.
     const topo = captureTopology(baseStart);
@@ -3387,7 +3529,7 @@
       const a = i / iters;
       const temp = temp0 * (1 - a) + temp1 * a;
 
-      const cand = mutateLens(cur, mode, topo);
+      const cand = mutateLens(cur, mode, topo, { efl: targetEfl, t: targetT, wavePreset });
       const candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
       const candUsable = isUsable(candEval);
       const curUsable = isUsable(curEval);
@@ -3398,15 +3540,24 @@
       } else if (!candUsable && curUsable) {
         accept = false;
       } else {
-        const d = candEval.score - curEval.score;
-        accept = (d <= 0) || (Math.random() < Math.exp(-d / Math.max(1e-9, temp)));
+        const cmpPri = compareEvalByPriority(candEval, curEval, priOpts);
+        if (cmpPri < 0) {
+          accept = true;
+        } else if (cmpPri > 0) {
+          // Small exploration chance to escape local minima while keeping FL>T>IC priority.
+          const explore = (mode === "wild" ? 0.05 : 0.015) * Math.max(0.20, temp);
+          accept = Math.random() < explore;
+        } else {
+          const dPri = priorityScore(candEval) - priorityScore(curEval);
+          accept = (dPri <= 0) || (Math.random() < Math.exp(-dPri / Math.max(1e-9, temp * 8)));
+        }
       }
       if (accept){
         cur = cand;
         curEval = candEval;
       }
 
-      if ((!bestUsable && candUsable) || (candUsable && candEval.score < best.eval.score)){
+      if ((!bestUsable && candUsable) || (candUsable && betterByPriority(candEval, best.eval))){
         best = { lens: clone(cand), eval: candEval, iter: i };
         bestUsable = true;
 
@@ -3419,16 +3570,17 @@
             `EFL ${fmtOptMm(bestView.efl)} (target ${targetEfl})\n` +
             `T ${fmtOptNum(bestView.T)} (target ${targetT})\n` +
             `COV ${bestView.covers?"YES":"NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n` +
+            `${priorityLine(best.eval, priOpts)}\n` +
             `${meritPartsLine(best.eval?.breakdown)}\n` +
             `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
           );
         }
       }
 
-      if (candEval.score < bestSoft.eval.score) {
+      if (betterByPriority(candEval, bestSoft.eval)) {
         bestSoft = { lens: clone(cand), eval: candEval, iter: i };
       }
-      if (isMountLegal(candEval) && (!bestSoftMount || candEval.score < bestSoftMount.eval.score)) {
+      if (isMountLegal(candEval) && (!bestSoftMount || betterByPriority(candEval, bestSoftMount.eval))) {
         bestSoftMount = { lens: clone(cand), eval: candEval, iter: i };
       }
 
@@ -3444,9 +3596,11 @@
           setOptLog(
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
             `current ${curEval.score.toFixed(2)} • EFL ${fmtOptMm(curView.efl)} • T ${fmtOptNum(curView.T)} • ${icText(curView)}\n` +
+            `${priorityLine(curEval, priOpts)}\n` +
             `${meritPartsLine(curEval?.breakdown)}\n` +
             `${bestLabel} ${bestRef.eval.score.toFixed(2)} @${bestRef.iter}\n` +
             `best: EFL ${fmtOptMm(bestView.efl)} • T ${fmtOptNum(bestView.T)} • COV ${bestView.covers?"YES":"NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n` +
+            `${priorityLine(bestRef.eval, priOpts)}\n` +
             `${meritPartsLine(bestRef.eval?.breakdown)}\n`
           );
         }
@@ -3456,8 +3610,13 @@
     }
 
     if (!bestUsable) {
-      if (baseUsable) best = { lens: clone(baseStart), eval: baseEval, iter: 0 };
-      else if (userUsable) best = { lens: clone(userStart), eval: userEval, iter: 0 };
+      const usableSeeds = [];
+      if (baseUsable) usableSeeds.push({ lens: clone(baseStart), eval: baseEval, iter: 0 });
+      if (userUsable) usableSeeds.push({ lens: clone(userStart), eval: userEval, iter: 0 });
+      if (usableSeeds.length) {
+        usableSeeds.sort((a, b) => compareEvalByPriority(a.eval, b.eval, priOpts));
+        best = usableSeeds[0];
+      }
       bestUsable = isUsable(best?.eval);
     }
 
@@ -3467,7 +3626,7 @@
       if (isMountLegal(baseEval)) fallbackCandidates.push({ lens: clone(baseStart), eval: baseEval, iter: 0 });
       if (isMountLegal(userEval)) fallbackCandidates.push({ lens: clone(userStart), eval: userEval, iter: 0 });
 
-      const fallback = fallbackCandidates.sort((a, b) => a.eval.score - b.eval.score)[0] || null;
+      const fallback = fallbackCandidates.sort((a, b) => compareEvalByPriority(a.eval, b.eval, priOpts))[0] || null;
       optRunning = false;
 
       const tEnd = performance.now();
@@ -3480,6 +3639,7 @@
             `done ${iters}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
             `NO mount-legal design found (everything ends behind PL flange).\n` +
             `Current: EFL ${fmtOptMm(curView.efl)} • T ${fmtOptNum(curView.T)} • ${icText(curView)} • INTR ${fmtOptMm(curView.intrusion)}\n` +
+            `${priorityLine(curEval, priOpts)}\n` +
             `${meritPartsLine(curEval?.breakdown)}\n`
           );
         }
@@ -3497,6 +3657,7 @@
           `EFL ${fmtOptMm(fallbackView.efl)} (target ${targetEfl})\n` +
           `T ${fmtOptNum(fallbackView.T)} (target ${targetT})\n` +
           `COV ${fallbackView.covers?"YES":"NO"} • ${icText(fallbackView)} • INTR ${fmtOptMm(fallbackView.intrusion)}\n` +
+          `${priorityLine(fallback.eval, priOpts)}\n` +
           `${meritPartsLine(fallback.eval?.breakdown)}\n` +
           `You can still click “Apply best” to inspect this closest candidate.\n`
         );
@@ -3518,6 +3679,7 @@
         `EFL ${fmtOptMm(bestView.efl)} (target ${targetEfl})\n` +
         `T ${fmtOptNum(bestView.T)} (target ${targetT})\n` +
         `COV ${bestView.covers?"YES":"NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n` +
+        `${priorityLine(best.eval, priOpts)}\n` +
         `${meritPartsLine(best.eval?.breakdown)}\n` +
         `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
         `Click “Apply best” to load.`
