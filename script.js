@@ -546,6 +546,11 @@
     if (k === "stop") {
       s.stop = !!el.checked;
       enforceSingleStop(i);
+      if (s.stop) {
+        s.type = "STOP";
+        s.R = 0;
+        s.glass = "AIR";
+      }
     } else if (k === "glass") {
       s.glass = resolveGlassName(String(el.value || "AIR"));
     } else if (k === "type") {
@@ -657,7 +662,7 @@
   }
 
   // -------------------- physical sanity clamps --------------------
-  const AP_SAFETY = 0.90;
+  const AP_SAFETY = 0.86;
   const AP_MAX_PLANE = 30.0;
   const AP_MIN = 0.01;
   const MID_AP_CFG = {
@@ -775,35 +780,68 @@
   }
 
   const PHYS_CFG = {
-    minAirGap: 0.12,
-    prefAirGap: 0.60,
-    minGlassCT: 0.35,
-    prefGlassCT: 1.20,
-    minRadius: 8.0,
+    minAirGap: 0.20,
+    prefAirGap: 0.90,
+    minGlassCT: 0.45,
+    prefGlassCT: 1.40,
+    minRadius: 10.0,
     minAperture: 1.2,
     maxAperture: 32.0,
     minThickness: 0.05,
     maxThickness: 55.0,
     minStopToApertureRatio: 0.28,
-    maxNegOverlap: 0.05,
-    gapWeightAir: 1200.0,
-    gapWeightGlass: 2600.0,
-    overlapWeight: 3200.0,
+    maxNegOverlap: 0.03,
+    gapWeightAir: 1500.0,
+    gapWeightGlass: 3200.0,
+    overlapWeight: 5200.0,
     tinyApWeight: 120.0,
     tinyRadiusWeight: 80.0,
-    pinchWeight: 220.0,
+    pinchWeight: 300.0,
     stopOversizeWeight: 240.0,
     stopTooTinyWeight: 200.0,
     minAirGapsPreferred: 3,
     tooFewAirGapsWeight: 260.0,
-    shortAirGapWeight: 190.0,
-    thinGlassWeight: 150.0,
-    minStopSideAirGap: 0.35,
-    stopAirSideWeight: 1200.0,
-    stopAirGapWeight: 900.0,
+    shortAirGapWeight: 260.0,
+    thinGlassWeight: 220.0,
+    minStopSideAirGap: 0.55,
+    stopAirSideWeight: 2200.0,
+    stopAirGapWeight: 1400.0,
     planeRefractiveWeight: 520.0,
     planeNearStopExtraWeight: 880.0,
+    minAirGapHard: 0.12,
+    minGlassCTHard: 0.28,
+    maxApToRadiusSoft: 0.72,
+    maxApToRadiusHard: 0.84,
+    apToRadiusWeight: 220.0,
+    stopMustBePlaneWeight: 900.0,
+    stopGeomSamples: 23,
+    stopIntrusionWeight: 1800.0,
   };
+
+  function clampGlassPairClearApertures(surfaces, minCT, margin = 0.98) {
+    if (!Array.isArray(surfaces) || surfaces.length < 2) return;
+    const minCtUse = Math.max(0.05, Number(minCT || PHYS_CFG.minGlassCT || 0.1));
+    const m = clamp(Number(margin || 0.98), 0.7, 1.0);
+
+    for (let i = 0; i < surfaces.length - 1; i++) {
+      const sA = surfaces[i];
+      const sB = surfaces[i + 1];
+      const tA = String(sA?.type || "").toUpperCase();
+      const tB = String(sB?.type || "").toUpperCase();
+      if (tA === "OBJ" || tA === "IMS" || tB === "OBJ" || tB === "IMS") continue;
+
+      const mediumAfterA = String(resolveGlassName(sA?.glass || "AIR")).toUpperCase();
+      if (mediumAfterA === "AIR") continue;
+
+      const noAp = maxNonOverlappingSemiDiameter(sA, sB, minCtUse);
+      if (!Number.isFinite(noAp) || noAp <= AP_MIN) continue;
+      const cap = Math.max(AP_MIN, noAp * m);
+      if (Number(sA.ap || 0) > cap) sA.ap = cap;
+      if (Number(sB.ap || 0) > cap) sB.ap = cap;
+      clampSurfaceAp(sA);
+      clampSurfaceAp(sB);
+    }
+  }
 
   function minGapBetweenSurfaces(sFront, sBack, yMax, samples = 11) {
     const n = Math.max(3, samples | 0);
@@ -854,6 +892,14 @@
       if (R > 1e-9 && R < PHYS_CFG.minRadius) {
         const d = PHYS_CFG.minRadius - R;
         penalty += PHYS_CFG.tinyRadiusWeight * d * d;
+      }
+      if (R > 1e-9 && ap > 0) {
+        const apToR = ap / R;
+        if (apToR > PHYS_CFG.maxApToRadiusSoft) {
+          const d = apToR - PHYS_CFG.maxApToRadiusSoft;
+          penalty += PHYS_CFG.apToRadiusWeight * d * d;
+        }
+        if (apToR > PHYS_CFG.maxApToRadiusHard) hardFail = true;
       }
       if (isRefractive && R <= 1e-9) {
         penalty += PHYS_CFG.planeRefractiveWeight;
@@ -920,6 +966,8 @@
         const w = (mediumAfterA === "AIR") ? PHYS_CFG.gapWeightAir : PHYS_CFG.gapWeightGlass;
         penalty += w * d * d;
       }
+      if (mediumAfterA === "AIR" && minGap < PHYS_CFG.minAirGapHard) hardFail = true;
+      if (mediumAfterA !== "AIR" && minGap < PHYS_CFG.minGlassCTHard) hardFail = true;
       if (mediumAfterA === "AIR" && minGap < PHYS_CFG.prefAirGap) {
         const d = PHYS_CFG.prefAirGap - minGap;
         penalty += PHYS_CFG.shortAirGapWeight * d * d;
@@ -947,6 +995,13 @@
       penalty += 1500;
       hardFail = true;
     } else {
+      const sStop = surfaces[stopIdx];
+      const stopR = Math.abs(Number(sStop?.R || 0));
+      if (stopR > 1e-9) {
+        penalty += PHYS_CFG.stopMustBePlaneWeight * stopR * stopR;
+        if (stopR > 0.25) hardFail = true;
+      }
+
       // Prefer iris in air on both sides.
       const prevMedium = stopIdx > 0 ? String(resolveGlassName(surfaces[stopIdx - 1]?.glass || "AIR")).toUpperCase() : "AIR";
       const nextMedium = String(resolveGlassName(surfaces[stopIdx]?.glass || "AIR")).toUpperCase();
@@ -970,6 +1025,58 @@
       if (rightGap < PHYS_CFG.minStopSideAirGap) {
         const d = PHYS_CFG.minStopSideAirGap - rightGap;
         penalty += PHYS_CFG.stopAirGapWeight * d * d;
+      }
+
+      // Geometric stop clearance: avoid stop plane cutting into neighboring curved glass.
+      if (stopIdx > 0) {
+        const sL = surfaces[stopIdx - 1];
+        const tL = String(sL?.type || "").toUpperCase();
+        if (tL !== "OBJ" && tL !== "IMS") {
+          const apL = Math.max(
+            0.1,
+            Math.min(
+              Number(stopAp || 0.1),
+              Number(sL?.ap || stopAp || 0.1),
+              Number(sStop?.ap || stopAp || 0.1),
+              maxApForSurface(sL),
+              maxApForSurface(sStop),
+            ),
+          );
+          const gL = minGapBetweenSurfaces(sL, sStop, apL, PHYS_CFG.stopGeomSamples);
+          if (!Number.isFinite(gL)) {
+            penalty += 100_000;
+            hardFail = true;
+          } else if (gL < PHYS_CFG.minStopSideAirGap) {
+            const d = PHYS_CFG.minStopSideAirGap - gL;
+            penalty += PHYS_CFG.stopIntrusionWeight * d * d;
+            if (gL < 0) hardFail = true;
+          }
+        }
+      }
+      if (stopIdx < surfaces.length - 1) {
+        const sR = surfaces[stopIdx + 1];
+        const tR = String(sR?.type || "").toUpperCase();
+        if (tR !== "OBJ" && tR !== "IMS") {
+          const apR = Math.max(
+            0.1,
+            Math.min(
+              Number(stopAp || 0.1),
+              Number(sR?.ap || stopAp || 0.1),
+              Number(sStop?.ap || stopAp || 0.1),
+              maxApForSurface(sR),
+              maxApForSurface(sStop),
+            ),
+          );
+          const gR = minGapBetweenSurfaces(sStop, sR, apR, PHYS_CFG.stopGeomSamples);
+          if (!Number.isFinite(gR)) {
+            penalty += 100_000;
+            hardFail = true;
+          } else if (gR < PHYS_CFG.minStopSideAirGap) {
+            const d = PHYS_CFG.minStopSideAirGap - gR;
+            penalty += PHYS_CFG.stopIntrusionWeight * d * d;
+            if (gR < 0) hardFail = true;
+          }
+        }
       }
 
       // STOP should be compatible with nearby clear apertures to avoid heavy on-axis clipping.
@@ -2293,6 +2400,12 @@
     if (phys.hardFail && ui.footerWarn) {
       ui.footerWarn.textContent =
         `INVALID geometry: overlap/clearance issue (overlap ${phys.worstOverlap.toFixed(2)}mm, pinch ${phys.worstPinch.toFixed(2)}mm).`;
+    } else if (phys.worstOverlap > 0.08 && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `Geometry warning: very tight/overlapping element pair (${phys.worstOverlap.toFixed(2)}mm). Increase air gap or reduce curvature/aperture.`;
+    } else if (phys.worstPinch > 0.80 && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `Geometry warning: strong aperture pinch (${phys.worstPinch.toFixed(2)}mm).`;
     } else if (bd.centerVigOk === false && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Center vignette too high (${bd.vigCenterPct ?? "—"}%). Increase middle/stop apertures.`;
@@ -2706,6 +2819,8 @@
       if (t === "OBJ" || t === "IMS") continue;
       surfaces[i].stop = true;
       surfaces[i].type = "STOP";
+      surfaces[i].R = 0;
+      surfaces[i].glass = "AIR";
       break;
     }
   }
@@ -2721,6 +2836,21 @@
       clampSurfaceAp(s);
     }
 
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx >= 0) {
+      const sStop = surfaces[stopIdx];
+      sStop.type = "STOP";
+      sStop.stop = true;
+      sStop.R = 0;
+      sStop.glass = "AIR";
+      if (stopIdx > 0) {
+        surfaces[stopIdx - 1].t = Math.max(PHYS_CFG.minStopSideAirGap, Number(surfaces[stopIdx - 1]?.t || 0));
+      }
+      if (stopIdx < surfaces.length - 1) {
+        surfaces[stopIdx].t = Math.max(PHYS_CFG.minStopSideAirGap, Number(surfaces[stopIdx]?.t || 0));
+      }
+    }
+
     // discourage abrupt aperture pinches (common optimizer failure mode)
     for (let i = 1; i < surfaces.length - 1; i++) {
       const a = surfaces[i - 1], b = surfaces[i], c = surfaces[i + 1];
@@ -2733,7 +2863,11 @@
       if (ref > 0.5 && Number(b.ap || 0) < 0.45 * ref) b.ap = 0.45 * ref;
       clampSurfaceAp(b);
     }
+    computeVertices(surfaces, 0, 0);
+    clampGlassPairClearApertures(surfaces, PHYS_CFG.minGlassCT, 0.985);
     expandMiddleApertures(surfaces);
+    clampGlassPairClearApertures(surfaces, PHYS_CFG.minGlassCT, 0.975);
+    clampAllApertures(surfaces);
   }
 
   function captureTopology(lensObj) {
@@ -2772,7 +2906,11 @@
         return;
       }
       s.stop = (i === lockStop);
-      if (s.stop) s.type = "STOP";
+      if (s.stop) {
+        s.type = "STOP";
+        s.glass = "AIR";
+        s.R = 0;
+      }
     });
     return true;
   }
