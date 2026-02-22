@@ -4067,8 +4067,7 @@
     };
     updateBestByMetric(baseRec, 0);
 
-    const popSize = mode === "wild" ? 9 : 6;
-    const proposalsPerIter = mode === "wild" ? 10 : 7;
+    const proposalsBase = mode === "wild" ? 7 : 4;
     const baseExploreProb = mode === "wild" ? 0.08 : 0.02;
     const BATCH = 50;
     const tStart = performance.now();
@@ -4086,6 +4085,10 @@
       const mRef = evalPriorityMetrics(curRec.eval, priOpts);
       const icShortNow = Number.isFinite(mRef.icShort) ? Math.max(0, mRef.icShort) : 40.0;
       const icTargetNow = Number.isFinite(mRef.icTarget) ? mRef.icTarget : targetImageCircleDiagMm(sensorW, sensorH);
+      const proposalsPerIter =
+        proposalsBase +
+        (stagnantGlobal > (mode === "wild" ? 120 : 70) ? 1 : 0) +
+        (stagnantGlobal > (mode === "wild" ? 260 : 140) ? 1 : 0);
 
       const candidates = [];
       const addCandidate = (lensObj, label) => {
@@ -4109,12 +4112,25 @@
         `guided-${focusMetric}`
       );
 
+      const stagnFrac = clamp(
+        stagnantGlobal / (mode === "wild" ? 280 : 170),
+        0,
+        1
+      );
+      const restartProb = 0.04 + 0.10 * stagnFrac;
+      const crossoverProb = 0.10;
+      const directedProb = 0.30 + 0.06 * stagnFrac;
+      const localProb = Math.max(0.40, 1.0 - restartProb - crossoverProb - directedProb);
+      const cutLocal = localProb;
+      const cutDirected = cutLocal + directedProb;
+      const cutCrossover = cutDirected + crossoverProb;
+
       for (let p = 0; p < proposalsPerIter; p++) {
         const seedRec = pickElite(elite) || curRec;
         let candLens;
         const r = Math.random();
 
-        if (r < 0.40) {
+        if (r < cutLocal) {
           candLens = mutateLens(seedRec.lens, mode, topo, {
             efl: targetEfl,
             t: targetT,
@@ -4123,7 +4139,7 @@
             icShortNow: Math.max(4, icShortNow),
             icTargetNow,
           });
-        } else if (r < 0.75) {
+        } else if (r < cutDirected) {
           const metricPick = (Math.random() < 0.6) ? focusMetric : pick(["fl", "ic", "t", "sharp"]);
           const phasePick = phaseForMetric(metricPick);
           const anchor = bestByMetric[metricPick] || bestGlobal || seedRec;
@@ -4143,7 +4159,7 @@
             icShortNow: Math.max(4, icShortNow * (metricPick === "ic" ? 1.3 : 1.0)),
             icTargetNow,
           });
-        } else if (r < 0.90 && elite.length >= 2) {
+        } else if (r < cutCrossover && elite.length >= 2) {
           const aRec = pickElite(elite) || seedRec;
           const bRec = pickElite(elite) || bestGlobal;
           const mixed = crossoverLens(aRec.lens, bRec.lens);
@@ -4193,9 +4209,57 @@
         addCandidate(candLens, `mut-${p}`);
       }
 
+      // Force one stronger directed candidate when current focus metric is far from target.
+      if (Number(curRec.vec?.[focusMetric] || 0) > tolByMetric[focusMetric] * 1.25) {
+        const focusAnchor = bestByMetric[focusMetric] || curRec || bestGlobal;
+        let surge = makeGuidedPhaseCandidate(focusAnchor.lens, {
+          phase: focusPhase,
+          targetEfl,
+          targetT,
+          wavePreset,
+          icShortMm: Math.max(6, icShortNow * (focusMetric === "ic" ? 1.45 : 1.0)),
+          icTargetMm: icTargetNow,
+        });
+        surge = mutateLens(surge, mode, topo, {
+          efl: targetEfl,
+          t: targetT,
+          wavePreset,
+          phase: focusPhase,
+          icShortNow: Math.max(6, icShortNow * (focusMetric === "ic" ? 1.35 : 1.0)),
+          icTargetNow,
+        });
+        if (Math.random() < 0.50) {
+          surge = mutateLens(surge, mode, topo, {
+            efl: targetEfl,
+            t: targetT,
+            wavePreset,
+            phase: focusPhase,
+            icShortNow: Math.max(6, icShortNow),
+            icTargetNow,
+          });
+        }
+        addCandidate(surge, `focus-surge-${focusMetric}`);
+      }
+
       if (!candidates.length) continue;
       candidates.sort((a, b) => a.obj - b.obj);
-      const candBest = candidates[0];
+      const candBestObj = candidates[0];
+      let candBestFocus = candBestObj;
+      for (let k = 1; k < candidates.length; k++) {
+        if (metricCompare(candidates[k], candBestFocus, focusMetric) < 0) {
+          candBestFocus = candidates[k];
+        }
+      }
+      let candBest = candBestObj;
+      if (metricCompare(candBestFocus, curRec, focusMetric) < 0) {
+        const focusObjSlack = temp * (focusMetric === "sharp" ? 1.2 : 2.4);
+        if (
+          candBestFocus.obj <= candBestObj.obj + focusObjSlack ||
+          candBestFocus.obj <= curRec.obj + focusObjSlack
+        ) {
+          candBest = candBestFocus;
+        }
+      }
 
       let accept = false;
       if (candBest.obj < curRec.obj) {
@@ -4263,7 +4327,7 @@
         }
       }
 
-      if (stagnantGlobal > (mode === "wild" ? 520 : 360)) {
+      if (stagnantGlobal > (mode === "wild" ? 300 : 170)) {
         const worstMetric = pickFocusMetric(bestGlobal);
         const phase = phaseForMetric(worstMetric);
         const seed = bestByMetric[worstMetric] || bestGlobal || baseRec;
