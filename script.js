@@ -2812,6 +2812,74 @@
     ui.optLog.value = String(lines || "");
   }
 
+  function evalViewForLog(lensObj, ev, { wavePreset, sensorW, sensorH, rayCount }) {
+    const fallback = {
+      efl: null,
+      T: null,
+      bfl: null,
+      covers: false,
+      icDiag: null,
+      icTarget: null,
+      intrusion: null,
+    };
+    if (!lensObj?.surfaces?.length) return fallback;
+
+    if (ev && Number.isFinite(ev.efl) && Number.isFinite(ev.T)) {
+      return {
+        efl: ev.efl,
+        T: ev.T,
+        bfl: ev.bfl,
+        covers: !!ev.covers,
+        icDiag: Number(ev?.breakdown?.imageCircleDiag),
+        icTarget: Number(ev?.breakdown?.imageCircleTarget),
+        intrusion: Number(ev?.intrusion),
+      };
+    }
+
+    try {
+      const tmp = clone(lensObj);
+      const s = tmp.surfaces || [];
+      if (!s.length) return fallback;
+
+      const ims = s[s.length - 1];
+      if (ims && String(ims.type).toUpperCase() === "IMS") {
+        ims.ap = Math.max(0.1, sensorH * 0.5);
+      }
+
+      const lensShift = Number.isFinite(ev?.lensShift) ? ev.lensShift : 0;
+      computeVertices(s, lensShift, 0.0);
+
+      const { efl, bfl } = estimateEflBflParaxial(s, wavePreset);
+      const T = estimateTStopApprox(efl, s, wavePreset);
+
+      const covMode = COVERAGE_CFG.mode;
+      const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
+      const maxFieldGeom = coverageTestMaxFieldDeg(s, wavePreset, 0.0, covHalfMm);
+      const maxFieldBundleIc = coverageTestBundleMaxFieldDeg(s, wavePreset, 0.0, rayCount, {
+        maxVigFrac: IMAGE_CIRCLE_CFG.maxIcVigFrac,
+        minValidFrac: IMAGE_CIRCLE_CFG.minIcValidFrac,
+      });
+      const maxField = Math.min(maxFieldGeom, maxFieldBundleIc);
+      const req = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
+      const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
+      const icDiag = imageCircleDiagFromHalfFieldMm(efl, maxField);
+      const icTarget = imageCircleDiagFromHalfFieldMm(efl, req);
+      const intrusion = lastPhysicalVertexX(s) - (-PL_FFD);
+
+      return { efl, T, bfl, covers, icDiag, icTarget, intrusion };
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  function fmtOptMm(x) {
+    return Number.isFinite(x) ? `${x.toFixed(2)}mm` : "—";
+  }
+
+  function fmtOptNum(x) {
+    return Number.isFinite(x) ? x.toFixed(2) : "—";
+  }
+
   function randn(){
     // Box–Muller
     let u = 0, v = 0;
@@ -3284,9 +3352,10 @@
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
     let bestUsable = isUsable(best.eval);
     let bestSoft = { lens: clone(cur), eval: curEval, iter: 0 };
-    const icText = (ev) => {
-      const ic = ev?.breakdown?.imageCircleDiag;
-      const tgt = ev?.breakdown?.imageCircleTarget;
+    const logCtx = { wavePreset, sensorW, sensorH, rayCount };
+    const icText = (v) => {
+      const ic = v?.icDiag;
+      const tgt = v?.icTarget;
       const icStr = Number.isFinite(ic) ? `${ic.toFixed(1)}mm` : "—";
       const tgtStr = Number.isFinite(tgt) ? `${tgt.toFixed(1)}mm` : "—";
       return `IC ${icStr}/${tgtStr}`;
@@ -3331,12 +3400,13 @@
 
         // UI update (rare)
         if (ui.optLog){
+          const bestView = evalViewForLog(best.lens, best.eval, logCtx);
           setOptLog(
             `best @${i}/${iters}\n` +
             `score ${best.eval.score.toFixed(2)}\n` +
-            `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
-            `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
-            `COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
+            `EFL ${fmtOptMm(bestView.efl)} (target ${targetEfl})\n` +
+            `T ${fmtOptNum(bestView.T)} (target ${targetT})\n` +
+            `COV ${bestView.covers?"YES":"NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n` +
             `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
           );
         }
@@ -3351,11 +3421,15 @@
         const dt = (tNow - tStart) / 1000;
         const ips = i / Math.max(1e-6, dt);
         if (ui.optLog){
+          const bestRef = bestUsable ? best : bestSoft;
           const bestLabel = bestUsable ? "best" : "best (no valid yet)";
+          const bestView = evalViewForLog(bestRef.lens, bestRef.eval, logCtx);
+          const curView = evalViewForLog(cur, curEval, logCtx);
           setOptLog(
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
-            `current ${curEval.score.toFixed(2)} • ${bestLabel} ${best.eval.score.toFixed(2)} @${best.iter}\n` +
-            `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • INTR ${best.eval.intrusion.toFixed(2)}mm\n`
+            `current ${curEval.score.toFixed(2)} • EFL ${fmtOptMm(curView.efl)} • T ${fmtOptNum(curView.T)} • ${icText(curView)}\n` +
+            `${bestLabel} ${bestRef.eval.score.toFixed(2)} @${bestRef.iter}\n` +
+            `best: EFL ${fmtOptMm(bestView.efl)} • T ${fmtOptNum(bestView.T)} • COV ${bestView.covers?"YES":"NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n`
           );
         }
         // yield to UI
@@ -3371,6 +3445,7 @@
 
     if (!bestUsable) {
       const fallback = bestSoft || best;
+      const fallbackView = evalViewForLog(fallback?.lens, fallback?.eval, logCtx);
       optBest = fallback;
       optRunning = false;
 
@@ -3381,9 +3456,9 @@
           `done ${iters}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
           `NO fully valid design found for current constraints.\n` +
           `Closest candidate:\n` +
-          `EFL ${Number.isFinite(fallback?.eval?.efl)?fallback.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
-          `T ${Number.isFinite(fallback?.eval?.T)?fallback.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
-          `COV ${fallback?.eval?.covers?"YES":"NO"} • ${icText(fallback?.eval)} • INTR ${Number.isFinite(fallback?.eval?.intrusion)?fallback.eval.intrusion.toFixed(2):"—"}mm\n` +
+          `EFL ${fmtOptMm(fallbackView.efl)} (target ${targetEfl})\n` +
+          `T ${fmtOptNum(fallbackView.T)} (target ${targetT})\n` +
+          `COV ${fallbackView.covers?"YES":"NO"} • ${icText(fallbackView)} • INTR ${fmtOptMm(fallbackView.intrusion)}\n` +
           `You can still click “Apply best” to inspect this closest candidate.\n`
         );
       }
@@ -3397,12 +3472,13 @@
     const tEnd = performance.now();
     const sec = (tEnd - tStart) / 1000;
     if (ui.optLog){
+      const bestView = evalViewForLog(best.lens, best.eval, logCtx);
       setOptLog(
         `done ${best.iter}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
         `BEST score ${best.eval.score.toFixed(2)}\n` +
-        `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
-        `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
-        `COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
+        `EFL ${fmtOptMm(bestView.efl)} (target ${targetEfl})\n` +
+        `T ${fmtOptNum(bestView.T)} (target ${targetT})\n` +
+        `COV ${bestView.covers?"YES":"NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n` +
         `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
         `Click “Apply best” to load.`
       );
