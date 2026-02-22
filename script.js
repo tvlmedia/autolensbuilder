@@ -343,6 +343,27 @@
     };
   }
 
+  let _standardSeedLens = null;
+  let _standardSeedTried = false;
+
+  async function ensureStandardSeedLoaded() {
+    if (_standardSeedTried) return;
+    _standardSeedTried = true;
+    try {
+      const res = await fetch("Standaard.json", { cache: "no-store" });
+      if (!res.ok) return;
+      const obj = await res.json();
+      const sane = sanitizeLens(obj);
+      if (Array.isArray(sane?.surfaces) && sane.surfaces.length >= 3) {
+        _standardSeedLens = sane;
+      }
+    } catch (_) {}
+  }
+
+  function getStandardSeedLens() {
+    return sanitizeLens(_standardSeedLens || omit50ConceptV1());
+  }
+
   // -------------------- sanitize/load --------------------
   function sanitizeLens(obj) {
     const safe = {
@@ -377,7 +398,7 @@
     return safe;
   }
 
-  let lens = sanitizeLens(omit50ConceptV1());
+  let lens = getStandardSeedLens();
   let selectedIndex = 0;
 
   function applySensorToIMS() {
@@ -2870,6 +2891,12 @@
       count: s.length,
       media: s.map((x) => String(resolveGlassName(x?.glass)).toUpperCase() === "AIR" ? "AIR" : "GLASS"),
       stopIdx: findStopSurfaceIndex(s),
+      anchors: s.map((x) => ({
+        R: Number(x?.R || 0),
+        t: Number(x?.t || 0),
+        ap: Number(x?.ap || 0),
+        glass: resolveGlassName(String(x?.glass || "AIR")),
+      })),
     };
   }
 
@@ -2931,7 +2958,9 @@
     }
 
     // main: perturb a few parameters
-    const kChanges = mode === "wild" ? 6 : 3;
+    const kChanges = topo
+      ? (mode === "wild" ? 4 : 2)
+      : (mode === "wild" ? 6 : 3);
     for (let c=0;c<kChanges;c++){
       const idxs = s.map((x,i)=>({x,i})).filter(o=>!surfaceIsLocked(o.x));
       if (!idxs.length) break;
@@ -2941,7 +2970,7 @@
       const choice = Math.random();
       if (choice < 0.45){
         // radius tweak
-        const scale = mode === "wild" ? 0.35 : 0.18;
+        const scale = topo ? (mode === "wild" ? 0.16 : 0.08) : (mode === "wild" ? 0.35 : 0.18);
         const d = randn() * scale;
         const R = Number(ss.R || 0);
         const absR = Math.max(PHYS_CFG.minRadius, Math.abs(R));
@@ -2949,21 +2978,26 @@
         ss.R = (R >= 0 ? 1 : -1) * clamp(newAbs, PHYS_CFG.minRadius, 450);
       } else if (choice < 0.70){
         // thickness tweak
-        const scale = mode === "wild" ? 0.55 : 0.25;
+        const scale = topo ? (mode === "wild" ? 0.20 : 0.10) : (mode === "wild" ? 0.55 : 0.25);
         const d = randn() * scale;
         const mediumAfter = String(resolveGlassName(ss.glass || "AIR")).toUpperCase();
         const minT = (mediumAfter === "AIR") ? PHYS_CFG.optMinAirGap : PHYS_CFG.minGlassCT;
         ss.t = clamp(Number(ss.t||0) * (1 + d), minT, 42);
       } else if (choice < 0.88){
         // aperture tweak
-        const scale = mode === "wild" ? 0.45 : 0.20;
+        const scale = topo ? (mode === "wild" ? 0.18 : 0.10) : (mode === "wild" ? 0.45 : 0.20);
         const d = randn() * scale;
         ss.ap = clamp(Number(ss.ap||0) * (1 + d), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
       } else {
-        // glass swap
-        const lock = topo?.media?.[o.i];
-        if (lock === "AIR") ss.glass = "AIR";
-        else ss.glass = pick(GLASS_LIST);
+        if (topo) {
+          // Topology-locked runs stay on seed glass; only tiny aperture nudge.
+          ss.ap = clamp(Number(ss.ap || 0) * (1 + randn() * 0.06), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        } else {
+          // glass swap
+          const lock = topo?.media?.[o.i];
+          if (lock === "AIR") ss.glass = "AIR";
+          else ss.glass = pick(GLASS_LIST);
+        }
       }
 
       // sometimes toggle stop
@@ -2981,6 +3015,40 @@
     // keep OBJ/IMS types correct
     if (s.length) s[0].type = "OBJ";
     if (s.length) s[s.length-1].type = "IMS";
+
+    if (topo?.anchors?.length === s.length) {
+      for (let i = 0; i < s.length; i++) {
+        const si = s[i];
+        const ti = String(si?.type || "").toUpperCase();
+        if (ti === "OBJ" || ti === "IMS") continue;
+        const a = topo.anchors[i];
+        if (!a) continue;
+
+        const aR = Number(a.R || 0);
+        const aAbs = Math.abs(aR);
+        if (aAbs < 1e-6) {
+          si.R = 0;
+        } else {
+          const sign = aR >= 0 ? 1 : -1;
+          const loR = Math.max(PHYS_CFG.minRadius, aAbs * 0.72);
+          const hiR = Math.min(450, aAbs * 1.38);
+          const curR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(si.R || aR)));
+          si.R = sign * clamp(curR, loR, hiR);
+        }
+
+        const mediumAfter = String(resolveGlassName(si.glass || "AIR")).toUpperCase();
+        const minT = (mediumAfter === "AIR") ? PHYS_CFG.optMinAirGap : PHYS_CFG.minGlassCT;
+        const aT = Math.max(minT, Number(a.t || minT));
+        si.t = clamp(Number(si.t || aT), Math.max(minT, aT * 0.65), Math.max(minT, aT * 1.55));
+
+        const aAp = Math.max(PHYS_CFG.minAperture, Number(a.ap || PHYS_CFG.minAperture));
+        si.ap = clamp(Number(si.ap || aAp), Math.max(PHYS_CFG.minAperture, aAp * 0.70), Math.min(PHYS_CFG.maxAperture, aAp * 1.50));
+
+        const wantMedium = topo.media?.[i];
+        if (wantMedium === "AIR") si.glass = "AIR";
+        else si.glass = String(a.glass || "N-BK7HT");
+      }
+    }
 
     if (topo) enforceTopology(s, topo);
     quickSanity(s);
@@ -3036,7 +3104,9 @@
 
     // autofocus (lens shift)
     const af = bestLensShiftForDesign(surfaces, fieldAngle, rayCount, wavePreset);
-    const lensShift = af.ok ? af.shift : 0;
+    const lensShiftRaw = af.ok ? af.shift : 0;
+    // During optimization we never push the optical block toward sensor/PL side.
+    const lensShift = clamp(lensShiftRaw, -8.0, 0.0);
 
     const sensorX = 0.0;
     computeVertices(surfaces, lensShift, sensorX);
@@ -3168,6 +3238,7 @@
   async function runOptimizer(){
     if (optRunning) return;
     optRunning = true;
+    await ensureStandardSeedLoaded();
 
     const targetEfl = num(ui.optTargetFL?.value, 75);
     const targetT = num(ui.optTargetT?.value, 2.0);
@@ -3181,7 +3252,7 @@
     const wavePreset = ui.wavePreset?.value || "d";
 
     const userStart = sanitizeLens(lens);
-    const baseSeed = sanitizeLens(omit50ConceptV1());
+    const baseSeed = getStandardSeedLens();
     quickSanity(baseSeed.surfaces);
 
     const baseNudged = sanitizeLens(baseSeed);
@@ -3205,26 +3276,14 @@
 
     const userUsable = isUsable(userEval);
     const baseUsable = isUsable(baseEval);
-    const nearTarget = (ev) => {
-      if (!ev) return false;
-      const eflOk = Number.isFinite(ev.efl) && Number.isFinite(targetEfl)
-        ? Math.abs(ev.efl - targetEfl) <= 8.0
-        : true;
-      const tOk = Number.isFinite(ev.T) && Number.isFinite(targetT) && targetT > 0
-        ? ev.T <= targetT * 1.6
-        : true;
-      return eflOk && tOk;
-    };
-    const allowUserSeed =
-      userUsable &&
-      nearTarget(userEval) &&
-      (!baseUsable || userEval.score <= baseEval.score * 0.98);
 
-    let cur = allowUserSeed ? userStart : baseStart;
-    let curEval = allowUserSeed ? userEval : baseEval;
+    // Always optimize from the standard/base seed so search stays in a sane family.
+    let cur = baseStart;
+    let curEval = baseEval;
 
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
     let bestUsable = isUsable(best.eval);
+    let bestSoft = { lens: clone(cur), eval: curEval, iter: 0 };
     const icText = (ev) => {
       const ic = ev?.breakdown?.imageCircleDiag;
       const tgt = ev?.breakdown?.imageCircleTarget;
@@ -3283,6 +3342,10 @@
         }
       }
 
+      if (candEval.score < bestSoft.eval.score) {
+        bestSoft = { lens: clone(cand), eval: candEval, iter: i };
+      }
+
       if (i % BATCH === 0){
         const tNow = performance.now();
         const dt = (tNow - tStart) / 1000;
@@ -3307,7 +3370,8 @@
     }
 
     if (!bestUsable) {
-      optBest = null;
+      const fallback = bestSoft || best;
+      optBest = fallback;
       optRunning = false;
 
       const tEnd = performance.now();
@@ -3315,11 +3379,15 @@
       if (ui.optLog){
         setOptLog(
           `done ${iters}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
-          `NO valid design found for current constraints.\n` +
-          `Try: higher iterations, target T less aggressive, or load base preset first.\n`
+          `NO fully valid design found for current constraints.\n` +
+          `Closest candidate:\n` +
+          `EFL ${Number.isFinite(fallback?.eval?.efl)?fallback.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
+          `T ${Number.isFinite(fallback?.eval?.T)?fallback.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
+          `COV ${fallback?.eval?.covers?"YES":"NO"} • ${icText(fallback?.eval)} • INTR ${Number.isFinite(fallback?.eval?.intrusion)?fallback.eval.intrusion.toFixed(2):"—"}mm\n` +
+          `You can still click “Apply best” to inspect this closest candidate.\n`
         );
       }
-      toast("Optimize done: no valid design");
+      toast("Optimize done: closest candidate saved");
       return;
     }
 
@@ -3402,7 +3470,11 @@
     ui.renderScale?.addEventListener("input", () => { scheduleRenderAll(); scheduleAutosave(); });
 
     ui.btnNew?.addEventListener("click", () => { newClearLens(); scheduleAutosave(); });
-    ui.btnLoadOmit?.addEventListener("click", () => { loadLens(omit50ConceptV1()); scheduleAutosave(); });
+    ui.btnLoadOmit?.addEventListener("click", async () => {
+      await ensureStandardSeedLoaded();
+      loadLens(getStandardSeedLens());
+      scheduleAutosave();
+    });
     ui.btnLoadDemo?.addEventListener("click", () => { loadLens(demoLensSimple()); scheduleAutosave(); });
 
     ui.btnAdd?.addEventListener("click", () => { addSurface(); scheduleAutosave(); });
@@ -3471,7 +3543,9 @@
   }
 
   // -------------------- boot --------------------
-  function boot() {
+  async function boot() {
+    await ensureStandardSeedLoaded();
+    lens = getStandardSeedLens();
     wireUI();
     bindKeyboardShortcuts();
 
