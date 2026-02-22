@@ -41,6 +41,7 @@
       <button id="btnSetTStop" class="btn" type="button">Set T</button>
       <button id="btnAutoFocus" class="btn" type="button">Auto focus</button>
       <button id="btnAutoDesign" class="btn btnPrimary" type="button">Autodesign Prime</button>
+      <button id="btnAutoDesignPreview" class="btn" type="button">Preview Best</button>
       <button id="btnAutoDesignStop" class="btn" type="button">Stop AD</button>
 
       <div class="sep" aria-hidden="true"></div>
@@ -138,6 +139,20 @@
             <div class="ctrl">
               <label for="adTargetT">Target T</label>
               <input id="adTargetT" type="number" step="0.05" value="2.0" />
+            </div>
+
+            <div class="ctrl">
+              <label for="adFocusTarget">Focus target</label>
+              <select id="adFocusTarget">
+                <option value="both" selected>Infinity + 2000mm</option>
+                <option value="inf">Infinity only</option>
+                <option value="near">2000mm only</option>
+              </select>
+            </div>
+
+            <div class="ctrl">
+              <label for="adAttempts">Attempts / Effort</label>
+              <input id="adAttempts" type="number" step="1" min="1" max="12" value="1" />
             </div>
 
             <div class="ctrl two">

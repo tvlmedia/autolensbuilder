@@ -63,11 +63,14 @@
     renderScale: $("#renderScale"),
     adTargetEFL: $("#adTargetEFL"),
     adTargetT: $("#adTargetT"),
+    adFocusTarget: $("#adFocusTarget"),
+    adAttempts: $("#adAttempts"),
     adLog: $("#adLog"),
 
     btnScaleToFocal: $("#btnScaleToFocal"),
     btnSetTStop: $("#btnSetTStop"),
     btnAutoDesign: $("#btnAutoDesign"),
+    btnAutoDesignPreview: $("#btnAutoDesignPreview"),
     btnAutoDesignStop: $("#btnAutoDesignStop"),
     btnNew: $("#btnNew"),
     btnLoadOmit: $("#btnLoadOmit"),
@@ -1489,6 +1492,8 @@
       renderScale: ui.renderScale?.value || "1.25",
       adTargetEFL: ui.adTargetEFL?.value || "50",
       adTargetT: ui.adTargetT?.value || "2.0",
+      adFocusTarget: ui.adFocusTarget?.value || "both",
+      adAttempts: ui.adAttempts?.value || "1",
     };
   }
 
@@ -1507,6 +1512,8 @@
     set(ui.renderScale, snap.renderScale);
     set(ui.adTargetEFL, snap.adTargetEFL);
     set(ui.adTargetT, snap.adTargetT);
+    set(ui.adFocusTarget, snap.adFocusTarget);
+    set(ui.adAttempts, snap.adAttempts);
   }
 
   let _autosaveTimer = 0;
@@ -2820,6 +2827,14 @@
   function adSetRunningUI(isRunning) {
     if (ui.btnAutoDesign) ui.btnAutoDesign.disabled = !!isRunning;
     if (ui.btnAutoDesignStop) ui.btnAutoDesignStop.disabled = !isRunning;
+    if (ui.btnAutoDesignPreview) ui.btnAutoDesignPreview.disabled = !!isRunning || !adBest?.lens;
+  }
+
+  function adNormalizeFocusTarget(v) {
+    const s = String(v || "both").trim().toLowerCase();
+    if (s === "inf" || s === "infinity") return "inf";
+    if (s === "near" || s === "2000" || s === "2m") return "near";
+    return "both";
   }
 
   function randRange(min, max) {
@@ -3414,7 +3429,10 @@
       shiftMaxMm: cfg.shiftMaxMm,
     });
 
-    computeVertices(surfaces, focusInf.ok ? focusInf.shift : 0, 0);
+    const focusTarget = adNormalizeFocusTarget(cfg.focusTarget);
+    const primaryFocus = focusTarget === "near" ? focusNear : focusInf;
+    const distShift = primaryFocus.ok ? primaryFocus.shift : (focusInf.ok ? focusInf.shift : 0);
+    computeVertices(surfaces, distShift, 0);
     const distPct = estimateDistortionPct(surfaces, cfg.wavePreset, 0, cfg.sensorW, cfg.sensorH, efl, COVERAGE_CFG.mode);
     const distAbs = Number.isFinite(distPct) ? Math.abs(distPct) : 12;
 
@@ -3425,16 +3443,20 @@
     const tOk = Number.isFinite(T) && T <= cfg.targetT * (1 + tSlack);
     const bflOk = Number.isFinite(bfl) && bfl >= cfg.bflMinMm;
     const intrusionOk = intrusion <= 1e-6;
-    const focusOk =
-      focusInf.ok &&
-      focusNear.ok &&
-      Math.abs(focusInf.shift) <= cfg.shiftMaxMm + 1e-6 &&
-      Math.abs(focusNear.shift) <= cfg.shiftMaxMm + 1e-6;
-    const noHardVig =
+    const focusInfOk = focusInf.ok && Math.abs(focusInf.shift) <= cfg.shiftMaxMm + 1e-6;
+    const focusNearOk = focusNear.ok && Math.abs(focusNear.shift) <= cfg.shiftMaxMm + 1e-6;
+    const focusOk = focusTarget === "both"
+      ? (focusInfOk && focusNearOk)
+      : (focusTarget === "near" ? focusNearOk : focusInfOk);
+    const noHardVigInf =
       Number(focusInf.edgeVigFrac || 1) <= 0.35 &&
+      Number(focusInf.validFrac || 0) >= 0.55;
+    const noHardVigNear =
       Number(focusNear.edgeVigFrac || 1) <= 0.45 &&
-      Number(focusInf.validFrac || 0) >= 0.55 &&
       Number(focusNear.validFrac || 0) >= 0.50;
+    const noHardVig = focusTarget === "both"
+      ? (noHardVigInf && noHardVigNear)
+      : (focusTarget === "near" ? noHardVigNear : noHardVigInf);
 
     const reasons = [];
     if (phys.hardFail) reasons.push("PHYS");
@@ -3447,12 +3469,24 @@
     if (!eflOk) reasons.push("EFL");
     if (!tOk) reasons.push("T");
 
-    let score =
-      cfg.focusWeightInf * Number(focusInf.merit || 1e5) +
-      cfg.focusWeightNear * Number(focusNear.merit || 1e5);
+    let score = 0;
+    if (focusTarget === "both") {
+      score += cfg.focusWeightInf * Number(focusInf.merit || 1e5);
+      score += cfg.focusWeightNear * Number(focusNear.merit || 1e5);
+    } else if (focusTarget === "near") {
+      score += Number(focusNear.merit || 1e5);
+    } else {
+      score += Number(focusInf.merit || 1e5);
+    }
 
     score += cfg.distWeight * distAbs * distAbs;
-    score += cfg.vigWeight * (Number(focusInf.edgeVigFrac || 1) + Number(focusNear.edgeVigFrac || 1));
+    if (focusTarget === "both") {
+      score += cfg.vigWeight * (Number(focusInf.edgeVigFrac || 1) + Number(focusNear.edgeVigFrac || 1));
+    } else if (focusTarget === "near") {
+      score += cfg.vigWeight * Number(focusNear.edgeVigFrac || 1);
+    } else {
+      score += cfg.vigWeight * Number(focusInf.edgeVigFrac || 1);
+    }
     score += cfg.physWeight * Math.max(0, Number(phys.penalty || 0));
 
     if (Number.isFinite(eflErrFrac)) score += cfg.eflWeight * eflErrFrac * eflErrFrac;
@@ -3468,7 +3502,9 @@
     if (Number.isFinite(bfl) && bfl < cfg.bflMinMm) score += cfg.bflWeight * (cfg.bflMinMm - bfl) ** 2;
     if (Number.isFinite(req) && Number.isFinite(maxField) && maxField < req) score += cfg.covWeight * (req - maxField) ** 2;
     if (!icOk) score += cfg.covWeight * Math.max(1, (icTarget - Number(icDiag || 0)) ** 2);
-    if (focusInf.ok && focusNear.ok) score += cfg.focusTravelWeight * (focusNear.shift - focusInf.shift) ** 2;
+    if (focusTarget === "both" && focusInf.ok && focusNear.ok) {
+      score += cfg.focusTravelWeight * (focusNear.shift - focusInf.shift) ** 2;
+    }
 
     if (reasons.length) score += cfg.guardFailPenalty * reasons.length;
 
@@ -3490,6 +3526,7 @@
       phys,
       focusInf,
       focusNear,
+      focusTarget,
     };
   }
 
@@ -3857,7 +3894,9 @@
     const infShift = Number.isFinite(ev.focusInf?.shift) ? `${ev.focusInf.shift.toFixed(2)}mm` : "—";
     const nearShift = Number.isFinite(ev.focusNear?.shift) ? `${ev.focusNear.shift.toFixed(2)}mm` : "—";
     const dist = Number.isFinite(ev.distPct) ? `${ev.distPct.toFixed(2)}%` : "—";
-    return `score ${ev.score.toFixed(2)} • EFL ${efl} • T ${t} • BFL ${bfl} • shift∞ ${infShift} • shift2m ${nearShift} • dist ${dist}`;
+    const fm = adNormalizeFocusTarget(ev.focusTarget || "both");
+    const fmTxt = fm === "near" ? "focus 2m" : fm === "inf" ? "focus ∞" : "focus ∞+2m";
+    return `score ${ev.score.toFixed(2)} • EFL ${efl} • T ${t} • BFL ${bfl} • shift∞ ${infShift} • shift2m ${nearShift} • dist ${dist} • ${fmTxt}`;
   }
 
   async function runAutodesignPrime() {
@@ -3865,16 +3904,26 @@
 
     const targetEfl = num(ui.adTargetEFL?.value, 50);
     const targetT = num(ui.adTargetT?.value, 2.0);
+    const focusTarget = adNormalizeFocusTarget(ui.adFocusTarget?.value || "both");
+    const attempts = clamp(Math.round(num(ui.adAttempts?.value, 1)), 1, 12);
+    if (ui.adFocusTarget) ui.adFocusTarget.value = focusTarget;
+    if (ui.adAttempts) ui.adAttempts.value = String(attempts);
     if (!Number.isFinite(targetEfl) || targetEfl <= 8) return toast("Autodesign: invalid target EFL");
     if (!Number.isFinite(targetT) || targetT <= 0.6) return toast("Autodesign: invalid target T");
 
+    const effort = attempts;
     const cfg = {
       ...AD_CFG,
       targetEfl,
       targetT,
+      focusTarget,
       sensorW: AD_CFG.sensorW,
       sensorH: AD_CFG.sensorH,
       wavePreset: "d",
+      seedCount: clamp(Math.round(AD_CFG.seedCount * effort), 24, 600),
+      topK: clamp(Math.round(AD_CFG.topK + (effort - 1) * 1.3), 3, 12),
+      optimizeIters: clamp(Math.round(AD_CFG.optimizeIters * effort), 120, 5200),
+      logEvery: clamp(Math.round(AD_CFG.logEvery * Math.sqrt(effort)), 32, 320),
     };
 
     adRunning = true;
@@ -3886,8 +3935,10 @@
       setADLog(
         `Autodesigner v2 start\n` +
         `Target EFL ${targetEfl.toFixed(2)}mm • Target T ${targetT.toFixed(2)}\n` +
+        `Focus target: ${focusTarget === "near" ? "2000mm" : focusTarget === "inf" ? "infinity" : "infinity + 2000mm"}\n` +
+        `Effort: ${attempts}x (seeds ${cfg.seedCount}, iters ${cfg.optimizeIters}, topK ${cfg.topK})\n` +
         `Sensor ${cfg.sensorW.toFixed(2)}x${cfg.sensorH.toFixed(2)}mm • PL BFL>=${cfg.bflMinMm.toFixed(1)}\n` +
-        `Focus checks: infinity + ${cfg.focusNearMm.toFixed(0)}mm\n`
+        `Focus near distance: ${cfg.focusNearMm.toFixed(0)}mm\n`
       );
 
       appendADLog("Stage A: template synthesis + quick guards...");
@@ -3934,13 +3985,16 @@
       loadLens(globalBest.lens);
       if (ui.focusMode) ui.focusMode.value = "lens";
       if (ui.sensorOffset) ui.sensorOffset.value = "0";
-      if (ui.lensFocus) ui.lensFocus.value = Number(globalBest.eval.focusInf?.shift || 0).toFixed(2);
+      const previewShift = focusTarget === "near"
+        ? Number(globalBest.eval.focusNear?.shift || 0)
+        : Number(globalBest.eval.focusInf?.shift || 0);
+      if (ui.lensFocus) ui.lensFocus.value = previewShift.toFixed(2);
       scheduleAutosave();
       renderAll();
 
       appendADLog("Done: valid prime generated.");
       appendADLog(adFormatEval(globalBest.eval));
-      appendADLog(`JSON ready via Save JSON.`);
+      appendADLog(`JSON ready via Save JSON. Je kunt ook altijd op "Preview Best" klikken.`);
       toast(`Autodesign done • merit ${globalBest.eval.score.toFixed(2)}`);
     } catch (err) {
       console.error(err);
@@ -3950,6 +4004,25 @@
       adRunning = false;
       adSetRunningUI(false);
     }
+  }
+
+  function previewAutodesignBest() {
+    if (!adBest?.lens) return toast("No best design yet");
+
+    const mode = adNormalizeFocusTarget(ui.adFocusTarget?.value || adBest?.eval?.focusTarget || "both");
+    const shift = mode === "near"
+      ? Number(adBest.eval?.focusNear?.shift || 0)
+      : Number(adBest.eval?.focusInf?.shift || 0);
+
+    loadLens(adBest.lens);
+    if (ui.focusMode) ui.focusMode.value = "lens";
+    if (ui.sensorOffset) ui.sensorOffset.value = "0";
+    if (ui.lensFocus) ui.lensFocus.value = shift.toFixed(2);
+    scheduleAutosave();
+    renderAll();
+
+    appendADLog(`Preview Best loaded (${mode === "near" ? "focus 2000mm" : "focus infinity"}).`);
+    toast("Preview Best loaded");
   }
 
   function stopAutodesign() {
@@ -3977,7 +4050,7 @@
       ui[id]?.addEventListener("change", () => { scheduleRenderAll(); scheduleAutosave(); });
     });
     ui.renderScale?.addEventListener("input", () => { scheduleRenderAll(); scheduleAutosave(); });
-    ["adTargetEFL", "adTargetT"].forEach((id) => {
+    ["adTargetEFL", "adTargetT", "adFocusTarget", "adAttempts"].forEach((id) => {
       ui[id]?.addEventListener("input", () => scheduleAutosave());
       ui[id]?.addEventListener("change", () => scheduleAutosave());
     });
@@ -4003,6 +4076,7 @@
         toast("Autodesign failed");
       });
     });
+    ui.btnAutoDesignPreview?.addEventListener("click", previewAutodesignBest);
     ui.btnAutoDesignStop?.addEventListener("click", stopAutodesign);
 
     ui.btnSave?.addEventListener("click", saveJSON);
