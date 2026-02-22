@@ -3279,67 +3279,6 @@
     return cmp(ma.score, mb.score, 1e-9);
   }
 
-  function compareEvalForIcRecovery(a, b, opts = {}) {
-    if (!a && !b) return 0;
-    if (!a) return 1;
-    if (!b) return -1;
-
-    const ma = evalPriorityMetrics(a, opts);
-    const mb = evalPriorityMetrics(b, opts);
-
-    const cmp = (x, y, tie = 0) => {
-      const xf = Number.isFinite(x);
-      const yf = Number.isFinite(y);
-      if (!xf && !yf) return 0;
-      if (!xf) return 1;
-      if (!yf) return -1;
-      if (Math.abs(x - y) <= tie) return 0;
-      return x < y ? -1 : 1;
-    };
-
-    let c = cmp(ma.hardInvalid, mb.hardInvalid, 0);
-    if (c) return c;
-    c = cmp(ma.intrOver, mb.intrOver, 1e-6);
-    if (c) return c;
-    c = cmp(ma.covFail, mb.covFail, 0);
-    if (c) return c;
-    c = cmp(ma.icShort, mb.icShort, 0.28);
-    if (c) return c;
-    c = cmp(ma.flErr, mb.flErr, 0.35);
-    if (c) return c;
-    c = cmp(ma.tSlowErr, mb.tSlowErr, 0.20);
-    if (c) return c;
-    return cmp(ma.score, mb.score, 1e-9);
-  }
-
-  function isDegenerateIcCandidate(ev, opts = {}) {
-    const m = evalPriorityMetrics(ev, opts);
-    const icDiag = Number(m.icDiag);
-    const icTarget = Number(m.icTarget);
-    if (!Number.isFinite(icTarget) || icTarget <= 0) return true;
-    if (!Number.isFinite(icDiag)) return true;
-    const hardFloor = Math.min(1.0, Math.max(0.35, icTarget * 0.03));
-    return icDiag < hardFloor;
-  }
-
-  function priorityScoreForAnneal(ev, opts = {}) {
-    const m = evalPriorityMetrics(ev, opts);
-    const flN = Number.isFinite(m.flErr) ? (m.flErr / Math.max(1e-6, PRIORITY_CFG.flTolMm)) : 1e6;
-    const tN = Number.isFinite(m.tSlowErr) ? (m.tSlowErr / Math.max(1e-6, PRIORITY_CFG.tTol)) : 1e6;
-    const icN = Number.isFinite(m.icShort) ? (m.icShort / Math.max(1e-6, PRIORITY_CFG.icTolMm)) : 1e6;
-    const intrN = Number.isFinite(m.intrOver) ? (m.intrOver / 0.1) : 1e6;
-    const meritN = Number.isFinite(m.score) ? (m.score * 0.0002) : 1e6;
-    return (
-      m.hardInvalid * 1_000_000 +
-      intrN * 50_000 +
-      flN * 4200 +
-      icN * 900 +
-      m.covFail * 350 +
-      tN * 160 +
-      meritN
-    );
-  }
-
   function priorityLine(ev, opts = {}) {
     const m = evalPriorityMetrics(ev, opts);
     const fl = Number.isFinite(m.flErr) ? `${m.flErr.toFixed(2)}mm` : "—";
@@ -3349,19 +3288,134 @@
     return `Perr: FL ${fl} • ICshort ${ic} • COV ${cov} • Tslow ${t}`;
   }
 
-  function optimizerPhaseFromEval(ev, opts = {}) {
-    const m = evalPriorityMetrics(ev, opts);
-    if (!Number.isFinite(m.flErr) || m.flErr > 0.35) return "fl";
-    if (!Number.isFinite(m.icShort) || m.icShort > 1.50 || m.covFail > 0) return "ic";
-    if (!Number.isFinite(m.tSlowErr) || m.tSlowErr > 0.22) return "t";
-    return "refine";
-  }
-
   function optimizerPhaseLabel(phase) {
     if (phase === "fl") return "FL-lock";
     if (phase === "t") return "T-tune";
     if (phase === "ic") return "IC-boost";
     return "Refine";
+  }
+
+  const OPT_V2_PHASE_CFG = {
+    flLockMm: 0.60,
+    flRelaxMm: 0.95,
+    icLockMm: 0.70,
+    icRelaxMm: 1.35,
+    tLock: 0.18,
+    tRelax: 0.40,
+  };
+
+  function finiteOrHuge(v, huge = 1e9) {
+    return Number.isFinite(v) ? v : huge;
+  }
+
+  function compareScalarWithTie(a, b, tie = 0) {
+    const aa = finiteOrHuge(a);
+    const bb = finiteOrHuge(b);
+    if (Math.abs(aa - bb) <= tie) return 0;
+    return aa < bb ? -1 : 1;
+  }
+
+  function optimizerPhaseLocksV2(ev, opts = {}) {
+    const m = evalPriorityMetrics(ev, opts);
+    const flLocked = Number.isFinite(m.flErr) && m.flErr <= OPT_V2_PHASE_CFG.flLockMm;
+    const icLocked =
+      Number.isFinite(m.icShort) &&
+      m.icShort <= OPT_V2_PHASE_CFG.icLockMm &&
+      m.covFail === 0;
+    const tLocked = Number.isFinite(m.tSlowErr) && m.tSlowErr <= OPT_V2_PHASE_CFG.tLock;
+    return { flLocked, icLocked, tLocked, metrics: m };
+  }
+
+  function optimizerPhaseFromEvalV2(ev, opts = {}) {
+    const lk = optimizerPhaseLocksV2(ev, opts);
+    if (!lk.flLocked) return "fl";
+    if (!lk.icLocked) return "ic";
+    if (!lk.tLocked) return "t";
+    return "refine";
+  }
+
+  function compareEvalByPhaseV2(a, b, phase, opts = {}) {
+    if (!a && !b) return 0;
+    if (!a) return 1;
+    if (!b) return -1;
+
+    const ma = evalPriorityMetrics(a, opts);
+    const mb = evalPriorityMetrics(b, opts);
+    const intrBadA = Number.isFinite(ma.intrOver) && ma.intrOver > 1e-6 ? 1 : 0;
+    const intrBadB = Number.isFinite(mb.intrOver) && mb.intrOver > 1e-6 ? 1 : 0;
+
+    let c = compareScalarWithTie(ma.hardInvalid, mb.hardInvalid, 0);
+    if (c) return c;
+    c = compareScalarWithTie(intrBadA, intrBadB, 0);
+    if (c) return c;
+
+    const phaseStr = String(phase || "refine");
+    if (phaseStr === "fl") {
+      c = compareScalarWithTie(ma.flErr, mb.flErr, 0.04);
+      if (c) return c;
+      c = compareScalarWithTie(ma.icShort, mb.icShort, 0.25);
+      if (c) return c;
+      c = compareScalarWithTie(ma.covFail, mb.covFail, 0);
+      if (c) return c;
+      c = compareScalarWithTie(ma.tSlowErr, mb.tSlowErr, 0.10);
+      if (c) return c;
+      return compareScalarWithTie(ma.score, mb.score, 1e-9);
+    }
+
+    if (phaseStr === "ic") {
+      const flBadA = finiteOrHuge(ma.flErr) > OPT_V2_PHASE_CFG.flRelaxMm ? 1 : 0;
+      const flBadB = finiteOrHuge(mb.flErr) > OPT_V2_PHASE_CFG.flRelaxMm ? 1 : 0;
+      c = compareScalarWithTie(flBadA, flBadB, 0);
+      if (c) return c;
+      c = compareScalarWithTie(ma.covFail, mb.covFail, 0);
+      if (c) return c;
+      c = compareScalarWithTie(ma.icShort, mb.icShort, 0.18);
+      if (c) return c;
+      c = compareScalarWithTie(ma.flErr, mb.flErr, 0.15);
+      if (c) return c;
+      c = compareScalarWithTie(ma.tSlowErr, mb.tSlowErr, 0.14);
+      if (c) return c;
+      return compareScalarWithTie(ma.score, mb.score, 1e-9);
+    }
+
+    if (phaseStr === "t") {
+      const flBadA = finiteOrHuge(ma.flErr) > OPT_V2_PHASE_CFG.flRelaxMm ? 1 : 0;
+      const flBadB = finiteOrHuge(mb.flErr) > OPT_V2_PHASE_CFG.flRelaxMm ? 1 : 0;
+      const icBadA = ma.covFail > 0 || finiteOrHuge(ma.icShort) > OPT_V2_PHASE_CFG.icRelaxMm ? 1 : 0;
+      const icBadB = mb.covFail > 0 || finiteOrHuge(mb.icShort) > OPT_V2_PHASE_CFG.icRelaxMm ? 1 : 0;
+      c = compareScalarWithTie(flBadA, flBadB, 0);
+      if (c) return c;
+      c = compareScalarWithTie(icBadA, icBadB, 0);
+      if (c) return c;
+      c = compareScalarWithTie(ma.tSlowErr, mb.tSlowErr, 0.05);
+      if (c) return c;
+      c = compareScalarWithTie(ma.flErr, mb.flErr, 0.12);
+      if (c) return c;
+      c = compareScalarWithTie(ma.icShort, mb.icShort, 0.16);
+      if (c) return c;
+      return compareScalarWithTie(ma.score, mb.score, 1e-9);
+    }
+
+    // refine: keep lock conditions first, then sharpness/score.
+    const flBadA = finiteOrHuge(ma.flErr) > OPT_V2_PHASE_CFG.flLockMm ? 1 : 0;
+    const flBadB = finiteOrHuge(mb.flErr) > OPT_V2_PHASE_CFG.flLockMm ? 1 : 0;
+    const icBadA = ma.covFail > 0 || finiteOrHuge(ma.icShort) > OPT_V2_PHASE_CFG.icLockMm ? 1 : 0;
+    const icBadB = mb.covFail > 0 || finiteOrHuge(mb.icShort) > OPT_V2_PHASE_CFG.icLockMm ? 1 : 0;
+    const tBadA = finiteOrHuge(ma.tSlowErr) > OPT_V2_PHASE_CFG.tLock ? 1 : 0;
+    const tBadB = finiteOrHuge(mb.tSlowErr) > OPT_V2_PHASE_CFG.tLock ? 1 : 0;
+    c = compareScalarWithTie(flBadA, flBadB, 0);
+    if (c) return c;
+    c = compareScalarWithTie(icBadA, icBadB, 0);
+    if (c) return c;
+    c = compareScalarWithTie(tBadA, tBadB, 0);
+    if (c) return c;
+    c = compareScalarWithTie(ma.score, mb.score, 1e-9);
+    if (c) return c;
+    c = compareScalarWithTie(ma.flErr, mb.flErr, 0.08);
+    if (c) return c;
+    c = compareScalarWithTie(ma.icShort, mb.icShort, 0.12);
+    if (c) return c;
+    return compareScalarWithTie(ma.tSlowErr, mb.tSlowErr, 0.08);
   }
 
   function makeGuidedPhaseCandidate(
@@ -3910,17 +3964,6 @@
     };
   }
 
-  function evalIsUsable(ev, opts = {}) {
-    if (!ev || !Number.isFinite(ev.score)) return false;
-    if (!Number.isFinite(ev.efl) || ev.efl <= 1) return false;
-    if (!Number.isFinite(ev.T) || ev.T <= 0) return false;
-    if (!Number.isFinite(ev.bfl)) return false;
-    if ((ev.breakdown?.hardInvalid) === true) return false;
-    if (!Number.isFinite(ev.intrusion)) return false;
-    if (ev.intrusion > MERIT_CFG.maxRearIntrusion + 1e-6) return false;
-    return true;
-  }
-
   async function runOptimizer(){
     if (optRunning) return;
     optRunning = true;
@@ -3936,42 +3979,23 @@
     const rayCount = Math.max(9, Math.min(61, (num(ui.rayCount?.value, 31) | 0))); // limit for speed
     const wavePreset = ui.wavePreset?.value || "d";
 
-    const baseStart = buildTargetDrivenSeedLens({
+    const baseSeed = buildTargetDrivenSeedLens({
       targetEfl,
       targetT,
       sensorW,
       sensorH,
       wavePreset,
     });
-    quickSanity(baseStart.surfaces);
-
-    const baseEval = evalLensMerit(baseStart, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
-
-    const isUsable = (ev) => evalIsUsable(ev, { targetEfl, targetT });
+    quickSanity(baseSeed.surfaces);
+    const topo = captureTopology(baseSeed);
     const priOpts = { targetEfl, targetT };
-    const betterByPriority = (a, b) => compareEvalByPriority(a, b, priOpts) < 0;
-    const betterForIc = (a, b) => compareEvalForIcRecovery(a, b, priOpts) < 0;
-    const priorityScore = (ev) => priorityScoreForAnneal(ev, priOpts);
+    const logCtx = { wavePreset, sensorW, sensorH, rayCount };
 
-    // Keep optimizer around a sane Double-Gauss-like base topology.
-    const topo = captureTopology(baseStart);
-
-    const baseUsable = isUsable(baseEval);
     const isMountLegal = (ev) =>
       !!ev &&
       Number.isFinite(ev.intrusion) &&
       ev.intrusion <= MERIT_CFG.maxRearIntrusion + 1e-6;
-
-    // Always optimize from a target-driven seed so search stays physically useful.
-    let cur = baseStart;
-    let curEval = baseEval;
-
-    let best = { lens: clone(cur), eval: curEval, iter: 0 };
-    let bestUsable = isUsable(best.eval);
-    let bestSoft = { lens: clone(cur), eval: curEval, iter: 0 };
-    let bestSoftMount = isMountLegal(curEval) ? { lens: clone(cur), eval: curEval, iter: 0 } : null;
-    let bestIc = { lens: clone(cur), eval: curEval, iter: 0 };
-    const logCtx = { wavePreset, sensorW, sensorH, rayCount };
+    const phaseCmp = (a, b, phase) => compareEvalByPhaseV2(a, b, phase, priOpts);
     const icText = (v) => {
       const ic = v?.icDiag;
       const tgt = v?.icTarget;
@@ -3980,350 +4004,314 @@
       return `IC ${icStr}/${tgtStr}`;
     };
 
-    // annealing-ish
-    let temp0 = mode === "wild" ? 3.5 : 1.8;
-    let temp1 = mode === "wild" ? 0.25 : 0.12;
+    let evalCount = 0;
+    const evalArgs = { targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH };
+    const makeRec = (lensObj, iter = 0, label = "cand") => {
+      const L = sanitizeLens(clone(lensObj));
+      quickSanity(L.surfaces);
+      const ev = evalLensMerit(L, evalArgs);
+      evalCount++;
+      return { lens: L, eval: ev, iter, label };
+    };
 
+    let baseRec = makeRec(baseSeed, 0, "seed");
+    let curRec = baseRec;
+    let bestRec = baseRec;
+    let bestSoftMount = isMountLegal(bestRec.eval) ? bestRec : null;
+    let phaseBest = {
+      fl: baseRec,
+      ic: baseRec,
+      t: baseRec,
+      refine: baseRec,
+    };
+    let population = [baseRec];
+
+    const popSize = mode === "wild" ? 9 : 6;
+    const proposalsPerIter = mode === "wild" ? 9 : 6;
+    const baseExploreProb = mode === "wild" ? 0.06 : 0.015;
+    const BATCH = 50;
     const tStart = performance.now();
     let stagnantIters = 0;
 
-    const BATCH = 60;
+    const pickSeedRec = (phaseNow) => {
+      const bucket = [];
+      if (phaseBest[phaseNow]) bucket.push(phaseBest[phaseNow], phaseBest[phaseNow]);
+      if (bestRec) bucket.push(bestRec, bestRec);
+      if (curRec) bucket.push(curRec);
+      for (let k = 0; k < Math.min(4, population.length); k++) bucket.push(population[k]);
+      if (!bucket.length) bucket.push(baseRec);
+      return bucket[(Math.random() * bucket.length) | 0];
+    };
 
-    for (let i = 1; i <= iters; i++){
+    for (let i = 1; i <= iters; i++) {
       if (!optRunning) break;
 
-      const a = i / iters;
-      const temp = temp0 * (1 - a) + temp1 * a;
-      const phaseNow = optimizerPhaseFromEval(curEval, priOpts);
-      const curMetrics = evalPriorityMetrics(curEval, priOpts);
-      const icShortRaw = Number(curMetrics.icShort);
-      const icShortNow = Number.isFinite(icShortRaw) ? Math.max(0, icShortRaw) : 40.0;
-      const icTargetRaw = Number(curMetrics.icTarget);
-      const icTargetNow = Number.isFinite(icTargetRaw)
-        ? icTargetRaw
-        : targetImageCircleDiagMm(sensorW, sensorH);
-      const preferredIcSeed = bestIc?.lens || best?.lens || cur;
-      const seedForMut =
-        phaseNow === "ic"
-          ? (Math.random() < 0.72 ? preferredIcSeed : ((best?.lens && Math.random() < 0.50) ? best.lens : cur))
-          : (phaseNow === "fl" && best?.lens && Math.random() < 0.45 ? best.lens : cur);
-      let cand = mutateLens(seedForMut, mode, topo, {
-        efl: targetEfl,
-        t: targetT,
-        wavePreset,
-        phase: phaseNow,
-        icShortNow,
-        icTargetNow,
-      });
-      let candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+      const phaseNow = optimizerPhaseFromEvalV2(bestRec.eval, priOpts);
+      const mBest = evalPriorityMetrics(bestRec.eval, priOpts);
+      const icShortNow = Number.isFinite(mBest.icShort) ? Math.max(0, mBest.icShort) : 40.0;
+      const icTargetNow = Number.isFinite(mBest.icTarget) ? mBest.icTarget : targetImageCircleDiagMm(sensorW, sensorH);
 
-      // In IC phase, always try one guided repair candidate to avoid random wandering.
-      if (phaseNow === "ic" && (icShortNow > 1.0 || !curEval.covers)) {
-        const guidedSeed = bestIc?.lens || best?.lens || cur;
-        const guided = makeGuidedPhaseCandidate(guidedSeed, {
-          phase: "ic",
-          targetEfl,
-          targetT,
-          wavePreset,
-          icShortMm: Math.max(icShortNow, 6),
-          icTargetMm: icTargetNow,
-        });
-        const guidedMut = mutateLens(guided, mode, topo, {
-          efl: targetEfl,
-          t: targetT,
-          wavePreset,
-          phase: "ic",
-          icShortNow: Math.max(icShortNow, 6),
-          icTargetNow,
-        });
-        const guidedEval = evalLensMerit(guidedMut, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
-        if (betterByPriority(guidedEval, candEval) || betterForIc(guidedEval, candEval)) {
-          cand = guidedMut;
-          candEval = guidedEval;
+      const candidates = [];
+      const addCandidate = (lensObj, label) => {
+        const rec = makeRec(lensObj, i, label);
+        candidates.push(rec);
+        if (isMountLegal(rec.eval) && (!bestSoftMount || compareEvalByPriority(rec.eval, bestSoftMount.eval, priOpts) < 0)) {
+          bestSoftMount = rec;
         }
-      }
+      };
 
-      // Hard reject/repair degenerate IC candidates instead of wasting batches on IC~0.
-      if (phaseNow === "ic") {
-        const candDegIc = isDegenerateIcCandidate(candEval, priOpts);
-        const curDegIc = isDegenerateIcCandidate(curEval, priOpts);
-        if (candDegIc && (!curDegIc || betterForIc(curEval, candEval))) {
-          const repairSeed = bestIc?.lens || best?.lens || baseStart;
-          const repairGuided = makeGuidedPhaseCandidate(repairSeed, {
-            phase: "ic",
-            targetEfl,
-            targetT,
-            wavePreset,
-            icShortMm: Math.max(10, icShortNow),
-            icTargetMm: icTargetNow,
-          });
-          const repairMut = mutateLens(repairGuided, mode, topo, {
-            efl: targetEfl,
-            t: targetT,
-            wavePreset,
-            phase: "ic",
-            icShortNow: Math.max(10, icShortNow),
-            icTargetNow,
-          });
-          const repairEval = evalLensMerit(repairMut, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
-          if (betterByPriority(repairEval, candEval) || betterForIc(repairEval, candEval)) {
-            cand = repairMut;
-            candEval = repairEval;
-          }
-        }
-      }
-      const candUsable = isUsable(candEval);
-      const curUsable = isUsable(curEval);
-      const prevEval = curEval;
-      let iterProgress = false;
-
-      let accept = false;
-      if (candUsable && !curUsable) {
-        accept = true;
-      } else if (!candUsable && curUsable) {
-        accept = false;
-      } else {
-        const mCur = evalPriorityMetrics(curEval, priOpts);
-        const mCand = evalPriorityMetrics(candEval, priOpts);
-        const cmpPri = compareEvalByPriority(candEval, curEval, priOpts);
-        if (cmpPri < 0) {
-          accept = true;
-        } else if (cmpPri > 0) {
-          // In IC phase we accept clear IC progress even with tiny FL drift.
-          if (phaseNow === "ic" && compareEvalForIcRecovery(candEval, curEval, priOpts) < 0) {
-            const flSlack = Number.isFinite(mCur.flErr) && mCur.flErr <= 0.35 ? 0.45 : 0.70;
-            const flOk =
-              Number.isFinite(mCand.flErr) &&
-              Number.isFinite(mCur.flErr) &&
-              mCand.flErr <= (mCur.flErr + flSlack);
-            const tOk =
-              !Number.isFinite(mCand.tSlowErr) || !Number.isFinite(mCur.tSlowErr)
-                ? true
-                : (mCand.tSlowErr <= mCur.tSlowErr + 0.80);
-            if (flOk && tOk) accept = true;
-          }
-
-          // Small exploration chance while keeping FL+IC first, then T.
-          if (!accept) {
-            let explore = (mode === "wild" ? 0.05 : 0.015) * Math.max(0.20, temp);
-            if (phaseNow === "ic") {
-              const isMuchWorseIc =
-                Number.isFinite(mCur.icShort) &&
-                Number.isFinite(mCand.icShort) &&
-                mCand.icShort > mCur.icShort + 0.7;
-              const isDegenerateIc = isDegenerateIcCandidate(candEval, priOpts);
-              if (isMuchWorseIc || isDegenerateIc) explore = 0;
-              else explore *= 0.15;
-            }
-            accept = Math.random() < explore;
-          }
-        } else {
-          const dPri = priorityScore(candEval) - priorityScore(curEval);
-          accept = (dPri <= 0) || (Math.random() < Math.exp(-dPri / Math.max(1e-9, temp * 8)));
-        }
-      }
-      if (accept){
-        cur = cand;
-        curEval = candEval;
-        const stepCmp = (phaseNow === "ic")
-          ? compareEvalForIcRecovery(curEval, prevEval, priOpts)
-          : compareEvalByPriority(curEval, prevEval, priOpts);
-        if (stepCmp < 0) iterProgress = true;
-      }
-
-      if ((!bestUsable && candUsable) || (candUsable && betterByPriority(candEval, best.eval))){
-        best = { lens: clone(cand), eval: candEval, iter: i };
-        bestUsable = true;
-        iterProgress = true;
-
-        // UI update (rare)
-        if (ui.optLog){
-          const bestView = evalViewForLog(best.lens, best.eval, logCtx);
-          const bestPhase = optimizerPhaseLabel(optimizerPhaseFromEval(best.eval, priOpts));
-          setOptLog(
-            `best @${i}/${iters}\n` +
-            `phase ${bestPhase}\n` +
-            `score ${best.eval.score.toFixed(2)}\n` +
-            `EFL ${fmtOptMm(bestView.efl)} (target ${targetEfl})\n` +
-            `T ${fmtOptNum(bestView.T)} (target ${targetT})\n` +
-            `COV ${bestView.covers?"YES":"NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n` +
-            `${priorityLine(best.eval, priOpts)}\n` +
-            `${meritPartsLine(best.eval?.breakdown)}\n` +
-            `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
-          );
-        }
-      }
-      if (iterProgress) stagnantIters = 0;
-      else stagnantIters++;
-
-      if (betterByPriority(candEval, bestSoft.eval)) {
-        bestSoft = { lens: clone(cand), eval: candEval, iter: i };
-      }
-      if (isMountLegal(candEval) && (!bestSoftMount || betterByPriority(candEval, bestSoftMount.eval))) {
-        bestSoftMount = { lens: clone(cand), eval: candEval, iter: i };
-      }
-      if (isMountLegal(candEval) && (!bestIc || betterForIc(candEval, bestIc.eval))) {
-        bestIc = { lens: clone(cand), eval: candEval, iter: i };
-      }
-      if (isMountLegal(curEval) && (!bestIc || betterForIc(curEval, bestIc.eval))) {
-        bestIc = { lens: clone(cur), eval: curEval, iter: i };
-      }
-
-      // If stuck too long, force a guided reseed so we keep making measurable progress.
-      if (phaseNow === "ic" && stagnantIters > 420) {
-        const seedIc = bestIc?.lens || best?.lens || baseStart;
-        const bestIcM = evalPriorityMetrics(bestIc?.eval || curEval, priOpts);
-        const reseed = makeGuidedPhaseCandidate(seedIc, {
-          phase: "ic",
-          targetEfl,
-          targetT,
-          wavePreset,
-          icShortMm: Math.max(10, Number(bestIcM.icShort || icShortNow || 0)),
-          icTargetMm: Number(bestIcM.icTarget || icTargetNow || 0),
-        });
-        const reseedMut = mutateLens(reseed, mode, topo, {
-          efl: targetEfl,
-          t: targetT,
-          wavePreset,
-          phase: "ic",
-          icShortNow: Math.max(10, Number(bestIcM.icShort || icShortNow || 0)),
-          icTargetNow: Number(bestIcM.icTarget || icTargetNow || 0),
-        });
-        const reseedEval = evalLensMerit(reseedMut, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
-        if (betterForIc(reseedEval, curEval) || betterByPriority(reseedEval, curEval) || Math.random() < 0.18) {
-          cur = reseedMut;
-          curEval = reseedEval;
-        }
-        stagnantIters = 0;
-      } else if (phaseNow !== "ic" && stagnantIters > 950) {
-        const reseed = makeGuidedPhaseCandidate(best?.lens || baseStart, {
+      const guideSeed = (phaseBest[phaseNow] || bestRec || curRec || baseRec).lens;
+      addCandidate(
+        makeGuidedPhaseCandidate(guideSeed, {
           phase: phaseNow,
           targetEfl,
           targetT,
           wavePreset,
           icShortMm: Math.max(4, icShortNow),
           icTargetMm: icTargetNow,
-        });
-        const reseedEval = evalLensMerit(reseed, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
-        if (betterByPriority(reseedEval, curEval) || Math.random() < 0.15) {
-          cur = reseed;
-          curEval = reseedEval;
+        }),
+        `guided-${phaseNow}`
+      );
+
+      for (let p = 0; p < proposalsPerIter; p++) {
+        const seedRec = pickSeedRec(phaseNow);
+        let candLens;
+
+        if (phaseNow === "ic" && p < 2) {
+          const icPush = p === 0 ? 1.20 : 1.65;
+          const guided = makeGuidedPhaseCandidate(seedRec.lens, {
+            phase: "ic",
+            targetEfl,
+            targetT,
+            wavePreset,
+            icShortMm: Math.max(8, icShortNow * icPush),
+            icTargetMm: icTargetNow,
+          });
+          candLens = mutateLens(guided, mode, topo, {
+            efl: targetEfl,
+            t: targetT,
+            wavePreset,
+            phase: "ic",
+            icShortNow: Math.max(8, icShortNow * icPush),
+            icTargetNow,
+          });
+          if (p === 1) {
+            candLens = mutateLens(candLens, mode, topo, {
+              efl: targetEfl,
+              t: targetT,
+              wavePreset,
+              phase: "ic",
+              icShortNow: Math.max(10, icShortNow * 1.8),
+              icTargetNow,
+            });
+          }
+        } else if (phaseNow === "fl" && p === 0) {
+          const guided = makeGuidedPhaseCandidate(seedRec.lens, {
+            phase: "fl",
+            targetEfl,
+            targetT,
+            wavePreset,
+            icShortMm: icShortNow,
+            icTargetMm: icTargetNow,
+          });
+          candLens = mutateLens(guided, mode, topo, {
+            efl: targetEfl,
+            t: targetT,
+            wavePreset,
+            phase: "fl",
+            icShortNow,
+            icTargetNow,
+          });
+        } else if (phaseNow === "t" && p === 0) {
+          const guided = makeGuidedPhaseCandidate(seedRec.lens, {
+            phase: "t",
+            targetEfl,
+            targetT,
+            wavePreset,
+            icShortMm: icShortNow,
+            icTargetMm: icTargetNow,
+          });
+          candLens = mutateLens(guided, mode, topo, {
+            efl: targetEfl,
+            t: targetT,
+            wavePreset,
+            phase: "t",
+            icShortNow,
+            icTargetNow,
+          });
+        } else {
+          candLens = mutateLens(seedRec.lens, mode, topo, {
+            efl: targetEfl,
+            t: targetT,
+            wavePreset,
+            phase: phaseNow,
+            icShortNow,
+            icTargetNow,
+          });
+          if (phaseNow !== "fl" && Math.random() < 0.30) {
+            candLens = mutateLens(candLens, mode, topo, {
+              efl: targetEfl,
+              t: targetT,
+              wavePreset,
+              phase: phaseNow,
+              icShortNow,
+              icTargetNow,
+            });
+          }
         }
+        addCandidate(candLens, `mut-${p}`);
+      }
+
+      if (!candidates.length) continue;
+      candidates.sort((a, b) => phaseCmp(a.eval, b.eval, phaseNow));
+      const candBest = candidates[0];
+
+      const cmpCur = phaseCmp(candBest.eval, curRec.eval, phaseNow);
+      const exploreProb = baseExploreProb * Math.max(0.20, 1 - i / Math.max(1, iters));
+      if (cmpCur < 0 || Math.random() < exploreProb) {
+        curRec = candBest;
+      }
+
+      if (!phaseBest[phaseNow] || phaseCmp(candBest.eval, phaseBest[phaseNow].eval, phaseNow) < 0) {
+        phaseBest[phaseNow] = candBest;
+      }
+
+      const cmpBest = phaseCmp(candBest.eval, bestRec.eval, phaseNow);
+      if (cmpBest < 0) {
+        bestRec = candBest;
+        stagnantIters = 0;
+      } else {
+        const cmpCurBest = phaseCmp(curRec.eval, bestRec.eval, phaseNow);
+        if (cmpCurBest < 0) {
+          bestRec = curRec;
+          stagnantIters = 0;
+        } else {
+          stagnantIters++;
+        }
+      }
+
+      const merged = population.concat(candidates.slice(0, Math.min(popSize * 2, candidates.length)));
+      const seen = new Set();
+      const unique = [];
+      for (const rec of merged) {
+        const m = evalPriorityMetrics(rec.eval, priOpts);
+        const sig = [
+          Math.round(finiteOrHuge(m.flErr) * 100),
+          Math.round(finiteOrHuge(m.icShort) * 100),
+          Math.round(finiteOrHuge(m.tSlowErr) * 100),
+          Math.round(finiteOrHuge(rec.eval?.score) * 0.1),
+        ].join("|");
+        if (seen.has(sig)) continue;
+        seen.add(sig);
+        unique.push(rec);
+      }
+      unique.sort((a, b) => phaseCmp(a.eval, b.eval, phaseNow));
+      population = unique.slice(0, popSize);
+      if (!population.length) population = [bestRec];
+
+      const resetLimit =
+        phaseNow === "ic" ? 280 :
+        phaseNow === "t" ? 360 :
+        phaseNow === "fl" ? 420 : 700;
+      if (stagnantIters > resetLimit) {
+        const resetSeed = (phaseBest[phaseNow] || bestRec || baseRec).lens;
+        let reseed = makeGuidedPhaseCandidate(resetSeed, {
+          phase: phaseNow,
+          targetEfl,
+          targetT,
+          wavePreset,
+          icShortMm: Math.max(6, icShortNow),
+          icTargetMm: icTargetNow,
+        });
+        reseed = mutateLens(reseed, mode, topo, {
+          efl: targetEfl,
+          t: targetT,
+          wavePreset,
+          phase: phaseNow,
+          icShortNow: Math.max(6, icShortNow),
+          icTargetNow,
+        });
+        const reseedRec = makeRec(reseed, i, `reseed-${phaseNow}`);
+        curRec = reseedRec;
+        if (phaseCmp(reseedRec.eval, bestRec.eval, phaseNow) < 0) {
+          bestRec = reseedRec;
+        }
+        population.unshift(reseedRec);
+        population.sort((a, b) => phaseCmp(a.eval, b.eval, phaseNow));
+        population = population.slice(0, popSize);
         stagnantIters = 0;
       }
 
-      if (i % BATCH === 0){
+      if (i % BATCH === 0) {
         const tNow = performance.now();
         const dt = (tNow - tStart) / 1000;
         const ips = i / Math.max(1e-6, dt);
-        if (ui.optLog){
-          const bestRef = bestUsable ? best : bestSoft;
-          const bestLabel = bestUsable ? "best" : "best (no valid yet)";
-          const bestView = evalViewForLog(bestRef.lens, bestRef.eval, logCtx);
-          const bestIcView = evalViewForLog(bestIc.lens, bestIc.eval, logCtx);
-          const curView = evalViewForLog(cur, curEval, logCtx);
-          const curPhase = optimizerPhaseLabel(optimizerPhaseFromEval(curEval, priOpts));
-          const bestPhase = optimizerPhaseLabel(optimizerPhaseFromEval(bestRef.eval, priOpts));
+        if (ui.optLog) {
+          const bestView = evalViewForLog(bestRec.lens, bestRec.eval, logCtx);
+          const curView = evalViewForLog(curRec.lens, curRec.eval, logCtx);
+          const phaseView = optimizerPhaseLabel(phaseNow);
+          const locks = optimizerPhaseLocksV2(bestRec.eval, priOpts);
           setOptLog(
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
-            `phase ${curPhase}\n` +
-            `current ${curEval.score.toFixed(2)} • EFL ${fmtOptMm(curView.efl)} • T ${fmtOptNum(curView.T)} • ${icText(curView)}\n` +
-            `${priorityLine(curEval, priOpts)}\n` +
-            `${meritPartsLine(curEval?.breakdown)}\n` +
-            `${bestLabel} ${bestRef.eval.score.toFixed(2)} @${bestRef.iter}\n` +
-            `${bestLabel}-phase ${bestPhase}\n` +
-            `best: EFL ${fmtOptMm(bestView.efl)} • T ${fmtOptNum(bestView.T)} • COV ${bestView.covers?"YES":"NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n` +
-            `${priorityLine(bestRef.eval, priOpts)}\n` +
-            `${meritPartsLine(bestRef.eval?.breakdown)}\n` +
-            `best-IC @${bestIc.iter}: EFL ${fmtOptMm(bestIcView.efl)} • T ${fmtOptNum(bestIcView.T)} • COV ${bestIcView.covers?"YES":"NO"} • ${icText(bestIcView)} • INTR ${fmtOptMm(bestIcView.intrusion)}\n` +
-            `${priorityLine(bestIc.eval, priOpts)}\n`
+            `phase ${phaseView} • evals ${evalCount}\n` +
+            `current ${curRec.eval.score.toFixed(2)} • EFL ${fmtOptMm(curView.efl)} • T ${fmtOptNum(curView.T)} • ${icText(curView)}\n` +
+            `${priorityLine(curRec.eval, priOpts)}\n` +
+            `${meritPartsLine(curRec.eval?.breakdown)}\n` +
+            `best ${bestRec.eval.score.toFixed(2)} @${bestRec.iter}\n` +
+            `best: EFL ${fmtOptMm(bestView.efl)} • T ${fmtOptNum(bestView.T)} • COV ${bestView.covers ? "YES" : "NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n` +
+            `${priorityLine(bestRec.eval, priOpts)}\n` +
+            `${meritPartsLine(bestRec.eval?.breakdown)}\n` +
+            `locks: FL ${locks.flLocked ? "OK" : "NO"} • IC ${locks.icLocked ? "OK" : "NO"} • T ${locks.tLocked ? "OK" : "NO"} • stagn ${stagnantIters}\n`
           );
         }
-        // yield to UI
-        await new Promise(r => setTimeout(r, 0));
+        await new Promise((r) => setTimeout(r, 0));
       }
     }
 
-    if (!bestUsable) {
-      const usableSeeds = [];
-      if (baseUsable) usableSeeds.push({ lens: clone(baseStart), eval: baseEval, iter: 0 });
-      if (usableSeeds.length) {
-        usableSeeds.sort((a, b) => compareEvalByPriority(a.eval, b.eval, priOpts));
-        best = usableSeeds[0];
+    let finalRec = bestRec;
+    if (!isMountLegal(finalRec?.eval)) {
+      const fallbacks = [];
+      if (bestSoftMount) fallbacks.push(bestSoftMount);
+      for (const rec of population) if (isMountLegal(rec.eval)) fallbacks.push(rec);
+      if (isMountLegal(baseRec.eval)) fallbacks.push(baseRec);
+      if (fallbacks.length) {
+        fallbacks.sort((a, b) => compareEvalByPriority(a.eval, b.eval, priOpts));
+        finalRec = fallbacks[0];
       }
-      bestUsable = isUsable(best?.eval);
     }
 
-    if (!bestUsable) {
-      const fallbackCandidates = [];
-      if (bestSoftMount) fallbackCandidates.push(bestSoftMount);
-      if (bestIc && isMountLegal(bestIc.eval)) fallbackCandidates.push(bestIc);
-      if (isMountLegal(baseEval)) fallbackCandidates.push({ lens: clone(baseStart), eval: baseEval, iter: 0 });
-
-      const fallback = fallbackCandidates.sort((a, b) => compareEvalByPriority(a.eval, b.eval, priOpts))[0] || null;
-      optRunning = false;
-
-      const tEnd = performance.now();
-      const sec = (tEnd - tStart) / 1000;
-      if (!fallback) {
-        optBest = null;
-        if (ui.optLog){
-          const curView = evalViewForLog(cur, curEval, logCtx);
-          const curPhase = optimizerPhaseLabel(optimizerPhaseFromEval(curEval, priOpts));
-          setOptLog(
-            `done ${iters}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
-            `NO mount-legal design found (everything ends behind PL flange).\n` +
-            `phase ${curPhase}\n` +
-            `Current: EFL ${fmtOptMm(curView.efl)} • T ${fmtOptNum(curView.T)} • ${icText(curView)} • INTR ${fmtOptMm(curView.intrusion)}\n` +
-            `${priorityLine(curEval, priOpts)}\n` +
-            `${meritPartsLine(curEval?.breakdown)}\n`
-          );
-        }
-        toast("Optimize done: no mount-legal candidate");
-        return;
-      }
-
-      const fallbackView = evalViewForLog(fallback.lens, fallback.eval, logCtx);
-      optBest = fallback;
-      if (ui.optLog){
-        const fbPhase = optimizerPhaseLabel(optimizerPhaseFromEval(fallback.eval, priOpts));
-        setOptLog(
-          `done ${iters}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
-          `NO fully valid design found for current constraints (but mount-legal fallback found).\n` +
-          `Closest mount-legal candidate:\n` +
-          `phase ${fbPhase}\n` +
-          `EFL ${fmtOptMm(fallbackView.efl)} (target ${targetEfl})\n` +
-          `T ${fmtOptNum(fallbackView.T)} (target ${targetT})\n` +
-          `COV ${fallbackView.covers?"YES":"NO"} • ${icText(fallbackView)} • INTR ${fmtOptMm(fallbackView.intrusion)}\n` +
-          `${priorityLine(fallback.eval, priOpts)}\n` +
-          `${meritPartsLine(fallback.eval?.breakdown)}\n` +
-          `You can still click “Apply best” to inspect this closest candidate.\n`
-        );
-      }
-      toast("Optimize done: mount-legal fallback saved");
-      return;
-    }
-
-    optBest = best;
+    optBest = finalRec
+      ? { lens: clone(finalRec.lens), eval: finalRec.eval, iter: finalRec.iter }
+      : null;
     optRunning = false;
 
     const tEnd = performance.now();
     const sec = (tEnd - tStart) / 1000;
-    if (ui.optLog){
-      const bestView = evalViewForLog(best.lens, best.eval, logCtx);
-      const bestPhase = optimizerPhaseLabel(optimizerPhaseFromEval(best.eval, priOpts));
-      setOptLog(
-        `done ${best.iter}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
-        `phase ${bestPhase}\n` +
-        `BEST score ${best.eval.score.toFixed(2)}\n` +
-        `EFL ${fmtOptMm(bestView.efl)} (target ${targetEfl})\n` +
-        `T ${fmtOptNum(bestView.T)} (target ${targetT})\n` +
-        `COV ${bestView.covers?"YES":"NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n` +
-        `${priorityLine(best.eval, priOpts)}\n` +
-        `${meritPartsLine(best.eval?.breakdown)}\n` +
-        `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
-        `Click “Apply best” to load.`
-      );
+    if (ui.optLog) {
+      if (!finalRec) {
+        setOptLog(
+          `done ${iters}/${iters}  (${(iters / Math.max(1e-6, sec)).toFixed(1)} it/s)\n` +
+          `No valid candidate found.\n` +
+          `phase ${optimizerPhaseLabel(optimizerPhaseFromEvalV2(bestRec.eval, priOpts))} • evals ${evalCount}\n`
+        );
+      } else {
+        const bestView = evalViewForLog(finalRec.lens, finalRec.eval, logCtx);
+        const finalPhase = optimizerPhaseLabel(optimizerPhaseFromEvalV2(finalRec.eval, priOpts));
+        const locks = optimizerPhaseLocksV2(finalRec.eval, priOpts);
+        setOptLog(
+          `done ${finalRec.iter}/${iters}  (${(iters / Math.max(1e-6, sec)).toFixed(1)} it/s)\n` +
+          `phase ${finalPhase} • evals ${evalCount}\n` +
+          `BEST score ${finalRec.eval.score.toFixed(2)}\n` +
+          `EFL ${fmtOptMm(bestView.efl)} (target ${targetEfl})\n` +
+          `T ${fmtOptNum(bestView.T)} (target ${targetT})\n` +
+          `COV ${bestView.covers ? "YES" : "NO"} • ${icText(bestView)} • INTR ${fmtOptMm(bestView.intrusion)}\n` +
+          `${priorityLine(finalRec.eval, priOpts)}\n` +
+          `${meritPartsLine(finalRec.eval?.breakdown)}\n` +
+          `locks: FL ${locks.flLocked ? "OK" : "NO"} • IC ${locks.icLocked ? "OK" : "NO"} • T ${locks.tLocked ? "OK" : "NO"}\n` +
+          `RMS0 ${finalRec.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${finalRec.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
+          `Click “Apply best” to load.`
+        );
+      }
     }
 
     toast(optBest ? `Optimize done. Best merit ${optBest.eval.score.toFixed(2)}` : "Optimize stopped");
