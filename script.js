@@ -1017,6 +1017,7 @@
     let pts = [];
     let vignetted = false;
     let tir = false;
+    let clippedByMount = false;
 
     pts.push({ x: ray.p.x, y: ray.p.y });
 
@@ -1034,7 +1035,7 @@
       const mountHit = (!skipIMS && nBefore <= 1.000001)
         ? mountClipHitAlongRay(ray, hitInfo?.t ?? Infinity)
         : null;
-      if (mountHit) { pts.push(mountHit.hit); vignetted = true; break; }
+      if (mountHit) { pts.push(mountHit.hit); vignetted = true; clippedByMount = true; break; }
 
       if (!hitInfo) { vignetted = true; break; }
 
@@ -1062,7 +1063,7 @@
       nBefore = nAfter;
     }
 
-    return { pts, vignetted, tir, endRay: ray };
+    return { pts, vignetted, tir, clippedByMount, endRay: ray };
   }
 
   // -------------------- ray bundles --------------------
@@ -1230,6 +1231,7 @@
   const IMG_CIRCLE_CFG = {
     subtleVignetteFrac: 0.12, // allow slight edge falloff, reject clear hard cutoff
     minValidFrac: 0.55,       // enough rays must remain to consider field usable
+    maxMountClipFrac: 0.04,   // mount/throat clipping is treated stricter than normal shading
     maxFieldDeg: 60,
     coarseStepDeg: 1.5,
     refineIters: 10,
@@ -1245,39 +1247,71 @@
     return defaultTargetImageCircleMm(sensorW, sensorH);
   }
 
-  function bundleCenterHalfHeightMm(traces, sensorX) {
-    const ys = [];
-    for (const tr of traces || []) {
-      if (!tr || tr.vignetted || tr.tir || !tr.endRay) continue;
+  function medianAbs(values) {
+    if (!Array.isArray(values) || !values.length) return null;
+    const arr = values.map((v) => Math.abs(v)).filter(Number.isFinite).sort((a, b) => a - b);
+    if (!arr.length) return null;
+    const mid = (arr.length - 1) * 0.5;
+    const lo = Math.floor(mid);
+    const hi = Math.ceil(mid);
+    return (arr[lo] + arr[hi]) * 0.5;
+  }
+
+  function traceIcBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX, opts = {}) {
+    const minRays = Math.max(9, Number(opts.minRays || 31));
+    const maxRays = Math.max(minRays, Number(opts.maxRays || 41));
+    const n = Math.max(minRays, Math.min(maxRays, (rayCount | 0)));
+    const rays = buildRays(surfaces, fieldDeg, n);
+    const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
+
+    let vignettedCount = 0;
+    let validCount = 0;
+    let mountCount = 0;
+    const yHits = [];
+
+    for (const tr of traces) {
+      if (!tr || !tr.endRay || tr.tir) continue;
+      validCount++;
+      if (tr.clippedByMount) mountCount++;
+      if (tr.vignetted) {
+        vignettedCount++;
+        continue;
+      }
       const y = rayHitYAtX(tr.endRay, sensorX);
-      if (Number.isFinite(y)) ys.push(y);
+      if (Number.isFinite(y)) yHits.push(y);
     }
-    if (!ys.length) return null;
-    ys.sort((a, b) => a - b);
-    const mid = (ys.length - 1) * 0.5;
-    const lo = Math.floor(mid), hi = Math.ceil(mid);
-    const yMed = (ys[lo] + ys[hi]) * 0.5;
-    return Math.abs(yMed);
+
+    const halfSizeMm = medianAbs(yHits);
+    return {
+      total: n,
+      traces,
+      validCount,
+      vignettedCount,
+      mountCount,
+      validFrac: validCount / Math.max(1, n),
+      vigFrac: vignettedCount / Math.max(1, n),
+      mountFrac: mountCount / Math.max(1, n),
+      halfSizeMm,
+      goodHitCount: yHits.length,
+    };
   }
 
   function imageCircleEdgeSample(surfaces, fieldDeg, rayCount, wavePreset, sensorX, opts = {}) {
-    const minRays = Math.max(9, Number(opts.minRays || 15));
-    const maxRays = Math.max(minRays, Number(opts.maxRays || 41));
-    const sampleRays = Math.max(minRays, Math.min(maxRays, (rayCount | 0)));
-    const pack = traceBundleAtField(surfaces, fieldDeg, sampleRays, wavePreset, sensorX);
-    const validFrac = pack.n / Math.max(1, sampleRays);
+    const pack = traceIcBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX, opts);
     const maxVig = Number.isFinite(opts.subtleVignetteFrac) ? opts.subtleVignetteFrac : IMG_CIRCLE_CFG.subtleVignetteFrac;
     const minValid = Number.isFinite(opts.minValidFrac) ? opts.minValidFrac : IMG_CIRCLE_CFG.minValidFrac;
-    if (pack.vigFrac > maxVig) return null;
-    if (validFrac < minValid) return null;
+    const maxMount = Number.isFinite(opts.maxMountClipFrac) ? opts.maxMountClipFrac : IMG_CIRCLE_CFG.maxMountClipFrac;
 
-    const halfByCenter = bundleCenterHalfHeightMm(pack.traces, sensorX);
-    if (!Number.isFinite(halfByCenter)) return null;
+    if (pack.validFrac < minValid) return null;
+    if (pack.vigFrac > maxVig) return null;
+    if (pack.mountFrac > maxMount) return null;
+    if (!Number.isFinite(pack.halfSizeMm) || pack.goodHitCount < 5) return null;
 
     return {
-      halfSizeMm: Math.abs(halfByCenter),
+      halfSizeMm: Math.abs(pack.halfSizeMm),
       vigFrac: pack.vigFrac,
-      validFrac,
+      validFrac: pack.validFrac,
+      mountFrac: pack.mountFrac,
       fieldDeg,
     };
   }
@@ -1289,15 +1323,7 @@
     let loField = 0;
     let hiField = step;
     let best = imageCircleEdgeSample(surfaces, 0, rayCount, wavePreset, sensorX, opts);
-    if (!best) {
-      // center fallback: if center already has heavy clipping, still report a conservative non-zero IC
-      best = imageCircleEdgeSample(surfaces, 0, rayCount, wavePreset, sensorX, {
-        ...opts,
-        subtleVignetteFrac: 0.60,
-        minValidFrac: 0.20,
-      });
-    }
-    if (!best) return { diameterMm: 0, halfSizeMm: 0, edgeFieldDeg: 0, vigFrac: 1, validFrac: 0 };
+    if (!best) return { diameterMm: 0, halfSizeMm: 0, edgeFieldDeg: 0, vigFrac: 1, validFrac: 0, mountFrac: 1 };
 
     for (let f = step; f <= hiMax + 1e-9; f += step) {
       const sample = imageCircleEdgeSample(surfaces, f, rayCount, wavePreset, sensorX, opts);
@@ -1321,13 +1347,14 @@
       }
     }
 
-    if (!best || !Number.isFinite(best.halfSizeMm)) return null;
+    if (!best || !Number.isFinite(best.halfSizeMm)) return { diameterMm: 0, halfSizeMm: 0, edgeFieldDeg: 0, vigFrac: 1, validFrac: 0, mountFrac: 1 };
     return {
       diameterMm: Math.max(0, best.halfSizeMm * 2),
       halfSizeMm: best.halfSizeMm,
       edgeFieldDeg: best.fieldDeg,
       vigFrac: best.vigFrac,
       validFrac: best.validFrac,
+      mountFrac: best.mountFrac,
     };
   }
 
@@ -2786,10 +2813,10 @@
     const phys = evaluatePhysicalConstraints(surfaces);
     const imageCircle = estimateImageCircleMm(surfaces, wavePreset, sensorX, rayCount, {
       maxFieldDeg: 55,
-      coarseStepDeg: 4.0,
-      refineIters: 4,
-      minRays: 11,
-      maxRays: 23,
+      coarseStepDeg: 2.0,
+      refineIters: 8,
+      minRays: 31,
+      maxRays: 41,
     });
     const imageCircleMm = imageCircle?.diameterMm ?? null;
 
