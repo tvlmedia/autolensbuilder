@@ -1309,15 +1309,26 @@
     const target = Math.max(0, Number(rTargetMm || 0));
     const maxField = Math.max(5, Number(cfg.maxFieldDeg || 60));
     const iters = Math.max(8, Number(cfg.solveIters || 20) | 0);
+    const step = Math.max(0.25, Number(cfg.fieldStepDeg || 1.0));
 
     if (target <= 1e-9) return 0;
 
     let lo = 0;
-    let hi = maxField;
     let yLo = chiefSensorRadiusAtFieldDeg(surfaces, lo, wavePreset, sensorX);
-    let yHi = chiefSensorRadiusAtFieldDeg(surfaces, hi, wavePreset, sensorX);
     if (!Number.isFinite(yLo)) return null;
-    if (!Number.isFinite(yHi) || yHi < target) return null;
+
+    let hi = null;
+    for (let th = step; th <= maxField + 1e-9; th += step) {
+      const y = chiefSensorRadiusAtFieldDeg(surfaces, th, wavePreset, sensorX);
+      if (!Number.isFinite(y)) continue;
+      if (y >= target) {
+        hi = th;
+        break;
+      }
+      lo = th;
+      yLo = y;
+    }
+    if (!Number.isFinite(hi)) return null;
 
     for (let i = 0; i < iters; i++) {
       const mid = 0.5 * (lo + hi);
