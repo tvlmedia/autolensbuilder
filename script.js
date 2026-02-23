@@ -2805,10 +2805,16 @@
     bflWeight: 2400.0,
     covWeight: 1400.0,
     focusTravelWeight: 40.0,
+    centerRmsWeight: 3400.0,
+    centerRmsMaxInf: 0.16,
+    centerRmsMaxNear: 0.20,
+    midRmsWeight: 900.0,
+    midRmsMaxInf: 0.32,
+    midRmsMaxNear: 0.38,
     guardFailPenalty: 900000.0,
     maxSurfaceCount: 32,
   };
-  const AD_BUILD_TAG = "v2-rescue-r6";
+  const AD_BUILD_TAG = "v2-rescue-r9";
 
   const AD_GLASS_CLASSES = {
     CROWN: ["N-BK7HT", "N-BAK4", "N-BAK2", "N-K5", "N-PSK3", "N-SK14"],
@@ -3913,6 +3919,17 @@
       ? (noHardVigInf && noHardVigNear)
       : (focusTarget === "near" ? noHardVigNear : noHardVigInf);
 
+    const centerInfOk = Number.isFinite(focusInf.rmsCenter) && focusInf.rmsCenter <= Number(cfg.centerRmsMaxInf || 0.16);
+    const centerNearOk = Number.isFinite(focusNear.rmsCenter) && focusNear.rmsCenter <= Number(cfg.centerRmsMaxNear || 0.20);
+    const midInfOk = Number.isFinite(focusInf.rmsMid) && focusInf.rmsMid <= Number(cfg.midRmsMaxInf || 0.32);
+    const midNearOk = Number.isFinite(focusNear.rmsMid) && focusNear.rmsMid <= Number(cfg.midRmsMaxNear || 0.38);
+    const centerSpotOk = focusTarget === "both"
+      ? (centerInfOk && centerNearOk)
+      : (focusTarget === "near" ? centerNearOk : centerInfOk);
+    const midSpotOk = focusTarget === "both"
+      ? (midInfOk && midNearOk)
+      : (focusTarget === "near" ? midNearOk : midInfOk);
+
     const reasons = [];
     if (phys.hardFail) reasons.push("PHYS");
     if (!intrusionOk) reasons.push("INTRUSION");
@@ -3921,6 +3938,8 @@
     if (!icOk) reasons.push("IC");
     if (!noHardVig) reasons.push("VIG");
     if (!focusOk) reasons.push("FOCUS");
+    if (!centerSpotOk) reasons.push("FOCUS_SPOT");
+    if (!midSpotOk) reasons.push("MID_SPOT");
     if (!eflOk) reasons.push("EFL");
     if (!tOk) reasons.push("T");
     if (!eflSignOk) reasons.push("EFL_SIGN");
@@ -3945,6 +3964,21 @@
       score += cfg.vigWeight * Number(focusInf.edgeVigFrac || 1);
     }
     score += cfg.physWeight * Math.max(0, Number(phys.penalty || 0));
+
+    const cInf = Number(focusInf.rmsCenter);
+    const cNear = Number(focusNear.rmsCenter);
+    const mInf = Number(focusInf.rmsMid);
+    const mNear = Number(focusNear.rmsMid);
+    const cInfMax = Number(cfg.centerRmsMaxInf || 0.16);
+    const cNearMax = Number(cfg.centerRmsMaxNear || 0.20);
+    const mInfMax = Number(cfg.midRmsMaxInf || 0.32);
+    const mNearMax = Number(cfg.midRmsMaxNear || 0.38);
+    if (Number.isFinite(cInf)) score += Number(cfg.centerRmsWeight || 0) * Math.max(0, cInf - cInfMax) ** 2;
+    else score += Number(cfg.centerRmsWeight || 0) * 0.9;
+    if (Number.isFinite(cNear)) score += Number(cfg.centerRmsWeight || 0) * 0.75 * Math.max(0, cNear - cNearMax) ** 2;
+    else score += Number(cfg.centerRmsWeight || 0) * 0.7;
+    if (Number.isFinite(mInf)) score += Number(cfg.midRmsWeight || 0) * Math.max(0, mInf - mInfMax) ** 2;
+    if (Number.isFinite(mNear)) score += Number(cfg.midRmsWeight || 0) * 0.75 * Math.max(0, mNear - mNearMax) ** 2;
 
     if (Number.isFinite(eflErrFrac)) score += cfg.eflWeight * eflErrFrac * eflErrFrac;
     else score += cfg.eflWeight;
@@ -4289,6 +4323,31 @@
     if (Number.isFinite(vigNear) && vigNear > 0.60) r += (vigNear - 0.60) * 260_000_000;
     const icDiag = Number(ev?.icDiag);
     if (!Number.isFinite(icDiag) || icDiag < 6.0) r += 260_000_000 + (Number.isFinite(icDiag) ? (6 - icDiag) * 25_000_000 : 0);
+    const targetEfl = Math.max(1, Number(cfg?.targetEfl || 50));
+    if (Number.isFinite(efl) && efl > 0) {
+      const eflErrFrac = Math.abs(efl - targetEfl) / targetEfl;
+      r += 260_000_000 * eflErrFrac * eflErrFrac;
+      if (eflErrFrac > 0.60) r += 300_000_000 * (eflErrFrac - 0.60);
+    }
+    const targetT = Math.max(0.4, Number(cfg?.targetT || 2.0));
+    if (Number.isFinite(t) && t > 0.1) {
+      const tSlow = Math.max(0, (t - targetT) / targetT);
+      const tFast = Math.max(0, (targetT - t) / targetT);
+      r += 220_000_000 * tSlow * tSlow + 60_000_000 * tFast * tFast;
+      if (tSlow > 0.45) r += 180_000_000 * (tSlow - 0.45);
+    }
+    const cInf = Number(ev?.focusInf?.rmsCenter);
+    const cNear = Number(ev?.focusNear?.rmsCenter);
+    const cInfMax = Number(cfg?.centerRmsMaxInf || 0.16);
+    const cNearMax = Number(cfg?.centerRmsMaxNear || 0.20);
+    if (!Number.isFinite(cInf) || cInf > cInfMax) {
+      const d = Number.isFinite(cInf) ? (cInf - cInfMax) : 0.8;
+      r += 180_000_000 * d * d + 120_000_000;
+    }
+    if (!Number.isFinite(cNear) || cNear > cNearMax) {
+      const d = Number.isFinite(cNear) ? (cNear - cNearMax) : 0.8;
+      r += 170_000_000 * d * d + 100_000_000;
+    }
     return r;
   }
 
@@ -4390,6 +4449,7 @@
     let curEval = adEvaluateCandidate(cur, cfg, { quick: false });
     cur = curEval.lens;
     let bestValid = curEval.valid ? { lens: clone(curEval.lens), eval: curEval, iter: 0 } : null;
+    let bestInvalid = curEval.valid ? null : { lens: clone(curEval.lens), eval: curEval, iter: 0 };
     let bestAny = { lens: clone(curEval.lens), eval: curEval, iter: 0 };
     let topo = adCaptureTopology(cur);
     let invalidStreak = curEval.valid ? 0 : 1;
@@ -4432,6 +4492,8 @@
 
       if (candEval.valid && (!bestValid || candEval.score < bestValid.eval.score)) {
         bestValid = { lens: clone(candEval.lens), eval: candEval, iter };
+      } else if (!candEval.valid && (!bestInvalid || adNearRank(candEval, cfg) < adNearRank(bestInvalid.eval, cfg))) {
+        bestInvalid = { lens: clone(candEval.lens), eval: candEval, iter };
       }
 
       if (curEval.score < bestAny.eval.score) {
@@ -4440,13 +4502,15 @@
 
       if (curEval.valid && (!bestValid || curEval.score < bestValid.eval.score)) {
         bestValid = { lens: clone(curEval.lens), eval: curEval, iter };
+      } else if (!curEval.valid && (!bestInvalid || adNearRank(curEval, cfg) < adNearRank(bestInvalid.eval, cfg))) {
+        bestInvalid = { lens: clone(curEval.lens), eval: curEval, iter };
       }
 
       invalidStreak = curEval.valid ? 0 : (invalidStreak + 1);
       if (invalidStreak >= cfg.invalidRestartEvery) {
         const seedBase = bestValid?.lens
           ? clone(bestValid.lens)
-          : (bestAny?.lens ? clone(bestAny.lens) : clone(seedItem.lens));
+          : (bestInvalid?.lens ? clone(bestInvalid.lens) : (bestAny?.lens ? clone(bestAny.lens) : clone(seedItem.lens)));
         cur = adConditionSeedLens(seedBase, cfg);
         curEval = adEvaluateCandidate(cur, cfg, { quick: true });
         cur = curEval.lens;
@@ -4463,7 +4527,7 @@
       }
     }
 
-    return bestValid || bestAny || { lens: clone(curEval.lens || cur), eval: curEval, iter: cfg.optimizeIters };
+    return bestValid || bestInvalid || bestAny || { lens: clone(curEval.lens || cur), eval: curEval, iter: cfg.optimizeIters };
   }
 
   async function adRescueInvalidBest(bestItem, cfg) {
@@ -4504,19 +4568,31 @@
         candEval = adEvaluateCandidate(m.lens, cfg, { quick: (iter % 5) !== 0 });
       }
 
-      if (
-        candEval.score < curEval.score ||
-        (candEval.valid && !curEval.valid)
-      ) {
+      if (candEval.valid && !curEval.valid) {
         curEval = candEval;
         curLens = candEval.lens;
+      } else if (candEval.valid && curEval.valid) {
+        if (candEval.score < curEval.score) {
+          curEval = candEval;
+          curLens = candEval.lens;
+        }
+      } else if (!candEval.valid && !curEval.valid) {
+        if (adNearRank(candEval, cfg) < adNearRank(curEval, cfg)) {
+          curEval = candEval;
+          curLens = candEval.lens;
+        }
       }
 
-      if (
-        candEval.score < best.eval.score ||
-        (candEval.valid && !best.eval.valid)
-      ) {
+      if (candEval.valid && !best.eval.valid) {
         best = { lens: clone(candEval.lens), eval: candEval, iter };
+      } else if (candEval.valid && best.eval.valid) {
+        if (candEval.score < best.eval.score) {
+          best = { lens: clone(candEval.lens), eval: candEval, iter };
+        }
+      } else if (!candEval.valid && !best.eval.valid) {
+        if (adNearRank(candEval, cfg) < adNearRank(best.eval, cfg)) {
+          best = { lens: clone(candEval.lens), eval: candEval, iter };
+        }
       }
 
       if (best.eval.valid) break;
@@ -4635,10 +4711,15 @@
       const hasTrueValid = seedPool.some((x) => !!x?.eval?.valid);
       const isUsableNear = (ev) => {
         if (!ev) return false;
+        const targetE = Math.max(1, Number(cfg.targetEfl || 50));
         const e = Number(ev.efl);
         const ic = Number(ev.icDiag);
         const vf = Number(ev.focusNear?.validFrac ?? ev.focusInf?.validFrac);
+        const tVal = Number(ev.T);
         if (!Number.isFinite(e) || e <= 1) return false;
+        const eFrac = Math.abs(e - targetE) / targetE;
+        if (eFrac > 0.95) return false;
+        if (Number.isFinite(tVal) && tVal > Number(cfg.targetT || 2.0) * 2.2) return false;
         if (!Number.isFinite(ic) || ic < 4) return false;
         if (Number.isFinite(vf) && vf < 0.08) return false;
         return true;
@@ -4670,15 +4751,21 @@
       if (trueValidCount === 0) appendADLog("Stage A note: using near-ranked fallback candidates (no strictly valid seed yet).");
       appendADLog(`Stage B: optimize top ${topSeeds.length} seeds...`);
 
-      let globalBest = null;
+      let bestValid = null;
+      let bestNear = null;
       for (let i = 0; i < topSeeds.length; i++) {
         if (!adRunning) break;
         appendADLog(`--- Seed ${i + 1}/${topSeeds.length} (${topSeeds[i].family}) ---`);
         const out = await adOptimizeSeed(topSeeds[i], cfg, i + 1, topSeeds.length);
         appendADLog(`Seed ${i + 1} done: ${adFormatEval(out.eval)}`);
 
-        if (!globalBest || out.eval.score < globalBest.eval.score) globalBest = out;
+        if (out?.eval?.valid) {
+          if (!bestValid || out.eval.score < bestValid.eval.score) bestValid = out;
+        } else {
+          if (!bestNear || adNearRank(out.eval, cfg) < adNearRank(bestNear.eval, cfg)) bestNear = out;
+        }
       }
+      let globalBest = bestValid || bestNear;
 
       if (!adRunning) return;
       if (!globalBest) {
@@ -4693,7 +4780,19 @@
         appendADLog("Stage C: rescue invalid best candidate...");
         const rescued = await adRescueInvalidBest(globalBest, cfg);
         if (!adRunning) return;
-        if (rescued?.eval && (rescued.eval.valid || rescued.eval.score < globalBest.eval.score)) {
+        if (
+          rescued?.eval && (
+            rescued.eval.valid ||
+            (
+              !globalBest.eval.valid &&
+              adNearRank(rescued.eval, cfg) < adNearRank(globalBest.eval, cfg)
+            ) ||
+            (
+              globalBest.eval.valid &&
+              rescued.eval.score < globalBest.eval.score
+            )
+          )
+        ) {
           globalBest = rescued;
           adBest = rescued;
           appendADLog(`Rescue done: ${adFormatEval(rescued.eval)}`);
