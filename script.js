@@ -32,7 +32,6 @@
     bfl: $("#badgeBfl"),
     tstop: $("#badgeT"),
     vig: $("#badgeVig"),
-    imgCircle: $("#badgeIC"),
     dist: $("#badgeDist"),
     fov: $("#badgeFov"),
     merit: $("#badgeMerit"),
@@ -43,7 +42,6 @@
     eflTop: $("#badgeEflTop"),
     bflTop: $("#badgeBflTop"),
     tstopTop: $("#badgeTTop"),
-    imgCircleTop: $("#badgeICTop"),
     fovTop: $("#badgeFovTop"),
     distTop: $("#badgeDistTop"),
     meritTop: $("#badgeMeritTop"),
@@ -83,7 +81,6 @@
     // Optimizer
     optTargetFL: $("#optTargetFL"),
     optTargetT: $("#optTargetT"),
-    optTargetIC: $("#optTargetIC"),
     optIters: $("#optIters"),
     optPop: $("#optPop"),
     optLog: $("#optLog"),
@@ -1017,7 +1014,6 @@
     let pts = [];
     let vignetted = false;
     let tir = false;
-    let clippedByMount = false;
 
     pts.push({ x: ray.p.x, y: ray.p.y });
 
@@ -1035,7 +1031,7 @@
       const mountHit = (!skipIMS && nBefore <= 1.000001)
         ? mountClipHitAlongRay(ray, hitInfo?.t ?? Infinity)
         : null;
-      if (mountHit) { pts.push(mountHit.hit); vignetted = true; clippedByMount = true; break; }
+      if (mountHit) { pts.push(mountHit.hit); vignetted = true; break; }
 
       if (!hitInfo) { vignetted = true; break; }
 
@@ -1063,7 +1059,7 @@
       nBefore = nAfter;
     }
 
-    return { pts, vignetted, tir, clippedByMount, endRay: ray };
+    return { pts, vignetted, tir, endRay: ray };
   }
 
   // -------------------- ray bundles --------------------
@@ -1199,6 +1195,35 @@
     return Number.isFinite(T) ? T : null;
   }
 
+  function measureCenterThroughput(surfaces, wavePreset, sensorX, rayCount = 41) {
+    const rays = buildRays(surfaces, 0, rayCount);
+    let good = 0;
+    const total = rays.length;
+
+    for (const r of rays) {
+      const tr = traceRayForward(clone(r), surfaces, wavePreset);
+      if (!tr || tr.vignetted || tr.tir || !tr.endRay) continue;
+      const y = rayHitYAtX(tr.endRay, sensorX);
+      if (Number.isFinite(y)) good++;
+    }
+
+    const goodFrac = clamp(good / Math.max(1, total), 1e-6, 1.0);
+    return { good, total, goodFrac };
+  }
+
+  function estimateEffectiveT(tGeom, goodFrac0) {
+    if (!Number.isFinite(tGeom) || tGeom <= 0) return null;
+    const g = clamp(Number(goodFrac0 || 0), 1e-6, 1.0);
+    const tEff = tGeom / Math.sqrt(g);
+    return Number.isFinite(tEff) ? tEff : null;
+  }
+
+  function tLossStops(tEff, tGeom) {
+    if (!Number.isFinite(tEff) || !Number.isFinite(tGeom) || tEff <= 0 || tGeom <= 0) return null;
+    const ds = Math.log2(tEff / tGeom);
+    return Number.isFinite(ds) ? ds : null;
+  }
+
   // -------------------- FOV --------------------
   function deg2rad(d) { return (d * Math.PI) / 180; }
   function rad2deg(r) { return (r * 180) / Math.PI; }
@@ -1226,252 +1251,6 @@
     if (mode === "v") return Math.max(0.1, sensorH * 0.5);
     const d = Math.hypot(sensorW, sensorH);
     return Math.max(0.1, d * 0.5);
-  }
-
-  const IMG_CIRCLE_CFG = {
-    sampleCount: 15,
-    raysPerBundle: 41,
-    maxFieldDeg: 60,
-    thetaSolveIters: 20,
-    thetaCoarseStepDeg: 2.0,
-    illumThreshold: 0.20,
-    mountMaxFrac: 0.03,
-    hardVigFrac: 0.35,
-    hardMountMaxFrac: 0.015,
-    // fallback pass/fail gate to avoid calling severe clipping "acceptable"
-    subtleVignetteFrac: 0.12,
-    minValidFrac: 0.55,
-    illumExponent: 1.0, // >1 makes edge stricter (good/total)^exp
-    centerRadiusTolMm: 0.5,
-    centerGoodMin: 0.30,
-  };
-
-  function defaultTargetImageCircleMm(sensorW, sensorH) {
-    return Math.hypot(sensorW, sensorH);
-  }
-
-  function getTargetImageCircleMm(sensorW, sensorH) {
-    const v = num(ui.optTargetIC?.value, NaN);
-    if (Number.isFinite(v) && v > 0.1) return v;
-    return defaultTargetImageCircleMm(sensorW, sensorH);
-  }
-
-  function medianAbs(values) {
-    if (!Array.isArray(values) || !values.length) return null;
-    const arr = values.map((v) => Math.abs(v)).filter(Number.isFinite).sort((a, b) => a - b);
-    if (!arr.length) return null;
-    const mid = (arr.length - 1) * 0.5;
-    const lo = Math.floor(mid);
-    const hi = Math.ceil(mid);
-    return (arr[lo] + arr[hi]) * 0.5;
-  }
-
-  function traceIcBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX, opts = {}) {
-    const desired = Math.max(9, Number(opts.raysPerBundle || IMG_CIRCLE_CFG.raysPerBundle));
-    const n = Math.max(9, Math.min(101, Number.isFinite(desired) ? (desired | 0) : (rayCount | 0)));
-    const rays = buildRays(surfaces, fieldDeg, n);
-    const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
-
-    let vignettedCount = 0;
-    let validCount = 0;
-    let mountCount = 0;
-    let goodCount = 0;
-    const yHits = [];
-
-    for (const tr of traces) {
-      if (!tr || !tr.endRay || tr.tir) continue;
-      validCount++;
-      if (tr.clippedByMount) mountCount++;
-      if (tr.vignetted) {
-        vignettedCount++;
-        continue;
-      }
-      goodCount++;
-      const y = rayHitYAtX(tr.endRay, sensorX);
-      if (Number.isFinite(y)) yHits.push(y);
-    }
-
-    const halfSizeMm = medianAbs(yHits);
-    return {
-      total: n,
-      traces,
-      validCount,
-      goodCount,
-      vignettedCount,
-      mountCount,
-      validFrac: validCount / Math.max(1, n),
-      goodFrac: goodCount / Math.max(1, n),
-      vigFrac: vignettedCount / Math.max(1, n),
-      mountFrac: mountCount / Math.max(1, n),
-      halfSizeMm,
-      goodHitCount: yHits.length,
-    };
-  }
-
-  function chiefSensorRadiusAtField(surfaces, fieldDeg, wavePreset, sensorX) {
-    const chief = buildChiefRay(surfaces, fieldDeg);
-    const tr = traceRayForward(clone(chief), surfaces, wavePreset);
-    if (!tr || !tr.endRay || tr.tir || tr.vignetted) return { ok: false, radiusMm: null };
-    const y = rayHitYAtX(tr.endRay, sensorX);
-    if (!Number.isFinite(y)) return { ok: false, radiusMm: null };
-    return { ok: true, radiusMm: Math.abs(y) };
-  }
-
-  function findFieldDegForRadius(surfaces, rTargetMm, wavePreset, sensorX, opts = {}) {
-    const maxField = Math.max(1, Number(opts.maxFieldDeg || IMG_CIRCLE_CFG.maxFieldDeg));
-    const step = Math.max(0.25, Number(opts.thetaCoarseStepDeg || IMG_CIRCLE_CFG.thetaCoarseStepDeg));
-    const iters = Math.max(8, Number(opts.thetaSolveIters || IMG_CIRCLE_CFG.thetaSolveIters));
-    const target = Math.max(0, Number(rTargetMm || 0));
-
-    const e0 = chiefSensorRadiusAtField(surfaces, 0, wavePreset, sensorX);
-    if (!e0.ok) return null;
-    if (target <= 1e-6) return 0;
-
-    let loDeg = 0;
-    let loEval = e0;
-    let hiDeg = null;
-    let hiEval = null;
-
-    for (let f = step; f <= maxField + 1e-9; f += step) {
-      const e = chiefSensorRadiusAtField(surfaces, f, wavePreset, sensorX);
-      if (!e.ok) break;
-      if (e.radiusMm >= target) {
-        hiDeg = f;
-        hiEval = e;
-        break;
-      }
-      loDeg = f;
-      loEval = e;
-    }
-
-    if (hiDeg == null || !hiEval?.ok || loEval.radiusMm > target) return null;
-
-    for (let i = 0; i < iters; i++) {
-      const mid = 0.5 * (loDeg + hiDeg);
-      const e = chiefSensorRadiusAtField(surfaces, mid, wavePreset, sensorX);
-      if (!e.ok || e.radiusMm >= target) {
-        hiDeg = mid;
-        if (e.ok) hiEval = e;
-      } else {
-        loDeg = mid;
-        loEval = e;
-      }
-    }
-
-    if (!hiEval?.ok || !Number.isFinite(hiEval.radiusMm)) return null;
-    return hiDeg;
-  }
-
-  function illuminationAtRadius(surfaces, rTargetMm, rayCount, wavePreset, sensorX, centerGoodFrac, opts = {}) {
-    const thetaDeg = findFieldDegForRadius(surfaces, rTargetMm, wavePreset, sensorX, opts);
-    if (!Number.isFinite(thetaDeg)) {
-      return {
-        rTargetMm,
-        thetaDeg: null,
-        relIllum: 0,
-        validFrac: 0,
-        vigFrac: 1,
-        mountFrac: 1,
-        pass: false,
-      };
-    }
-
-    const pack = traceIcBundleAtField(surfaces, thetaDeg, rayCount, wavePreset, sensorX, opts);
-    const mountMax = Number.isFinite(opts.mountMaxFrac) ? opts.mountMaxFrac : IMG_CIRCLE_CFG.mountMaxFrac;
-    const hardMountMax = Number.isFinite(opts.hardMountMaxFrac) ? opts.hardMountMaxFrac : IMG_CIRCLE_CFG.hardMountMaxFrac;
-    const exp = Math.max(1, Number(opts.illumExponent || IMG_CIRCLE_CFG.illumExponent || 1));
-
-    const centerRef = Math.max(1e-6, Number(centerGoodFrac || 0));
-    let relIllum = Math.pow(pack.goodFrac / centerRef, exp);
-    relIllum = clamp(relIllum, 0, 1);
-    if (pack.mountFrac > mountMax) relIllum = 0; // hard mechanical cutoff zeroes illumination
-    if (pack.vigFrac > hardVig) relIllum = 0;
-
-    const threshold = Number.isFinite(opts.illumThreshold) ? opts.illumThreshold : IMG_CIRCLE_CFG.illumThreshold;
-    const softPass = relIllum >= threshold;
-    const hardPass = pack.mountFrac <= hardMountMax;
-    const stopsDown = relIllum > 1e-9 ? -Math.log2(relIllum) : Infinity;
-
-    return {
-      rTargetMm,
-      thetaDeg,
-      relIllum,
-      stopsDown,
-      validFrac: pack.validFrac,
-      vigFrac: pack.vigFrac,
-      mountFrac: pack.mountFrac,
-      softPass,
-      hardPass,
-      pass: softPass,
-    };
-  }
-
-  function estimateImageCircleIllumMm(surfaces, wavePreset, sensorX, rayCount, sensorW, sensorH, opts = {}) {
-    const diagHalf = 0.5 * Math.hypot(sensorW, sensorH);
-    const sampleCount = Math.max(3, Number(opts.sampleCount || IMG_CIRCLE_CFG.sampleCount) | 0);
-    const threshold = Number.isFinite(opts.illumThreshold) ? opts.illumThreshold : IMG_CIRCLE_CFG.illumThreshold;
-    const centerPack = traceIcBundleAtField(surfaces, 0, rayCount, wavePreset, sensorX, opts);
-    const centerGoodFrac = Math.max(1e-6, Number(centerPack.goodFrac || 0));
-
-    let lastPass = null;
-    let firstFailAfterPass = null;
-    let lastHardPass = null;
-    const samples = [];
-
-    for (let i = 0; i < sampleCount; i++) {
-      const t = sampleCount === 1 ? 0 : (i / (sampleCount - 1));
-      const r = diagHalf * t;
-      const s = illuminationAtRadius(surfaces, r, rayCount, wavePreset, sensorX, centerGoodFrac, opts);
-      samples.push(s);
-
-      if (s.softPass) {
-        lastPass = s;
-      } else if (lastPass && !firstFailAfterPass) {
-        firstFailAfterPass = s;
-      }
-      if (s.hardPass) lastHardPass = s;
-    }
-
-    let softEdgeR = lastPass ? lastPass.rTargetMm : 0;
-    if (lastPass && firstFailAfterPass) {
-      const r0 = lastPass.rTargetMm;
-      const r1 = firstFailAfterPass.rTargetMm;
-      const i0 = lastPass.relIllum;
-      const i1 = firstFailAfterPass.relIllum;
-      if (Number.isFinite(i0) && Number.isFinite(i1) && Math.abs(i1 - i0) > 1e-9 && r1 > r0) {
-        const a = (threshold - i0) / (i1 - i0);
-        const k = clamp(a, 0, 1);
-        softEdgeR = r0 + (r1 - r0) * k;
-      }
-    }
-
-    softEdgeR = clamp(softEdgeR, 0, Math.max(0, diagHalf));
-    const hardEdgeR = clamp(lastHardPass ? lastHardPass.rTargetMm : 0, 0, Math.max(0, diagHalf));
-    const diagSample = samples.length ? samples[samples.length - 1] : null;
-    const softDiagRelIllum = diagSample ? Number(diagSample.relIllum || 0) : 0;
-    const softDiagStopsDown = diagSample ? Number(diagSample.stopsDown) : Infinity;
-    const softDiagMountFrac = diagSample ? Number(diagSample.mountFrac || 1) : 1;
-    const softDiagVigFrac = diagSample ? Number(diagSample.vigFrac || 1) : 1;
-    const hardFail = softDiagMountFrac > (Number.isFinite(opts.hardMountMaxFrac) ? opts.hardMountMaxFrac : IMG_CIRCLE_CFG.hardMountMaxFrac);
-
-    return {
-      diameterMm: Math.max(0, hardEdgeR * 2), // compatibility: IC now means HardIC
-      hardDiameterMm: Math.max(0, hardEdgeR * 2),
-      softDiameterMm: Math.max(0, softEdgeR * 2),
-      halfSizeMm: softEdgeR,
-      sensorDiagHalfMm: diagHalf,
-      relIllumAtEdge: lastPass ? lastPass.relIllum : 0,
-      centerGoodFrac,
-      centerValidFrac: centerPack.validFrac,
-      centerVigFrac: centerPack.vigFrac,
-      centerMountFrac: centerPack.mountFrac,
-      softDiagRelIllum,
-      softDiagStopsDown,
-      softDiagMountFrac,
-      softDiagVigFrac,
-      hardFail,
-      samples,
-    };
   }
 
   function estimateDistortionPct(surfaces, wavePreset, sensorX, sensorW, sensorH, efl, mode = "d") {
@@ -1505,7 +1284,6 @@
       renderScale: ui.renderScale?.value || "1.25",
       optTargetFL: ui.optTargetFL?.value || "75",
       optTargetT: ui.optTargetT?.value || "2.0",
-      optTargetIC: ui.optTargetIC?.value || "44.7",
       optIters: ui.optIters?.value || "2000",
       optPop: ui.optPop?.value || "safe",
     };
@@ -1526,7 +1304,6 @@
     set(ui.renderScale, snap.renderScale);
     set(ui.optTargetFL, snap.optTargetFL);
     set(ui.optTargetT, snap.optTargetT);
-    set(ui.optTargetIC, snap.optTargetIC);
     set(ui.optIters, snap.optIters);
     set(ui.optPop, snap.optPop);
   }
@@ -1676,11 +1453,6 @@
     // target terms (optimizer uses these)
     eflWeight: 0.35,          // penalty per mm error (squared)
     tWeight: 10.0,            // penalty per T error (squared)
-    imgCircleWeight: 250.0,   // HardIC feasibility penalty (avoid black ring)
-    hardCutoffWeight: 4000.0, // strong extra penalty when diag has mechanical cutoff
-    softIllumWeight: 18.0,    // optional look penalty (corner falloff preference)
-    desiredSoftDiagIllum: null, // e.g. 0.25 if you want cleaner corners
-    centerIllumWeight: 900.0, // heavy penalty when center throughput is already too low
     bflMin: 52.0,             // for PL: discourage too-short backfocus
     bflWeight: 6.0,
     lowValidPenalty: 450.0,
@@ -1715,11 +1487,6 @@
     efl, T, bfl,
     targetEfl = null,
     targetT = null,
-    imageCircleMm = null,
-    targetImageCircleMm = null,
-    softDiagIllum = null,
-    hardCutoff = false,
-    centerGoodFrac = null,
     physPenalty = 0,
     hardInvalid = false,
   }){
@@ -1779,25 +1546,6 @@
       const d = (T - targetT);
       merit += MERIT_CFG.tWeight * (d * d);
     }
-    if (Number.isFinite(targetImageCircleMm) && Number.isFinite(imageCircleMm)){
-      const shortfall = Math.max(0, targetImageCircleMm - imageCircleMm);
-      merit += MERIT_CFG.imgCircleWeight * (shortfall * shortfall);
-    }
-    if (hardCutoff) {
-      merit += MERIT_CFG.hardCutoffWeight;
-    }
-    const desiredSoft = Number.isFinite(MERIT_CFG.desiredSoftDiagIllum) ? MERIT_CFG.desiredSoftDiagIllum : null;
-    if (Number.isFinite(desiredSoft) && Number.isFinite(softDiagIllum)) {
-      const shortfall = Math.max(0, desiredSoft - softDiagIllum);
-      merit += MERIT_CFG.softIllumWeight * (shortfall * shortfall);
-    }
-    if (Number.isFinite(centerGoodFrac)) {
-      const minCenter = Number(IMG_CIRCLE_CFG.centerGoodMin || 0.30);
-      if (centerGoodFrac < minCenter) {
-        const d = (minCenter - centerGoodFrac);
-        merit += MERIT_CFG.centerIllumWeight * (d * d);
-      }
-    }
 
     const minValidTarget = Math.max(7, Math.floor(rayCount * 0.45));
     if (validMin < minValidTarget) {
@@ -1815,11 +1563,6 @@
       fields: fields.map(v => Number.isFinite(v) ? v : 0),
       vigCenterPct: Math.round(vigCenter * 100),
       vigMidPct: Math.round(vigMid * 100),
-      imageCircleMm: Number.isFinite(imageCircleMm) ? imageCircleMm : null,
-      targetImageCircleMm: Number.isFinite(targetImageCircleMm) ? targetImageCircleMm : null,
-      softDiagIllum: Number.isFinite(softDiagIllum) ? softDiagIllum : null,
-      hardCutoff: !!hardCutoff,
-      centerGoodFrac: Number.isFinite(centerGoodFrac) ? centerGoodFrac : null,
       physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
       hardInvalid: !!hardInvalid,
     };
@@ -2313,22 +2056,15 @@
     const vigPct = traces.length ? Math.round((vCount / traces.length) * 100) : 0;
 
     const { efl, bfl } = estimateEflBflParaxial(lens.surfaces, wavePreset);
-    const T = estimateTStopApprox(efl, lens.surfaces);
+    const Tgeom = estimateTStopApprox(efl, lens.surfaces);
+    const centerTp = measureCenterThroughput(lens.surfaces, wavePreset, sensorX, Math.max(31, rayCount | 0));
+    const T = estimateEffectiveT(Tgeom, centerTp.goodFrac);
+    const tLoss = tLossStops(T, Tgeom);
 
     const fov = computeFovDeg(efl, sensorW, sensorH);
     const fovTxt = !fov
       ? "FOV: —"
       : `FOV: H ${fov.hfov.toFixed(1)}° • V ${fov.vfov.toFixed(1)}° • D ${fov.dfov.toFixed(1)}°`;
-
-    const targetImageCircle = getTargetImageCircleMm(sensorW, sensorH);
-    const imageCircle = estimateImageCircleIllumMm(lens.surfaces, wavePreset, sensorX, rayCount, sensorW, sensorH);
-    const imageCircleMm = imageCircle?.hardDiameterMm ?? imageCircle?.diameterMm ?? null;
-    const softDiagIllum = Number(imageCircle?.softDiagRelIllum);
-    const softDiagStopsDown = Number(imageCircle?.softDiagStopsDown);
-    const hardFail = !!imageCircle?.hardFail;
-    const softDiagMountFrac = Number(imageCircle?.softDiagMountFrac);
-    const imageCircleDelta = Number.isFinite(imageCircleMm) ? (imageCircleMm - targetImageCircle) : null;
-    const centerGoodFrac = Number(imageCircle?.centerGoodFrac);
 
     const distPct = estimateDistortionPct(lens.surfaces, wavePreset, sensorX, sensorW, sensorH, efl, "d");
 
@@ -2346,11 +2082,6 @@
       efl, T, bfl,
       targetEfl: num(ui.optTargetFL?.value, NaN),
       targetT: num(ui.optTargetT?.value, NaN),
-      imageCircleMm,
-      targetImageCircleMm: targetImageCircle,
-      softDiagIllum,
-      hardCutoff: hardFail,
-      centerGoodFrac,
       physPenalty: phys.penalty,
       hardInvalid: phys.hardFail,
     });
@@ -2383,20 +2114,16 @@
 
     if (ui.efl) ui.efl.textContent = `Focal Length: ${efl == null ? "—" : efl.toFixed(2)}mm`;
     if (ui.bfl) ui.bfl.textContent = `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
-    if (ui.tstop) ui.tstop.textContent = `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
-    if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
-    if (ui.imgCircle) {
-      ui.imgCircle.textContent = Number.isFinite(imageCircleMm)
-        ? `HardIC: ${imageCircleMm.toFixed(2)}mm (target ${targetImageCircle.toFixed(2)}mm) • Soft@D ${(Number.isFinite(softDiagIllum) ? (softDiagIllum * 100).toFixed(0) : "—")}% (${Number.isFinite(softDiagStopsDown) ? softDiagStopsDown.toFixed(2) : "—"}st)`
-        : `ImgCircle: — (target ${targetImageCircle.toFixed(2)}mm)`;
+    if (ui.tstop) {
+      ui.tstop.textContent = `T_eff≈ ${T == null ? "—" : "T" + T.toFixed(2)} (${Tgeom == null ? "geom —" : "geom T" + Tgeom.toFixed(2)})`;
     }
+    if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
     if (ui.dist) ui.dist.textContent = `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
     if (ui.fov) ui.fov.textContent = fovTxt;
 
     if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
     if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
-    if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
-    if (ui.imgCircleTop) ui.imgCircleTop.textContent = ui.imgCircle?.textContent || "ImgCircle: —";
+    if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T_eff≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.distTop) ui.distTop.textContent = ui.dist?.textContent || `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
 
@@ -2406,17 +2133,11 @@
     } else if (phys.airGapCount < PHYS_CFG.minAirGapsPreferred && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Few air gaps (${phys.airGapCount}); aim for >= ${PHYS_CFG.minAirGapsPreferred} for practical designs.`;
+    } else if (centerTp.goodFrac < 0.85 && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `Center throughput low (${(centerTp.goodFrac * 100).toFixed(0)}%): effective T is slower than geometric T.`;
     } else if (tirCount > 0 && ui.footerWarn) {
       ui.footerWarn.textContent = `TIR on ${tirCount} rays (check glass / curvature).`;
-    } else if (hardFail && ui.footerWarn) {
-      ui.footerWarn.textContent =
-        `Hard cutoff risk on sensor diag (mount clip ${(Number.isFinite(softDiagMountFrac) ? (softDiagMountFrac * 100).toFixed(1) : "—")}%).`;
-    } else if (Number.isFinite(centerGoodFrac) && centerGoodFrac < IMG_CIRCLE_CFG.centerGoodMin && ui.footerWarn) {
-      ui.footerWarn.textContent =
-        `Low center throughput (${(centerGoodFrac * 100).toFixed(0)}%); strong central clipping likely.`;
-    } else if (Number.isFinite(imageCircleDelta) && imageCircleDelta < -0.05 && ui.footerWarn) {
-      ui.footerWarn.textContent =
-        `Image circle too small by ${Math.abs(imageCircleDelta).toFixed(2)}mm (target ${targetImageCircle.toFixed(2)}mm).`;
     }
 
     if (ui.status) {
@@ -2424,9 +2145,6 @@
         `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${meritTxt}`;
     }
     if (ui.metaInfo) ui.metaInfo.textContent = `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm`;
-    if (ui.metaInfo && Number.isFinite(imageCircleMm)) {
-      ui.metaInfo.textContent += ` • IC ${imageCircleMm.toFixed(2)}mm`;
-    }
 
     resizeCanvasToCSS();
     const r = canvas.getBoundingClientRect();
@@ -2443,7 +2161,9 @@
     drawSensor(world, sensorX, halfH);
 
     const eflTxt = efl == null ? "—" : `${efl.toFixed(2)}mm`;
-    const tTxt   = T == null ? "—" : `T${T.toFixed(2)}`;
+    const tTxt   = T == null ? "—" : `T_eff ${T.toFixed(2)}`;
+    const tGeomTxt = Tgeom == null ? "—" : `T_geom ${Tgeom.toFixed(2)}`;
+    const tpTxt = `Tp0 ${(centerTp.goodFrac * 100).toFixed(0)}%${Number.isFinite(tLoss) ? ` • +${tLoss.toFixed(2)}st` : ""}`;
     const focusTxt = (focusMode === "cam")
       ? `CamFocus ${sensorX.toFixed(2)}mm`
       : `LensFocus ${lensShift.toFixed(2)}mm`;
@@ -2453,7 +2173,8 @@
       `EFL ${eflTxt}`,
       `BFL ${bfl == null ? "—" : bfl.toFixed(2) + "mm"}`,
       tTxt,
-      `HardIC ${Number.isFinite(imageCircleMm) ? imageCircleMm.toFixed(2) + "mm" : "—"} / ${targetImageCircle.toFixed(2)}mm • Soft@D ${(Number.isFinite(softDiagIllum) ? (softDiagIllum * 100).toFixed(0) : "—")}%`,
+      tGeomTxt,
+      tpTxt,
       fovTxt,
       rearTxt,
       lenTxt,
@@ -2950,7 +2671,7 @@
     return sanitizeLens(L);
   }
 
-  function evalLensMerit(lensObj, {targetEfl, targetT, targetImageCircleMm, fieldAngle, rayCount, wavePreset, sensorW, sensorH}){
+  function evalLensMerit(lensObj, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH}){
     const tmp = clone(lensObj);
     const surfaces = tmp.surfaces;
 
@@ -2966,11 +2687,6 @@
     const sensorX = 0.0;
     computeVertices(surfaces, lensShift, sensorX);
     const phys = evaluatePhysicalConstraints(surfaces);
-    const imageCircle = estimateImageCircleIllumMm(surfaces, wavePreset, sensorX, rayCount, sensorW, sensorH);
-    const imageCircleMm = imageCircle?.hardDiameterMm ?? imageCircle?.diameterMm ?? null;
-    const softDiagIllum = Number(imageCircle?.softDiagRelIllum);
-    const hardCutoff = !!imageCircle?.hardFail;
-    const centerGoodFrac = Number(imageCircle?.centerGoodFrac);
 
     if (phys.hardFail) {
       const score = MERIT_CFG.hardInvalidPenalty + Math.max(0, Number(phys.penalty || 0));
@@ -2981,7 +2697,6 @@
         bfl: null,
         intrusion: 0,
         vigFrac: 1,
-        imageCircleMm,
         lensShift,
         rms0: null,
         rmsE: null,
@@ -2991,10 +2706,6 @@
           vigPct: 100,
           intrusion: null,
           fields: [0, 0, 0],
-          imageCircleMm,
-          targetImageCircleMm: Number.isFinite(targetImageCircleMm) ? targetImageCircleMm : null,
-          softDiagIllum: Number.isFinite(softDiagIllum) ? softDiagIllum : null,
-          centerGoodFrac: Number.isFinite(centerGoodFrac) ? centerGoodFrac : null,
           physPenalty: Number(phys.penalty || 0),
           hardInvalid: true,
         },
@@ -3008,7 +2719,9 @@
     const vigFrac = traces.length ? (vCount / traces.length) : 1;
 
     const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
-    const T = estimateTStopApprox(efl, surfaces);
+    const Tgeom = estimateTStopApprox(efl, surfaces);
+    const centerTp = measureCenterThroughput(surfaces, wavePreset, sensorX, Math.max(31, rayCount | 0));
+    const T = estimateEffectiveT(Tgeom, centerTp.goodFrac);
 
     const fov = computeFovDeg(efl, sensorW, sensorH);
 
@@ -3025,11 +2738,6 @@
       efl, T, bfl,
       targetEfl,
       targetT,
-      imageCircleMm,
-      targetImageCircleMm,
-      softDiagIllum,
-      hardCutoff,
-      centerGoodFrac,
       physPenalty: phys.penalty,
       hardInvalid: phys.hardFail,
     });
@@ -3044,7 +2752,7 @@
       bfl,
       intrusion,
       vigFrac,
-      imageCircleMm,
+      goodFrac0: centerTp.goodFrac,
       lensShift,
       rms0: meritRes.breakdown.rmsCenter,
       rmsE: meritRes.breakdown.rmsEdge,
@@ -3063,7 +2771,6 @@
 
     // snapshot sensor settings
     const { w: sensorW, h: sensorH } = getSensorWH();
-    const targetImageCircleMm = getTargetImageCircleMm(sensorW, sensorH);
     const fieldAngle = num(ui.fieldAngle?.value, 0);
     const rayCount = Math.max(9, Math.min(61, (num(ui.rayCount?.value, 31) | 0))); // limit for speed
     const wavePreset = ui.wavePreset?.value || "d";
@@ -3072,7 +2779,7 @@
     const topo = captureTopology(startLens);
 
     let cur = startLens;
-    let curEval = evalLensMerit(cur, {targetEfl, targetT, targetImageCircleMm, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+    let curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
 
     // annealing-ish
@@ -3090,7 +2797,7 @@
       const temp = temp0 * (1 - a) + temp1 * a;
 
       const cand = mutateLens(cur, mode, topo);
-      const candEval = evalLensMerit(cand, {targetEfl, targetT, targetImageCircleMm, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+      const candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
 
       const d = candEval.score - curEval.score;
       const accept = (d <= 0) || (Math.random() < Math.exp(-d / Math.max(1e-9, temp)));
@@ -3109,7 +2816,7 @@
             `score ${best.eval.score.toFixed(2)}\n` +
             `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
             `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
-            `IC ${Number.isFinite(best.eval.imageCircleMm)?best.eval.imageCircleMm.toFixed(2):"—"}mm (target ${targetImageCircleMm.toFixed(2)}mm)\n` +
+            `Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}%\n` +
             `INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
             `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
           );
@@ -3124,7 +2831,7 @@
           setOptLog(
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
             `current ${curEval.score.toFixed(2)} • best ${best.eval.score.toFixed(2)} @${best.iter}\n` +
-            `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • IC ${Number.isFinite(best.eval.imageCircleMm)?best.eval.imageCircleMm.toFixed(2):"—"}mm • INTR ${best.eval.intrusion.toFixed(2)}mm\n`
+            `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}% • INTR ${best.eval.intrusion.toFixed(2)}mm\n`
           );
         }
         // yield to UI
@@ -3143,7 +2850,7 @@
         `BEST score ${best.eval.score.toFixed(2)}\n` +
         `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
         `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
-        `IC ${Number.isFinite(best.eval.imageCircleMm)?best.eval.imageCircleMm.toFixed(2):"—"}mm (target ${targetImageCircleMm.toFixed(2)}mm)\n` +
+        `Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}%\n` +
         `INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
         `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
         `Click “Apply best” to load.`
@@ -3175,7 +2882,6 @@
     const targetEfl = num(ui.optTargetFL?.value, 75);
     const targetT = num(ui.optTargetT?.value, 2.0);
     const { w: sensorW, h: sensorH } = getSensorWH();
-    const targetImageCircleMm = getTargetImageCircleMm(sensorW, sensorH);
     const fieldAngle = num(ui.fieldAngle?.value, 0);
     const rayCount = Math.max(9, Math.min(61, (num(ui.rayCount?.value, 31) | 0)));
     const wavePreset = ui.wavePreset?.value || "d";
@@ -3183,7 +2889,7 @@
     const t0 = performance.now();
     let best = Infinity;
     for (let i=0;i<N;i++){
-      const res = evalLensMerit(lens, {targetEfl, targetT, targetImageCircleMm, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+      const res = evalLensMerit(lens, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
       if (res.score < best) best = res.score;
     }
     const t1 = performance.now();
@@ -3247,11 +2953,11 @@
     ui.btnOptApply?.addEventListener("click", applyBest);
     ui.btnOptBench?.addEventListener("click", benchOptimizer);
 
-    ["optTargetFL","optTargetT","optTargetIC","optIters","optPop"].forEach((id)=>{
+    ["optTargetFL","optTargetT","optIters","optPop"].forEach((id)=>{
       ui[id]?.addEventListener("change", () => { scheduleRenderAll(); scheduleAutosave(); });
       ui[id]?.addEventListener("input", () => {
         // don't rerender constantly for iters/preset; but update merit targets
-        if (id === "optTargetFL" || id === "optTargetT" || id === "optTargetIC") scheduleRenderAll();
+        if (id === "optTargetFL" || id === "optTargetT") scheduleRenderAll();
         scheduleAutosave();
       });
     });
