@@ -1286,6 +1286,14 @@
     return 0.5 * (arr[mid - 1] + arr[mid]);
   }
 
+  function chiefRadiusAtFieldDeg(workSurfaces, fieldDeg, wavePreset, sensorX) {
+    const chief = buildChiefRay(workSurfaces, fieldDeg);
+    const tr = traceRayForward(clone(chief), workSurfaces, wavePreset);
+    if (!tr || !tr.endRay || tr.tir) return null;
+    const y = rayHitYAtX(tr.endRay, sensorX);
+    return Number.isFinite(y) ? Math.abs(y) : null;
+  }
+
   function traceBundleAtFieldForSoftIc(surfaces, fieldDeg, wavePreset, sensorX, raysPerBundle) {
     const rays = buildRays(surfaces, fieldDeg, raysPerBundle);
     const total = rays.length;
@@ -1308,7 +1316,8 @@
       yHits.push(Math.abs(y));
     }
 
-    const rMm = medianAbs(yHits);
+    const rChief = chiefRadiusAtFieldDeg(surfaces, fieldDeg, wavePreset, sensorX);
+    const rMm = Number.isFinite(rChief) ? rChief : medianAbs(yHits);
     return {
       total,
       good,
