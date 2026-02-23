@@ -1053,17 +1053,29 @@
     return endRay.p.y + t * endRay.d.y;
   }
 
-  function coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, halfH) {
-    let lo = 0, hi = 60, best = 0;
-    for (let iter = 0; iter < 18; iter++) {
-      const mid = (lo + hi) * 0.5;
-      const ray = buildChiefRay(surfaces, mid);
-      const tr = traceRayForward(clone(ray), surfaces, wavePreset);
-      if (!tr || tr.vignetted || tr.tir) { hi = mid; continue; }
+  function coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, halfH, rayCount = 31) {
+    const covRays = Math.max(
+      COVERAGE_CFG.covRayCountMin,
+      Math.min(COVERAGE_CFG.covRayCountMax, Math.max(3, Math.min(101, rayCount | 0)))
+    );
 
-      const y = rayHitYAtX(tr.endRay, sensorX);
-      if (y == null) { hi = mid; continue; }
-      if (Math.abs(y) <= halfH) { best = mid; lo = mid; }
+    let lo = 0, hi = 60, best = 0;
+    for (let iter = 0; iter < COVERAGE_CFG.maxFieldIters; iter++) {
+      const mid = (lo + hi) * 0.5;
+
+      const chief = buildChiefRay(surfaces, mid);
+      const chiefTr = traceRayForward(clone(chief), surfaces, wavePreset);
+      if (!chiefTr || chiefTr.vignetted || chiefTr.tir) { hi = mid; continue; }
+
+      const chiefY = rayHitYAtX(chiefTr.endRay, sensorX);
+      if (!Number.isFinite(chiefY) || Math.abs(chiefY) > halfH) { hi = mid; continue; }
+
+      const pack = traceBundleAtField(surfaces, mid, covRays, wavePreset, sensorX);
+      const validFrac = (pack.n || 0) / Math.max(1, covRays);
+      const passVig = Number.isFinite(pack.vigFrac) && pack.vigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac;
+      const passValid = Number.isFinite(validFrac) && validFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
+
+      if (passVig && passValid) { best = mid; lo = mid; }
       else hi = mid;
     }
     return best;
@@ -1159,6 +1171,9 @@
     marginDeg: 0.5,
     minSensorW: 36.0,       // always at least full-frame
     minSensorH: 24.0,
+    maxFieldIters: 14,      // binary-search depth for usable-field estimate
+    covRayCountMin: 9,      // keep this low-ish for optimizer speed
+    covRayCountMax: 17,
   };
   const IMAGE_CIRCLE_CFG = {
     minDiagMm: 45.0,        // full-frame coverage floor with small margin
@@ -2055,7 +2070,7 @@
 
     const covMode = COVERAGE_CFG.mode;
     const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
-    const maxField = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, covHalfMm);
+    const maxField = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, covHalfMm, rayCount);
     const reqFloor = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
     const reqFromFov = coversSensorYesNo({ fov, maxField, mode: covMode, marginDeg: COVERAGE_CFG.marginDeg }).req;
     const req = Number.isFinite(reqFloor) ? reqFloor : reqFromFov;
@@ -2731,7 +2746,7 @@
     const fov = computeFovDeg(efl, sensorW, sensorH);
     const covMode = COVERAGE_CFG.mode;
     const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
-    const maxField = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfMm);
+    const maxField = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfMm, rayCount);
     const req = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
     const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
 
