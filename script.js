@@ -3340,9 +3340,12 @@
     return true;
   }
 
-  function mutateLens(baseLens, mode, topo = null){
+  function mutateLens(baseLens, mode, topo = null, opt = null){
     const L = clone(baseLens);
     L.name = baseLens.name;
+    const stage = Number(opt?.stage ?? 0);
+    const targetIC = Math.max(0, Number(opt?.targetIC || 0));
+    const icStage = (stage === 1 && targetIC > 0);
 
     const s = L.surfaces;
 
@@ -3366,7 +3369,8 @@
     }
 
     // main: perturb a few parameters
-    const kChanges = mode === "wild" ? 6 : 3;
+    let kChanges = mode === "wild" ? 6 : 3;
+    if (icStage) kChanges += (mode === "wild" ? 5 : 4);
     for (let c=0;c<kChanges;c++){
       const idxs = s.map((x,i)=>({x,i})).filter(o=>!surfaceIsLocked(o.x));
       if (!idxs.length) break;
@@ -3374,7 +3378,7 @@
       const ss = o.x;
 
       const choice = Math.random();
-      if (choice < 0.45){
+      if ((!icStage && choice < 0.45) || (icStage && choice < 0.30)){
         // radius tweak
         const scale = mode === "wild" ? 0.35 : 0.18;
         const d = randn() * scale;
@@ -3382,16 +3386,22 @@
         const absR = Math.max(PHYS_CFG.minRadius, Math.abs(R));
         const newAbs = absR * (1 + d);
         ss.R = (R >= 0 ? 1 : -1) * clamp(newAbs, PHYS_CFG.minRadius, 450);
-      } else if (choice < 0.70){
+      } else if ((!icStage && choice < 0.70) || (icStage && choice < 0.48)){
         // thickness tweak
         const scale = mode === "wild" ? 0.55 : 0.25;
         const d = randn() * scale;
         ss.t = clamp(Number(ss.t||0) * (1 + d), PHYS_CFG.minThickness, 42);
-      } else if (choice < 0.88){
+      } else if ((!icStage && choice < 0.88) || (icStage && choice < 0.98)){
         // aperture tweak
-        const scale = mode === "wild" ? 0.45 : 0.20;
-        const d = randn() * scale;
-        ss.ap = clamp(Number(ss.ap||0) * (1 + d), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        if (icStage) {
+          // In IC phase, strongly prefer larger clear apertures.
+          const grow = 1 + Math.abs(randn()) * (mode === "wild" ? 0.30 : 0.20);
+          ss.ap = clamp(Number(ss.ap || 0) * grow, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        } else {
+          const scale = mode === "wild" ? 0.45 : 0.20;
+          const d = randn() * scale;
+          ss.ap = clamp(Number(ss.ap||0) * (1 + d), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        }
       } else {
         // glass swap
         const lock = topo?.media?.[o.i];
@@ -3403,6 +3413,38 @@
       if (!topo && mode === "wild" && Math.random() < 0.015){
         ss.stop = !ss.stop;
         if (ss.stop) ss.type = "STOP";
+      }
+    }
+
+    if (icStage) {
+      // Pull tiny apertures up toward a practical floor for the requested image circle.
+      const apFloor = clamp(targetIC * 0.30, 6.0, 34.0);
+      for (let i = 0; i < s.length; i++) {
+        const ss = s[i];
+        if (surfaceIsLocked(ss)) continue;
+        const t = String(ss?.type || "").toUpperCase();
+        if (t === "OBJ" || t === "IMS") continue;
+
+        const ap = Number(ss.ap || 0);
+        if (ap < apFloor) {
+          const alpha = 0.35 + Math.random() * 0.45;
+          ss.ap = clamp(ap + (apFloor - ap) * alpha, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        } else if (Math.random() < 0.25) {
+          ss.ap = clamp(ap * (1.02 + Math.random() * 0.10), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        }
+      }
+
+      // Rear group usually drives hard cutoff; give it extra breathing room.
+      const stopIdx = findStopSurfaceIndex(s);
+      if (stopIdx >= 0) {
+        for (let i = stopIdx + 1; i < s.length - 1; i++) {
+          const ss = s[i];
+          if (surfaceIsLocked(ss)) continue;
+          if (Math.random() < 0.65) {
+            const ap = Number(ss.ap || 0);
+            ss.ap = clamp(ap * (1.05 + Math.random() * 0.13), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+          }
+        }
       }
     }
 
@@ -3691,10 +3733,9 @@
       const a = i / iters;
       const temp = temp0 * (1 - a) + temp1 * a;
 
-      const cand = mutateLens(cur, mode, topo);
-      const candEval = evalLensMerit(cand, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
-
       const curPri = buildOptPriority(curEval, targets);
+      const cand = mutateLens(cur, mode, topo, { stage: curPri.stage, targetIC });
+      const candEval = evalLensMerit(cand, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
       const candPri = buildOptPriority(candEval, targets);
 
       let accept = false;
