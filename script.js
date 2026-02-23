@@ -1259,7 +1259,7 @@
   const SOFT_IC_CFG = {
     raysPerBundle: 41,
     thresholdRel: 0.35, // usable circle @ 35% of center illumination
-    localBandMm: 1.0,   // local brightness band around chief-field radius
+    localBandMm: 0.5,   // local brightness band around chief-field radius
     thetaStepDeg: 0.5,
     maxFieldDeg: 60,
     diagMarginMm: 0.75,
@@ -1285,6 +1285,20 @@
     if (!tr || !tr.endRay || tr.tir) return null;
     const y = rayHitYAtX(tr.endRay, sensorX);
     return Number.isFinite(y) ? Math.abs(y) : null;
+  }
+
+  function naturalCos4AtSensorRadius(surfaces, rMm, sensorX = 0) {
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    const stopSurf = stopIdx >= 0 ? surfaces[stopIdx] : surfaces[0];
+    const xStop = Number(stopSurf?.vx);
+    const xSensor = Number(sensorX) + 0.05; // keep same epsilon convention as render engine
+    if (!Number.isFinite(xStop) || !Number.isFinite(xSensor)) return 1.0;
+    const dx = xStop - xSensor;
+    const rr = Math.max(0, Number(rMm || 0));
+    const denom = Math.hypot(dx, rr);
+    if (!(denom > 1e-9)) return 1.0;
+    const cosT = clamp(Math.abs(dx) / denom, 0, 1);
+    return cosT * cosT * cosT * cosT;
   }
 
   function traceBundleAtFieldForSoftIc(surfaces, fieldDeg, wavePreset, sensorX, raysPerBundle) {
@@ -1505,106 +1519,135 @@
     const lensShift = af.shift;
     computeVertices(work, lensShift, sensorX);
 
- // --- center reference: use throughput, not "local band" ---
-const centerPack = traceBundleAtFieldForSoftIc(work, 0, wavePreset, sensorX, cfg.raysPerBundle);
-const centerLocalFrac = Math.max(cfg.eps, Number(centerPack.localFrac || 0)); // debug only
-const centerGoodFrac  = Math.max(cfg.eps, Number(centerPack.goodFrac  || 0)); // REAL reference
+    const centerPack = traceBundleAtFieldForSoftIc(work, 0, wavePreset, sensorX, cfg.raysPerBundle);
+    const centerLocalFrac = Math.max(cfg.eps, Number(centerPack.localFrac || 0));
+    const centerNatural = naturalCos4AtSensorRadius(work, 0, sensorX);
+    const centerGain = Math.max(cfg.eps, centerLocalFrac * centerNatural);
+    if (centerGain <= cfg.eps * 1.01) {
+      return {
+        softICmm: 0,
+        rEdge: 0,
+        relMin: Number(cfg.thresholdRel || 0.35),
+        thresholdRel: Number(cfg.thresholdRel || 0.35),
+        usableCircleDiameterMm: 0,
+        usableCircleRadiusMm: 0,
+        relAtCutoff: 0,
+        centerGoodFrac: centerGain,
+        centerLocalFrac,
+        centerGain,
+        samples: [],
+        focusLensShift: lensShift,
+        focusFailed: false,
+        drasticDropRadiusMm: null,
+      };
+    }
 
-if (centerGoodFrac <= cfg.eps * 1.01) {
-  return {
-    softICmm: 0,
-    rEdge: 0,
-    relMin: Number(cfg.thresholdRel || 0.35),
-    thresholdRel: Number(cfg.thresholdRel || 0.35),
-    usableCircleDiameterMm: 0,
-    usableCircleRadiusMm: 0,
-    relAtCutoff: 0,
-    centerGoodFrac,
-    centerLocalFrac,
-    samples: [],
-    focusLensShift: lensShift,
-    focusFailed: false,
-    drasticDropRadiusMm: null,
-  };
-}
+    const fieldSamples = [];
+    let mapFailRun = 0;
+    let beyondDiagRun = 0;
 
-// cos^4 falloff helper (brightness proxy)
-const cos4 = (deg) => {
-  const th = (deg * Math.PI) / 180;
-  const c = Math.max(0, Math.cos(th));
-  return c * c * c * c;
-};
+    const stepDeg = Math.max(0.1, Number(cfg.thetaStepDeg || 0.5));
+    const maxFieldDeg = Math.max(stepDeg, Number(cfg.maxFieldDeg || 60));
+    const minSamplesForBreak = Math.max(3, Number(cfg.minSamplesForBreak || 10) | 0);
+    const maxConsecutiveMapFails = Math.max(2, Number(cfg.maxConsecutiveMapFails || 8) | 0);
 
-const thetaStep = Math.max(0.05, Number(cfg.thetaStepDeg || 0.5));
-const maxField  = Math.max(0.5, Number(cfg.maxFieldDeg || 60));
+    for (let thetaDeg = 0; thetaDeg <= maxFieldDeg + 1e-9; thetaDeg += stepDeg) {
+      const pack = thetaDeg <= 1e-9
+        ? centerPack
+        : traceBundleAtFieldForSoftIc(work, thetaDeg, wavePreset, sensorX, cfg.raysPerBundle);
+      if (!pack.valid) continue;
+      const rMm = Number.isFinite(pack.rMm) ? pack.rMm : null;
+      if (!Number.isFinite(rMm)) {
+        mapFailRun++;
+        if (fieldSamples.length >= minSamplesForBreak && mapFailRun >= maxConsecutiveMapFails) break;
+        continue;
+      }
+      mapFailRun = 0;
 
-const fieldSamples = [];
-let consecutiveFails = 0;
+      const goodFrac = clamp(pack.goodFrac, 0, 1);
+      const localFrac = clamp(Number(pack.localFrac || 0), 0, 1);
+      const naturalGain = naturalCos4AtSensorRadius(work, rMm, sensorX);
+      const gain = clamp(localFrac * naturalGain, 0, 1);
+      fieldSamples.push({
+        rMm,
+        thetaDeg,
+        goodFrac,
+        localFrac,
+        gain,
+        rawRel: clamp(gain / centerGain, 0, 1),
+        mountFrac: pack.mountFrac,
+      });
 
-for (let thetaDeg = 0; thetaDeg <= maxField + 1e-9; thetaDeg += thetaStep) {
-  const pack = traceBundleAtFieldForSoftIc(work, thetaDeg, wavePreset, sensorX, cfg.raysPerBundle);
-  const rMm = Number.isFinite(pack.rMm) ? Number(pack.rMm) : null;
+      if (Number.isFinite(rMm) && rMm > halfDiag + Math.max(0.1, Number(cfg.diagMarginMm || 0))) {
+        beyondDiagRun++;
+      } else {
+        beyondDiagRun = 0;
+      }
+      if (fieldSamples.length >= minSamplesForBreak && beyondDiagRun >= 2) break;
+    }
 
-  if (!Number.isFinite(rMm)) {
-    consecutiveFails++;
-    if (consecutiveFails >= Number(cfg.maxConsecutiveMapFails || 8)) break;
-    continue;
-  }
-  consecutiveFails = 0;
+    const ordered = fieldSamples
+      .filter((s) => Number.isFinite(s.rMm))
+      .sort((a, b) => a.rMm - b.rMm);
+    if (!ordered.length) {
+      return {
+        softICmm: 0,
+        rEdge: 0,
+        relMin: Number(cfg.thresholdRel || 0.35),
+        thresholdRel: Number(cfg.thresholdRel || 0.35),
+        usableCircleDiameterMm: 0,
+        usableCircleRadiusMm: 0,
+        relAtCutoff: 0,
+        centerGoodFrac: centerGain,
+        centerLocalFrac,
+        centerGain,
+        samples: [],
+        focusLensShift: lensShift,
+        focusFailed: false,
+        drasticDropRadiusMm: null,
+      };
+    }
 
-  const goodFrac = clamp(pack.goodFrac, 0, 1);
-  const localFrac = clamp(Number(pack.localFrac || 0), 0, 1);
+    const merged = [];
+    for (const s of ordered) {
+      const prev = merged[merged.length - 1];
+      if (prev && s.rMm <= prev.rMm + 1e-6) {
+        prev.goodFrac = Math.min(prev.goodFrac, s.goodFrac);
+        prev.localFrac = Math.min(prev.localFrac, s.localFrac);
+        prev.gain = Math.min(prev.gain, s.gain);
+        prev.rawRel = Math.min(prev.rawRel, s.rawRel);
+        prev.mountFrac = Math.max(prev.mountFrac, s.mountFrac);
+        prev.thetaDeg = Math.max(prev.thetaDeg, s.thetaDeg);
+        continue;
+      }
+      merged.push({ ...s });
+    }
 
-  // brightness proxy
-  const gain  = clamp(goodFrac * cos4(thetaDeg), 0, 1);
-  const gain0 = clamp(centerGoodFrac * cos4(0), cfg.eps, 1);
+    if (!merged.length || merged[0].rMm > 1e-6) {
+      merged.unshift({
+        rMm: 0,
+        thetaDeg: 0,
+        goodFrac: Math.max(0, Number(centerPack.goodFrac || 0)),
+        localFrac: centerLocalFrac,
+        gain: centerGain,
+        rawRel: 1,
+        mountFrac: centerPack.mountFrac,
+      });
+    } else {
+      merged[0].rMm = 0;
+      merged[0].goodFrac = Math.max(merged[0].goodFrac, Number(centerPack.goodFrac || 0));
+      merged[0].localFrac = Math.max(merged[0].localFrac, centerLocalFrac);
+      merged[0].gain = Math.max(Number(merged[0].gain || 0), centerGain);
+      merged[0].rawRel = 1;
+    }
 
-  fieldSamples.push({
-    rMm,
-    thetaDeg,
-    goodFrac,
-    localFrac, // debug
-    gain,
-    rawRel: clamp(gain / gain0, 0, 1),
-    mountFrac: pack.mountFrac,
-  });
-
-  // optional early break if we already far beyond diag (prevents wasting time)
-  if (rMm > halfDiag + Number(cfg.diagMarginMm || 0.75) && fieldSamples.length >= Number(cfg.minSamplesForBreak || 10)) {
-    break;
-  }
-}
-
-// merge / sort
-const merged = fieldSamples
-  .filter((s) => Number.isFinite(s.rMm))
-  .sort((a, b) => a.rMm - b.rMm);
-
-// ensure center sample exists
-if (!merged.length || merged[0].rMm > 1e-6) {
-  merged.unshift({
-    rMm: 0,
-    thetaDeg: 0,
-    goodFrac: Math.max(0, Number(centerPack.goodFrac || 0)),
-    localFrac: centerLocalFrac,
-    gain: clamp(centerGoodFrac * cos4(0), 0, 1),
-    rawRel: 1,
-    mountFrac: centerPack.mountFrac,
-  });
-} else {
-  // make sure first sample has gain
-  merged[0].gain = Math.max(Number(merged[0].gain || 0), clamp(centerGoodFrac * cos4(0), 0, 1));
-  merged[0].rawRel = 1;
-}
-
-// build curve + compute usable circle
-const radialMm  = merged.map((s) => s.rMm);
-const gainCurve = merged.map((s) => clamp(Number(s.gain || 0), 0, 1));
-const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg);
+    const radialMm = merged.map((s) => s.rMm);
+    const gainCurve = merged.map((s) => clamp(Number(s.gain || 0), 0, 1));
+    const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg);
 
     const relCurve = (uc.relCurve?.length === merged.length)
       ? uc.relCurve
-      : merged.map((s) => clamp(s.rawRel, 0, 1));
+      : merged.map((s) => clamp(Number(s.gain || 0) / centerGain, 0, 1));
     const thr = Number(uc.thresholdRel || cfg.thresholdRel || 0.35);
     const samples = merged.map((s, i) => {
       const relIllum = clamp(Number(relCurve[i] ?? s.rawRel), 0, 1);
@@ -1613,6 +1656,7 @@ const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg);
         thetaDeg: s.thetaDeg,
         goodFrac: s.goodFrac,
         localFrac: s.localFrac,
+        gain: s.gain,
         relRaw: s.rawRel,
         relIllum,
         stopsDown: relIllum > cfg.eps ? -Math.log2(relIllum) : Infinity,
@@ -1646,8 +1690,9 @@ const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg);
       usableCircleDiameterMm: softICmm,
       usableCircleRadiusMm: rEdge,
       relAtCutoff: Number(uc.relAtCutoff || 0),
-      centerGoodFrac,
-centerLocalFrac,
+      centerGoodFrac: centerGain,
+      centerLocalFrac,
+      centerGain,
       samples,
       focusLensShift: lensShift,
       focusFailed: false,
