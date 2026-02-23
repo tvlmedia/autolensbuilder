@@ -1341,19 +1341,28 @@
     }
 
     const rMm = Number.isFinite(rChief) ? rChief : null;
-    return {
-      total,
-      good,
-      goodFrac: good / Math.max(1, total),
-      localGood,
-      localFrac: localGood / Math.max(1, total),
-      mountClipped,
-      mountFrac: mountClipped / Math.max(1, total),
-      rMm: Number.isFinite(rMm) ? rMm : null,
-      rChief: Number.isFinite(rChief) ? rChief : null,
-      yHits,
-      valid: true,
-    };
+   const gf = good / Math.max(1, total);
+
+// center-field: definieer “illumination @ center” als 1.0
+let lf = localGood / Math.max(1, total);
+if (Math.abs(fieldDeg) <= 1e-9) {
+  lf = 1.0;
+  localGood = good;
+}
+
+return {
+  total,
+  good,
+  goodFrac: gf,
+  localGood,
+  localFrac: lf,
+  mountClipped,
+  mountFrac: mountClipped / Math.max(1, total),
+  rMm: Number.isFinite(rMm) ? rMm : null,
+  rChief: Number.isFinite(rChief) ? rChief : null,
+  yHits,
+  valid: true,
+};
   }
 
   function computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg = SOFT_IC_CFG) {
@@ -1520,10 +1529,10 @@
     computeVertices(work, lensShift, sensorX);
 
     const centerPack = traceBundleAtFieldForSoftIc(work, 0, wavePreset, sensorX, cfg.raysPerBundle);
-    const centerGoodFrac = Math.max(cfg.eps, Number(centerPack.goodFrac || 0));
-    const centerLocalFrac = Math.max(cfg.eps, Number(centerPack.localFrac || 0));
-    const centerNatural = naturalCos4AtSensorRadius(work, 0, sensorX);
-    const centerGain = Math.max(cfg.eps, centerGoodFrac * centerNatural);
+const centerGoodFrac  = Math.max(cfg.eps, Number(centerPack.goodFrac || 0));
+const centerLocalFrac = Math.max(cfg.eps, Number(centerPack.localFrac || 0)); // wordt nu 1.0 door patch A
+const centerNatural   = naturalCos4AtSensorRadius(work, 0, sensorX);
+const centerGain      = Math.max(cfg.eps, centerLocalFrac * centerNatural);  // = ~1.0
     if (centerGain <= cfg.eps * 1.01) {
       return {
         softICmm: 0,
@@ -1565,19 +1574,22 @@
       }
       mapFailRun = 0;
 
-      const goodFrac = clamp(pack.goodFrac, 0, 1);
-      const localFrac = clamp(Number(pack.localFrac || 0), 0, 1);
-      const naturalGain = naturalCos4AtSensorRadius(work, rMm, sensorX);
-      const gain = clamp(goodFrac * naturalGain, 0, 1);
-      fieldSamples.push({
-        rMm,
-        thetaDeg,
-        goodFrac,
-        localFrac,
-        gain,
-        rawRel: clamp(gain / centerGain, 0, 1),
-        mountFrac: pack.mountFrac,
-      });
+      const goodFrac  = clamp(pack.goodFrac, 0, 1);
+const localFrac = clamp(Number(pack.localFrac || 0), 0, 1);
+const naturalGain = naturalCos4AtSensorRadius(work, rMm, sensorX);
+
+// illumination proxy op radius r: “hoeveel rays vallen in de ring” * cos^4
+const gain = clamp(localFrac * naturalGain, 0, 1);
+
+fieldSamples.push({
+  rMm,
+  thetaDeg,
+  goodFrac,
+  localFrac,
+  gain,
+  rawRel: clamp(gain / centerGain, 0, 1),
+  mountFrac: pack.mountFrac,
+});
 
       if (Number.isFinite(rMm) && rMm > halfDiag + Math.max(0.1, Number(cfg.diagMarginMm || 0))) {
         beyondDiagRun++;
