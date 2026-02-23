@@ -1262,6 +1262,8 @@
     localBandMm: 0.5,   // local brightness band around chief-field radius
     thetaStepDeg: 0.5,
     maxFieldDeg: 60,
+       maxRadiusMm: 80,          // hard safety cap for search (lens-based)
+
     diagMarginMm: 0.75,
     maxConsecutiveMapFails: 8,
     minSamplesForBreak: 10,
@@ -1504,8 +1506,8 @@ return {
   function estimateSoftImageCircleStandalone(surfaces, sensorW, sensorH, wavePreset, rayCount) {
     const cfg = SOFT_IC_CFG;
     const sensorX = 0.0;
-   const halfDiag = 0.5 * sensorH; // 2D meridional: y = vertical only (so limit = half sensor height)
-    const work = clone(surfaces);
+const maxR = Math.max(10, Number(cfg.maxRadiusMm || 80));
+     const work = clone(surfaces);
 
     const af = bestLensShiftForDesign(work, 0, rayCount, wavePreset);
     if (!af.ok) {
@@ -1591,12 +1593,7 @@ fieldSamples.push({
   mountFrac: pack.mountFrac,
 });
 
-      if (Number.isFinite(rMm) && rMm > halfDiag + Math.max(0.1, Number(cfg.diagMarginMm || 0))) {
-        beyondDiagRun++;
-      } else {
-        beyondDiagRun = 0;
-      }
-      if (fieldSamples.length >= minSamplesForBreak && beyondDiagRun >= 2) break;
+     if (Number.isFinite(rMm) && rMm > maxR) break;
     }
 
     const ordered = fieldSamples
@@ -1691,10 +1688,10 @@ fieldSamples.push({
       }
     }
 
-    let rEdge = uc.valid ? Number(uc.radiusMm || 0) : 0;
-    rEdge = clamp(rEdge, 0, halfDiag);
-    const softICmm = uc.valid ? clamp(Number(uc.diameterMm || 0), 0, 2 * halfDiag) : 0;
-
+   let rEdge = uc.valid ? Number(uc.radiusMm || 0) : 0;
+rEdge = clamp(rEdge, 0, maxR);
+const softICmm = uc.valid ? clamp(Number(uc.diameterMm || 0), 0, 2 * maxR) : 0;
+     
     return {
       softICmm,
       rEdge,
