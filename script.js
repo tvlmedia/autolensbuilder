@@ -140,8 +140,8 @@
   }
 
   function getSensorWH() {
-    const w = Number(ui.sensorW?.value || 36.7);
-    const h = Number(ui.sensorH?.value || 25.54);
+    const w = num(ui.sensorW?.value, 36.7);
+    const h = num(ui.sensorH?.value, 25.54);
     return { w, h, halfH: Math.max(0.1, h * 0.5), halfW: Math.max(0.1, w * 0.5) };
   }
 
@@ -1335,7 +1335,7 @@
     return endRay.p.y + t * endRay.d.y;
   }
 
-  function chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, fieldDeg) {
+  function chiefHitAtField3D(surfaces, wavePreset, sensorX, fieldDeg) {
     const chiefF = buildChiefRay(surfaces, fieldDeg);
     const rayF = {
       p: { x: chiefF.p.x, y: chiefF.p.y, z: 0 },
@@ -1343,19 +1343,15 @@
     };
     const trF = traceRayForward3D(clone(rayF), surfaces, wavePreset);
     if (!trF || trF.vignetted || trF.tir) return null;
-    const hitF = rayHitAtX3D(trF.endRay, sensorX);
+    return rayHitAtX3D(trF.endRay, sensorX);
+  }
+
+  function chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, fieldDeg) {
+    const hitF = chiefHitAtField3D(surfaces, wavePreset, sensorX, fieldDeg);
     if (!hitF) return null;
 
-    const chief0 = buildChiefRay(surfaces, 0);
-    const ray0 = {
-      p: { x: chief0.p.x, y: chief0.p.y, z: 0 },
-      d: { x: chief0.d.x, y: chief0.d.y, z: 0 },
-    };
-    const tr0 = traceRayForward3D(clone(ray0), surfaces, wavePreset);
-    if (!tr0 || tr0.vignetted || tr0.tir) return null;
-    const hit0 = rayHitAtX3D(tr0.endRay, sensorX);
-    if (!hit0) return null;
-
+    const hit0 = chiefHitAtField3D(surfaces, wavePreset, sensorX, 0);
+    if (!hit0) return Number.isFinite(hitF.r) ? hitF.r : null;
     return Math.hypot(hitF.y - hit0.y, hitF.z - hit0.z);
   }
 
@@ -1363,10 +1359,17 @@
   function requiredFieldForSensorHalfMm(surfaces, wavePreset, sensorX, targetHalfMm, maxDeg = 80) {
     const tgt = Math.max(0, Number(targetHalfMm) || 0);
     if (tgt <= 1e-9) return 0;
+    const fallbackReq = (() => {
+      const para = estimateEflBflParaxial(surfaces, wavePreset);
+      const efl = para?.efl;
+      if (!Number.isFinite(efl) || efl <= 0) return null;
+      return rad2deg(Math.atan(tgt / efl));
+    })();
+    const safeFallbackReq = Number.isFinite(fallbackReq) ? clamp(fallbackReq, 0, maxDeg) : maxDeg;
 
     let lo = 0;
     let yLo = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, lo);
-    if (!Number.isFinite(yLo)) return null;
+    if (!Number.isFinite(yLo)) yLo = 0;
     if (yLo >= tgt) return 0;
 
     let hi = 0.75;
@@ -1378,7 +1381,7 @@
       yHi = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, hi);
     }
 
-    if (!Number.isFinite(yHi) || yHi < tgt) return null;
+    if (!Number.isFinite(yHi) || yHi < tgt) return safeFallbackReq;
 
     for (let i = 0; i < 28; i++) {
       const mid = 0.5 * (lo + hi);
@@ -1387,7 +1390,7 @@
       if (yMid >= tgt) hi = mid;
       else lo = mid;
     }
-    return hi;
+    return Number.isFinite(hi) ? hi : safeFallbackReq;
   }
 
   function coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, halfH, rayCount = 31) {
@@ -1395,7 +1398,7 @@
       COVERAGE_CFG.covRayCountMin,
       Math.min(COVERAGE_CFG.covRayCountMax, Math.max(3, Math.min(101, rayCount | 0)))
     );
-    const halfHEff = Math.max(0.1, Math.max(0, halfH) - Math.max(0, IMAGE_CIRCLE_CFG.edgeGuardMm || 0));
+    const halfHEff = Math.max(0.1, Math.max(0, halfH));
 
     let lo = 0, hi = 60, best = 0;
     for (let iter = 0; iter < COVERAGE_CFG.maxFieldIters; iter++) {
@@ -1426,25 +1429,25 @@
 
   function evaluateCoverageAtHalfMm(surfaces, wavePreset, sensorX, halfMm, rayCount = 101) {
     const half = Math.max(0.05, Number(halfMm) || 0);
-    const req = requiredFieldForSensorHalfMm(surfaces, wavePreset, sensorX, half);
+    const halfEval = Math.max(0.05, half + Math.max(0, IMAGE_CIRCLE_CFG.edgeGuardMm || 0));
+    const req = requiredFieldForSensorHalfMm(surfaces, wavePreset, sensorX, halfEval);
     if (!Number.isFinite(req)) {
       return {
-        ok: false, req: null,
+        ok: false, req: null, halfEvalMm: halfEval,
         vigFrac: null, validFrac: null, insideFrac: null,
         reqVigPct: null, reqValidPct: null, reqInsidePct: null,
       };
     }
 
-    const halfEff = Math.max(0.05, half - Math.max(0, IMAGE_CIRCLE_CFG.edgeGuardMm || 0));
     const chiefR = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, req);
-    const chiefOk = Number.isFinite(chiefR) && chiefR <= halfEff + (IMAGE_CIRCLE_CFG.sensorClipTolMm || 0);
+    const chiefOk = Number.isFinite(chiefR) && chiefR <= halfEval + (IMAGE_CIRCLE_CFG.sensorClipTolMm || 0);
 
-    const pack = traceBundleAtFieldCoverage(surfaces, req, rayCount, wavePreset, sensorX, halfEff);
+    const pack = traceBundleAtFieldCoverage(surfaces, req, rayCount, wavePreset, sensorX, halfEval);
     const vigFrac = Number.isFinite(pack?.vigFrac) ? pack.vigFrac : null;
     const validFrac = pack ? ((pack.n || 0) / Math.max(1, rayCount)) : null;
     const insideFrac = Number.isFinite(pack?.insideFrac) ? pack.insideFrac : null;
 
-    const pack0 = traceBundleAtFieldCoverage(surfaces, 0, rayCount, wavePreset, sensorX, halfEff);
+    const pack0 = traceBundleAtFieldCoverage(surfaces, 0, rayCount, wavePreset, sensorX, halfEval);
     const baseVig = Number.isFinite(pack0?.vigFrac) ? pack0.vigFrac : 1;
     const baseValid = pack0 ? ((pack0.n || 0) / Math.max(1, rayCount)) : 0;
 
@@ -1457,6 +1460,7 @@
     return {
       ok: !!chiefOk && reqVigOkAbs && reqVigOkRel && reqValidOkAbs && reqValidOkRel && reqInsideOk,
       req,
+      halfEvalMm: halfEval,
       vigFrac,
       validFrac,
       insideFrac,
@@ -1594,7 +1598,7 @@
     maxExtraReqVigFrac: 0.05, // edge clipping over on-axis baseline
     maxReqValidDrop: 0.10,    // max allowed valid-ray drop vs on-axis baseline
     sensorClipTolMm: 0.02,  // tiny tolerance for floating-point/rounding at the edge
-    edgeGuardMm: 0.90,      // safety margin so a reported "45mm" is visually clean in preview
+    edgeGuardMm: 0.90,      // conservative margin: reported IC must also survive this extra radius
   };
 
   function halfFieldFromDiagDeg(efl, diagMm) {
@@ -1830,8 +1834,8 @@
     if (ui.focusMode) ui.focusMode.value = "lens";
     if (ui.sensorOffset) ui.sensorOffset.value = "0";
 
-    const fieldAngle = Number(ui.fieldAngle?.value || 0);
-    const rayCount = Number(ui.rayCount?.value || 31);
+    const fieldAngle = num(ui.fieldAngle?.value, 0);
+    const rayCount = num(ui.rayCount?.value, 31);
     const wavePreset = ui.wavePreset?.value || "d";
 
     const res = bestLensShiftForDesign(lens.surfaces, fieldAngle, rayCount, wavePreset);
@@ -1972,7 +1976,7 @@
     let reqInsideFrac = null;
     if (Number.isFinite(req) && req > 0) {
       const reqHalfEff = Number.isFinite(reqHalfMm)
-        ? Math.max(0.1, reqHalfMm - Math.max(0, IMAGE_CIRCLE_CFG.edgeGuardMm || 0))
+        ? Math.max(0.1, reqHalfMm + Math.max(0, IMAGE_CIRCLE_CFG.edgeGuardMm || 0))
         : null;
       const packReq = traceBundleAtField(surfaces, req, rayCount, wavePreset, sensorX, reqHalfEff);
       reqVigFrac = packReq.vigFrac;
@@ -2095,7 +2099,7 @@
     const r = canvas.getBoundingClientRect();
     const cx = r.width / 2 + view.panX;
     const cy = r.height / 2 + view.panY;
-    const base = Number(ui.renderScale?.value || 1.25) * 3.2;
+    const base = num(ui.renderScale?.value, 1.25) * 3.2;
     const s = base * view.zoom;
     return { cx, cy, s };
   }
@@ -2517,15 +2521,15 @@
     if (!canvas || !ctx) return;
     if (ui.footerWarn) ui.footerWarn.textContent = "";
 
-    const fieldAngle = Number(ui.fieldAngle?.value || 0);
-    const rayCount   = Number(ui.rayCount?.value || 31);
+    const fieldAngle = num(ui.fieldAngle?.value, 0);
+    const rayCount   = num(ui.rayCount?.value, 31);
     const wavePreset = ui.wavePreset?.value || "d";
 
     const { w: sensorW, h: sensorH, halfH } = getSensorWH();
 
     const focusMode = String(ui.focusMode?.value || "cam").toLowerCase();
-    const sensorX = (focusMode === "cam") ? Number(ui.sensorOffset?.value || 0) : 0.0;
-    const lensShift = (focusMode === "lens") ? Number(ui.lensFocus?.value || 0) : 0;
+    const sensorX = (focusMode === "cam") ? num(ui.sensorOffset?.value, 0) : 0.0;
+    const lensShift = (focusMode === "lens") ? num(ui.lensFocus?.value, 0) : 0;
 
     computeVertices(lens.surfaces, lensShift, sensorX);
 
@@ -2598,8 +2602,8 @@
       reqHalfMm: covHalfMm,
       intrusion,
       efl, T, bfl,
-      targetEfl: Number(ui.optTargetFL?.value || NaN),
-      targetT: Number(ui.optTargetT?.value || NaN),
+      targetEfl: num(ui.optTargetFL?.value, NaN),
+      targetT: num(ui.optTargetT?.value, NaN),
       physPenalty: phys.penalty,
       hardInvalid: phys.hardFail,
     });
@@ -2610,7 +2614,7 @@
     const icTargetTxt = Number.isFinite(imageCircleTarget) ? `${fmtMmUp1(imageCircleTarget)}mm` : "—";
     covTxt = !fov
       ? "COV(D): —"
-      : `COV(D): ±${maxField.toFixed(1)}° • REQ(D): ${(req ?? 0).toFixed(1)}° • IC ${icDiagTxt}/${icTargetTxt} • ${coversStrict ? "COVERS ✅" : "NO ❌"}`;
+      : `COV(D): ±${maxField.toFixed(1)}° • REQ(D): ${Number.isFinite(req) ? req.toFixed(1) : "—"}° • IC ${icDiagTxt}/${icTargetTxt} • ${coversStrict ? "COVERS ✅" : "NO ❌"}`;
 
     const meritTxt =
       `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} ` +
@@ -3262,10 +3266,12 @@
     const covMode = COVERAGE_CFG.mode;
     const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
     const icProbeHalfMm = Math.max(covHalfMm, COVERAGE_CFG.icProbeHalfMm);
+    const covHalfEvalMm = covHalfMm + Math.max(0, IMAGE_CIRCLE_CFG.edgeGuardMm || 0);
+    const icProbeHalfEvalMm = icProbeHalfMm + Math.max(0, IMAGE_CIRCLE_CFG.edgeGuardMm || 0);
     const icTargetDiag = (covMode === "d") ? (2 * covHalfMm) : null;
-    const maxField = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfMm, rayCount);
-    const maxFieldIc = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, icProbeHalfMm, rayCount);
-    const req = requiredFieldForSensorHalfMm(surfaces, wavePreset, sensorX, covHalfMm);
+    const maxField = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfEvalMm, rayCount);
+    const maxFieldIc = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, icProbeHalfEvalMm, rayCount);
+    const req = requiredFieldForSensorHalfMm(surfaces, wavePreset, sensorX, covHalfEvalMm);
     const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
 
     const rearVx = lastPhysicalVertexX(surfaces);
