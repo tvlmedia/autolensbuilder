@@ -1505,120 +1505,55 @@
     const lensShift = af.shift;
     computeVertices(work, lensShift, sensorX);
 
-    const centerPack = traceBundleAtFieldForSoftIc(work, 0, wavePreset, sensorX, cfg.raysPerBundle);
-    const centerLocalFrac = Math.max(cfg.eps, Number(centerPack.localFrac || 0));
-    if (centerLocalFrac <= cfg.eps * 1.01) {
-      return {
-        softICmm: 0,
-        rEdge: 0,
-        relMin: Number(cfg.thresholdRel || 0.35),
-        thresholdRel: Number(cfg.thresholdRel || 0.35),
-        usableCircleDiameterMm: 0,
-        usableCircleRadiusMm: 0,
-        relAtCutoff: 0,
-        centerGoodFrac: centerLocalFrac,
-        centerLocalFrac,
-        samples: [],
-        focusLensShift: lensShift,
-        focusFailed: false,
-        drasticDropRadiusMm: null,
-      };
-    }
+   // --- center reference: use throughput, not "local band" ---
+const centerPack = traceBundleAtFieldForSoftIc(work, 0, wavePreset, sensorX, cfg.raysPerBundle);
+const centerGoodFrac = Math.max(cfg.eps, Number(centerPack.goodFrac || 0));
+if (centerGoodFrac <= cfg.eps * 1.01) {
+  return {
+    softICmm: 0,
+    rEdge: 0,
+    relMin: Number(cfg.thresholdRel || 0.35),
+    thresholdRel: Number(cfg.thresholdRel || 0.35),
+    usableCircleDiameterMm: 0,
+    usableCircleRadiusMm: 0,
+    relAtCutoff: 0,
+    centerGoodFrac,
+    samples: [],
+    focusLensShift: lensShift,
+    focusFailed: false,
+    drasticDropRadiusMm: null,
+  };
+}
 
-    const fieldSamples = [];
-    let mapFailRun = 0;
-    let beyondDiagRun = 0;
+// helper
+const cos4 = (deg) => {
+  const th = (deg * Math.PI) / 180;
+  const c = Math.max(0, Math.cos(th));
+  return c * c * c * c;
+};
 
-    const stepDeg = Math.max(0.1, Number(cfg.thetaStepDeg || 0.5));
-    const maxFieldDeg = Math.max(stepDeg, Number(cfg.maxFieldDeg || 60));
-    const minSamplesForBreak = Math.max(3, Number(cfg.minSamplesForBreak || 10) | 0);
-    const maxConsecutiveMapFails = Math.max(2, Number(cfg.maxConsecutiveMapFails || 8) | 0);
+...
 
-    for (let thetaDeg = 0; thetaDeg <= maxFieldDeg + 1e-9; thetaDeg += stepDeg) {
-      const pack = thetaDeg <= 1e-9
-        ? centerPack
-        : traceBundleAtFieldForSoftIc(work, thetaDeg, wavePreset, sensorX, cfg.raysPerBundle);
-      if (!pack.valid) continue;
-      const rMm = Number.isFinite(pack.rMm) ? pack.rMm : null;
-      if (!Number.isFinite(rMm)) {
-        mapFailRun++;
-        if (fieldSamples.length >= minSamplesForBreak && mapFailRun >= maxConsecutiveMapFails) break;
-        continue;
-      }
-      mapFailRun = 0;
+// inside for-loop where you push fieldSamples:
+const goodFrac = clamp(pack.goodFrac, 0, 1);
+const g = goodFrac * cos4(thetaDeg); // <-- KEY CHANGE
 
-      const goodFrac = clamp(pack.goodFrac, 0, 1);
-      const localFrac = clamp(Number(pack.localFrac || 0), 0, 1);
-      fieldSamples.push({
-        rMm,
-        thetaDeg,
-        goodFrac,
-        localFrac,
-        rawRel: clamp(localFrac / centerLocalFrac, 0, 1),
-        mountFrac: pack.mountFrac,
-      });
+fieldSamples.push({
+  rMm,
+  thetaDeg,
+  goodFrac,
+  localFrac: clamp(Number(pack.localFrac || 0), 0, 1), // keep for debugging if you want
+  rawRel: clamp(g / (centerGoodFrac * cos4(0)), 0, 1),
+  gain: g,
+  mountFrac: pack.mountFrac,
+});
 
-      if (Number.isFinite(rMm) && rMm > halfDiag + Math.max(0.1, Number(cfg.diagMarginMm || 0))) {
-        beyondDiagRun++;
-      } else {
-        beyondDiagRun = 0;
-      }
-      if (fieldSamples.length >= minSamplesForBreak && beyondDiagRun >= 2) break;
-    }
+...
 
-    const ordered = fieldSamples
-      .filter((s) => Number.isFinite(s.rMm))
-      .sort((a, b) => a.rMm - b.rMm);
-    if (!ordered.length) {
-      return {
-        softICmm: 0,
-        rEdge: 0,
-        relMin: Number(cfg.thresholdRel || 0.35),
-        thresholdRel: Number(cfg.thresholdRel || 0.35),
-        usableCircleDiameterMm: 0,
-        usableCircleRadiusMm: 0,
-        relAtCutoff: 0,
-        centerGoodFrac: centerLocalFrac,
-        centerLocalFrac,
-        samples: [],
-        focusLensShift: lensShift,
-        focusFailed: false,
-        drasticDropRadiusMm: null,
-      };
-    }
-
-    const merged = [];
-    for (const s of ordered) {
-      const prev = merged[merged.length - 1];
-      if (prev && s.rMm <= prev.rMm + 1e-6) {
-        prev.goodFrac = Math.min(prev.goodFrac, s.goodFrac);
-        prev.localFrac = Math.min(prev.localFrac, s.localFrac);
-        prev.rawRel = Math.min(prev.rawRel, s.rawRel);
-        prev.mountFrac = Math.max(prev.mountFrac, s.mountFrac);
-        prev.thetaDeg = Math.max(prev.thetaDeg, s.thetaDeg);
-        continue;
-      }
-      merged.push({ ...s });
-    }
-
-    if (!merged.length || merged[0].rMm > 1e-6) {
-      merged.unshift({
-        rMm: 0,
-        thetaDeg: 0,
-        goodFrac: Math.max(0, Number(centerPack.goodFrac || 0)),
-        localFrac: centerLocalFrac,
-        rawRel: 1,
-        mountFrac: centerPack.mountFrac,
-      });
-    } else {
-      merged[0].rMm = 0;
-      merged[0].goodFrac = Math.max(merged[0].goodFrac, Number(centerPack.goodFrac || 0));
-      merged[0].localFrac = Math.max(merged[0].localFrac, centerLocalFrac);
-      merged[0].rawRel = 1;
-    }
-
-    const radialMm = merged.map((s) => s.rMm);
-    const gainCurve = merged.map((s) => clamp(s.localFrac, 0, 1));
+// when building curve inputs:
+const radialMm  = merged.map((s) => s.rMm);
+const gainCurve = merged.map((s) => clamp(Number(s.gain ?? s.goodFrac ?? 0), 0, 1)); // <-- KEY CHANGE
+const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg);
     const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg);
 
     const relCurve = (uc.relCurve?.length === merged.length)
