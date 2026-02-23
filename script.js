@@ -83,6 +83,7 @@
     // Optimizer
     optTargetFL: $("#optTargetFL"),
     optTargetT: $("#optTargetT"),
+    optTargetIC: $("#optTargetIC"),
     optIters: $("#optIters"),
     optPop: $("#optPop"),
     optLog: $("#optLog"),
@@ -1257,15 +1258,22 @@
   }
 
   const SOFT_IC_CFG = {
-    thresholdRel: 0.35, // usable circle @ 35% of center illumination
+    thresholdRel: 0.36, // usable circle @ 36% of center illumination
     bgOverscan: 1.6,     // match Render Engine OV mapping
     bgLutSamples: 900,   // match Render Engine LUT density
-    bgPupilSqrt: 14,     // match Render Engine "normal" pupil sampling
+    bgPupilSqrt: 16,     // denser pupil sampling for tighter edge estimate
     bgObjDistMm: 2000,   // object plane distance for reverse ray hit test
     bgStartEpsMm: 0.05,  // avoid exact sensor plane degeneracy
     minSamplesForCurve: 8,
     smoothingHalfWindow: 3,
     eps: 1e-6,
+  };
+
+  // Faster IC estimator for optimizer loop (keeps search responsive).
+  const OPT_IC_CFG = {
+    bgLutSamples: 96,
+    bgPupilSqrt: 5,
+    smoothingHalfWindow: 2,
   };
 
   function softIcLabel(cfg = SOFT_IC_CFG) {
@@ -1419,32 +1427,44 @@
     return c * c * c * c;
   }
 
-  function estimateUsableCircleBackgroundLut(surfaces, sensorW, sensorH, wavePreset, rayCount) {
-    const cfg = SOFT_IC_CFG;
+  function estimateUsableCircleBackgroundLut(
+    surfaces,
+    sensorW,
+    sensorH,
+    wavePreset,
+    rayCount,
+    cfgOverride = null,
+    focusOpts = null
+  ) {
+    const cfg = { ...SOFT_IC_CFG, ...(cfgOverride || {}) };
     const sensorX = 0.0;
     const halfDiag = 0.5 * Math.hypot(sensorW, sensorH);
     const ov = Math.max(1.0, Number(cfg.bgOverscan || 1.6));
     const work = clone(surfaces);
+    const useFocusedGeometry = !!focusOpts?.useCurrentGeometry;
+    let lensShift = Number(focusOpts?.lensShift || 0);
 
-    const af = bestLensShiftForDesign(work, 0, Math.max(21, rayCount | 0), wavePreset);
-    if (!af.ok) {
-      return {
-        softICmm: 0, rEdge: 0,
-        relMin: Number(cfg.thresholdRel || 0.35),
-        thresholdRel: Number(cfg.thresholdRel || 0.35),
-        usableCircleDiameterMm: 0,
-        usableCircleRadiusMm: 0,
-        relAtCutoff: 0,
-        centerGoodFrac: 0,
-        samples: [],
-        focusLensShift: 0,
-        focusFailed: true,
-        drasticDropRadiusMm: null,
-      };
+    if (!useFocusedGeometry) {
+      const af = bestLensShiftForDesign(work, 0, Math.max(21, rayCount | 0), wavePreset);
+      if (!af.ok) {
+        return {
+          softICmm: 0, rEdge: 0,
+          relMin: Number(cfg.thresholdRel || 0.35),
+          thresholdRel: Number(cfg.thresholdRel || 0.35),
+          usableCircleDiameterMm: 0,
+          usableCircleRadiusMm: 0,
+          relAtCutoff: 0,
+          centerGoodFrac: 0,
+          samples: [],
+          focusLensShift: 0,
+          focusFailed: true,
+          drasticDropRadiusMm: null,
+        };
+      }
+
+      lensShift = af.shift;
+      computeVertices(work, lensShift, sensorX);
     }
-
-    const lensShift = af.shift;
-    computeVertices(work, lensShift, sensorX);
 
     const stopIdx = findStopSurfaceIndex(work);
     const stopSurf = stopIdx >= 0 ? work[stopIdx] : work[0];
@@ -1989,6 +2009,7 @@
       renderScale: ui.renderScale?.value || "1.25",
       optTargetFL: ui.optTargetFL?.value || "75",
       optTargetT: ui.optTargetT?.value || "2.0",
+      optTargetIC: ui.optTargetIC?.value || "0",
       optIters: ui.optIters?.value || "2000",
       optPop: ui.optPop?.value || "safe",
     };
@@ -2009,6 +2030,7 @@
     set(ui.renderScale, snap.renderScale);
     set(ui.optTargetFL, snap.optTargetFL);
     set(ui.optTargetT, snap.optTargetT);
+    set(ui.optTargetIC, snap.optTargetIC);
     set(ui.optIters, snap.optIters);
     set(ui.optPop, snap.optPop);
   }
@@ -3393,7 +3415,16 @@
     return sanitizeLens(L);
   }
 
-  function evalLensMerit(lensObj, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH}){
+  function evalLensMerit(lensObj, {
+    targetEfl,
+    targetT,
+    targetIC = 0,
+    fieldAngle,
+    rayCount,
+    wavePreset,
+    sensorW,
+    sensorH
+  }){
     const tmp = clone(lensObj);
     const surfaces = tmp.surfaces;
 
@@ -3412,10 +3443,13 @@
 
     if (phys.hardFail) {
       const score = MERIT_CFG.hardInvalidPenalty + Math.max(0, Number(phys.penalty || 0));
+      const icShortfallMm = Number.isFinite(targetIC) && targetIC > 0 ? targetIC : 0;
       return {
         score,
         efl: null,
         T: null,
+        softIcMm: 0,
+        icShortfallMm,
         bfl: null,
         intrusion: 0,
         vigFrac: 1,
@@ -3466,11 +3500,29 @@
 
     // tiny extra: hard fail if NaNs
     const score = Number.isFinite(meritRes.merit) ? meritRes.merit : 1e9;
+    let softIcMm = null;
+    let icShortfallMm = 0;
+    if (Number.isFinite(targetIC) && targetIC > 0) {
+      const icRes = estimateUsableCircleBackgroundLut(
+        surfaces,
+        sensorW,
+        sensorH,
+        wavePreset,
+        Math.max(15, Math.min(41, rayCount | 0)),
+        OPT_IC_CFG,
+        { useCurrentGeometry: true, lensShift }
+      );
+      const measured = Number(icRes?.usableCircleDiameterMm ?? icRes?.softICmm ?? 0);
+      softIcMm = Number.isFinite(measured) ? measured : 0;
+      icShortfallMm = Math.max(0, Number(targetIC) - softIcMm);
+    }
 
     return {
       score,
       efl,
       T,
+      softIcMm,
+      icShortfallMm,
       bfl,
       intrusion,
       vigFrac,
@@ -3482,12 +3534,42 @@
     };
   }
 
+  function evalSortKey(ev, targetIC) {
+    const score = Number.isFinite(ev?.score) ? Number(ev.score) : 1e9;
+    if (!(Number.isFinite(targetIC) && targetIC > 0)) {
+      return { shortfall: 0, score };
+    }
+    const measured = Number.isFinite(ev?.softIcMm) ? Number(ev.softIcMm) : 0;
+    return {
+      shortfall: Math.max(0, Number(targetIC) - measured),
+      score,
+    };
+  }
+
+  function isEvalBetterForTarget(a, b, targetIC) {
+    if (!b) return true;
+    const ka = evalSortKey(a, targetIC);
+    const kb = evalSortKey(b, targetIC);
+    if (Number.isFinite(targetIC) && targetIC > 0) {
+      if (Math.abs(ka.shortfall - kb.shortfall) > 0.02) return ka.shortfall < kb.shortfall;
+    }
+    return ka.score < kb.score;
+  }
+
+  function fmtIcOpt(evalRes, targetIC) {
+    if (!(Number.isFinite(targetIC) && targetIC > 0)) return "IC target off";
+    const ic = Number(evalRes?.softIcMm || 0);
+    const sf = Math.max(0, Number(targetIC) - ic);
+    return `IC ${Number.isFinite(ic) ? ic.toFixed(2) : "—"}mm (target ${targetIC.toFixed(2)} • short ${sf.toFixed(2)})`;
+  }
+
   async function runOptimizer(){
     if (optRunning) return;
     optRunning = true;
 
     const targetEfl = num(ui.optTargetFL?.value, 75);
     const targetT = num(ui.optTargetT?.value, 2.0);
+    const targetIC = Math.max(0, num(ui.optTargetIC?.value, 0));
     const iters = Math.max(10, (num(ui.optIters?.value, 2000) | 0));
     const mode = (ui.optPop?.value || "safe");
 
@@ -3501,7 +3583,7 @@
     const topo = captureTopology(startLens);
 
     let cur = startLens;
-    let curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+    let curEval = evalLensMerit(cur, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
 
     // annealing-ish
@@ -3519,16 +3601,26 @@
       const temp = temp0 * (1 - a) + temp1 * a;
 
       const cand = mutateLens(cur, mode, topo);
-      const candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+      const candEval = evalLensMerit(cand, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
 
       const d = candEval.score - curEval.score;
-      const accept = (d <= 0) || (Math.random() < Math.exp(-d / Math.max(1e-9, temp)));
+      const scoreAccept = (d <= 0) || (Math.random() < Math.exp(-d / Math.max(1e-9, temp)));
+      let accept = scoreAccept;
+      if (targetIC > 0) {
+        const sCur = Math.max(0, Number(curEval.icShortfallMm || 0));
+        const sCand = Math.max(0, Number(candEval.icShortfallMm || 0));
+        if (sCand < sCur - 0.02) {
+          accept = true;
+        } else if (sCand > sCur + 0.02 && d > -0.25) {
+          accept = false;
+        }
+      }
       if (accept){
         cur = cand;
         curEval = candEval;
       }
 
-      if (candEval.score < best.eval.score){
+      if (isEvalBetterForTarget(candEval, best.eval, targetIC)){
         best = { lens: clone(cand), eval: candEval, iter: i };
 
         // UI update (rare)
@@ -3538,6 +3630,7 @@
             `score ${best.eval.score.toFixed(2)}\n` +
             `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
             `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
+            `${fmtIcOpt(best.eval, targetIC)}\n` +
             `Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}%\n` +
             `INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
             `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
@@ -3553,6 +3646,7 @@
           setOptLog(
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
             `current ${curEval.score.toFixed(2)} • best ${best.eval.score.toFixed(2)} @${best.iter}\n` +
+            `current ${fmtIcOpt(curEval, targetIC)}\n` +
             `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}% • INTR ${best.eval.intrusion.toFixed(2)}mm\n`
           );
         }
@@ -3572,6 +3666,7 @@
         `BEST score ${best.eval.score.toFixed(2)}\n` +
         `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
         `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
+        `${fmtIcOpt(best.eval, targetIC)}\n` +
         `Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}%\n` +
         `INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
         `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
@@ -3579,7 +3674,11 @@
       );
     }
 
-    toast(optBest ? `Optimize done. Best merit ${optBest.eval.score.toFixed(2)}` : "Optimize stopped");
+    toast(
+      optBest
+        ? `Optimize done. Best score ${optBest.eval.score.toFixed(2)}${targetIC > 0 ? ` • IC ${Number(optBest.eval.softIcMm || 0).toFixed(1)}mm` : ""}`
+        : "Optimize stopped"
+    );
   }
 
   function stopOptimizer(){
@@ -3603,6 +3702,7 @@
     const N = 200;
     const targetEfl = num(ui.optTargetFL?.value, 75);
     const targetT = num(ui.optTargetT?.value, 2.0);
+    const targetIC = Math.max(0, num(ui.optTargetIC?.value, 0));
     const { w: sensorW, h: sensorH } = getSensorWH();
     const fieldAngle = num(ui.fieldAngle?.value, 0);
     const rayCount = Math.max(9, Math.min(61, (num(ui.rayCount?.value, 31) | 0)));
@@ -3610,14 +3710,29 @@
 
     const t0 = performance.now();
     let best = Infinity;
+    let bestIc = 0;
+    let bestShort = Infinity;
     for (let i=0;i<N;i++){
-      const res = evalLensMerit(lens, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+      const res = evalLensMerit(lens, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
       if (res.score < best) best = res.score;
+      if (targetIC > 0) {
+        const s = Math.max(0, Number(res.icShortfallMm || 0));
+        if (s < bestShort) {
+          bestShort = s;
+          bestIc = Number(res.softIcMm || 0);
+        }
+      }
     }
     const t1 = performance.now();
     const sec = (t1 - t0)/1000;
     const eps = N / Math.max(1e-6, sec);
-    setOptLog(`bench ${N} evals\n${eps.toFixed(1)} eval/s\nbest seen ${best.toFixed(2)}\n(rays=${rayCount}, field=${fieldAngle}°, wave=${wavePreset})`);
+    setOptLog(
+      `bench ${N} evals\n` +
+      `${eps.toFixed(1)} eval/s\n` +
+      `best seen ${best.toFixed(2)}\n` +
+      `${targetIC > 0 ? `IC best ${bestIc.toFixed(2)}mm • short ${bestShort.toFixed(2)}mm\n` : ""}` +
+      `(rays=${rayCount}, field=${fieldAngle}°, wave=${wavePreset})`
+    );
     toast(`Bench: ${eps.toFixed(1)} eval/s`);
   }
 
@@ -3675,11 +3790,11 @@
     ui.btnOptApply?.addEventListener("click", applyBest);
     ui.btnOptBench?.addEventListener("click", benchOptimizer);
 
-    ["optTargetFL","optTargetT","optIters","optPop"].forEach((id)=>{
+    ["optTargetFL","optTargetT","optTargetIC","optIters","optPop"].forEach((id)=>{
       ui[id]?.addEventListener("change", () => { scheduleRenderAll(); scheduleAutosave(); });
       ui[id]?.addEventListener("input", () => {
         // don't rerender constantly for iters/preset; but update merit targets
-        if (id === "optTargetFL" || id === "optTargetT") scheduleRenderAll();
+        if (id === "optTargetFL" || id === "optTargetT" || id === "optTargetIC") scheduleRenderAll();
         scheduleAutosave();
       });
     });
