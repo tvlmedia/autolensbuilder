@@ -1656,33 +1656,23 @@
   }
 
   function getSoftIcForCurrentLens(surfaces, sensorW, sensorH, wavePreset, rayCount) {
-    const keyObj = {
-      wavePreset,
-      rayCount,
-      sensorW: Number(sensorW).toFixed(3),
-      sensorH: Number(sensorH).toFixed(3),
-      softCfg: {
-        thresholdRel: Number(SOFT_IC_CFG.thresholdRel).toFixed(4),
-        localBandMm: Number(SOFT_IC_CFG.localBandMm).toFixed(3),
-        thetaStepDeg: Number(SOFT_IC_CFG.thetaStepDeg).toFixed(4),
-        maxFieldDeg: Number(SOFT_IC_CFG.maxFieldDeg).toFixed(3),
-        smoothingHalfWindow: Number(SOFT_IC_CFG.smoothingHalfWindow).toFixed(0),
-      },
-      surfaces: (surfaces || []).map((s) => ({
-        type: String(s.type || ""),
-        R: Number(s.R || 0).toFixed(6),
-        t: Number(s.t || 0).toFixed(6),
-        ap: Number(s.ap || 0).toFixed(6),
-        glass: String(s.glass || "AIR"),
-        stop: !!s.stop,
-      })),
+    // Image Circle calculation intentionally disabled for now.
+    return {
+      softICmm: 0,
+      rEdge: 0,
+      relMin: Number(SOFT_IC_CFG.thresholdRel || 0.35),
+      thresholdRel: Number(SOFT_IC_CFG.thresholdRel || 0.35),
+      usableCircleDiameterMm: 0,
+      usableCircleRadiusMm: 0,
+      relAtCutoff: 0,
+      centerGoodFrac: 0,
+      centerLocalFrac: 0,
+      samples: [],
+      focusLensShift: 0,
+      focusFailed: false,
+      drasticDropRadiusMm: null,
+      disabled: true,
     };
-    const key = JSON.stringify(keyObj);
-    if (key === _softIcCacheKey && _softIcCacheVal) return _softIcCacheVal;
-    const val = estimateSoftImageCircleStandalone(surfaces, sensorW, sensorH, wavePreset, rayCount);
-    _softIcCacheKey = key;
-    _softIcCacheVal = val;
-    return val;
   }
 
   function estimateDistortionPct(surfaces, wavePreset, sensorX, sensorW, sensorH, efl, mode = "d") {
@@ -2498,11 +2488,7 @@
       ? "FOV: —"
       : `FOV: H ${fov.hfov.toFixed(1)}° • V ${fov.vfov.toFixed(1)}° • D ${fov.dfov.toFixed(1)}°`;
 
-    const softIc = getSoftIcForCurrentLens(lens.surfaces, sensorW, sensorH, wavePreset, rayCount);
-    const softIcName = softIcLabel();
-    const softIcTxt = softIc.focusFailed
-      ? `${softIcName}: focus failed`
-      : `${softIcName}: ${softIc.softICmm.toFixed(2)}mm • center ${(softIc.centerGoodFrac * 100).toFixed(0)}%`;
+    const softIcTxt = "IC: —";
 
     const distPct = estimateDistortionPct(lens.surfaces, wavePreset, sensorX, sensorW, sensorH, efl, "d");
 
@@ -2565,7 +2551,7 @@
     if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
     if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T_eff≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
-    if (ui.softICTop) ui.softICTop.textContent = ui.softIC?.textContent || `${softIcName}: —`;
+    if (ui.softICTop) ui.softICTop.textContent = ui.softIC?.textContent || "IC: —";
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.distTop) ui.distTop.textContent = ui.dist?.textContent || `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
 
@@ -2589,7 +2575,7 @@
     if (ui.metaInfo) {
       ui.metaInfo.textContent =
         `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm • ` +
-        (softIc.focusFailed ? `${softIcName} focus failed` : `${softIcName} ${softIc.softICmm.toFixed(2)}mm`);
+        "IC —";
     }
 
     resizeCanvasToCSS();
