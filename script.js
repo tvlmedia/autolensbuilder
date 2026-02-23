@@ -32,6 +32,7 @@
     bfl: $("#badgeBfl"),
     tstop: $("#badgeT"),
     vig: $("#badgeVig"),
+    softIC: $("#badgeSoftIC"),
     dist: $("#badgeDist"),
     fov: $("#badgeFov"),
     merit: $("#badgeMerit"),
@@ -42,6 +43,7 @@
     eflTop: $("#badgeEflTop"),
     bflTop: $("#badgeBflTop"),
     tstopTop: $("#badgeTTop"),
+    softICTop: $("#badgeSoftICTop"),
     fovTop: $("#badgeFovTop"),
     distTop: $("#badgeDistTop"),
     meritTop: $("#badgeMeritTop"),
@@ -2325,12 +2327,18 @@
       ui.tstop.textContent = `T_eff≈ ${T == null ? "—" : "T" + T.toFixed(2)} (${Tgeom == null ? "geom —" : "geom T" + Tgeom.toFixed(2)})`;
     }
     if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
+    if (ui.softIC) {
+      ui.softIC.textContent = softIc.focusFailed
+        ? "SoftIC20: focus failed"
+        : `SoftIC20: ${softIc.softICmm.toFixed(2)}mm • center ${(softIc.centerGoodFrac * 100).toFixed(0)}%`;
+    }
     if (ui.dist) ui.dist.textContent = `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
     if (ui.fov) ui.fov.textContent = fovTxt;
 
     if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
     if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T_eff≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
+    if (ui.softICTop) ui.softICTop.textContent = ui.softIC?.textContent || "SoftIC20: —";
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.distTop) ui.distTop.textContent = ui.dist?.textContent || `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
 
