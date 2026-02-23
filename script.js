@@ -1505,14 +1505,10 @@
     const lensShift = af.shift;
     computeVertices(work, lensShift, sensorX);
 
-   // --- center reference: use throughput, not "local band" ---
+ // --- center reference: use throughput, not "local band" ---
 const centerPack = traceBundleAtFieldForSoftIc(work, 0, wavePreset, sensorX, cfg.raysPerBundle);
-
-// we houden centerLocalFrac nog even voor debug/compat (mag later weg)
-const centerLocalFrac = Math.max(cfg.eps, Number(centerPack.localFrac || 0));
-
-// maar: center reference voor IC moet throughput zijn, niet “local band”
-const centerGoodFrac = Math.max(cfg.eps, Number(centerPack.goodFrac || 0));
+const centerLocalFrac = Math.max(cfg.eps, Number(centerPack.localFrac || 0)); // debug only
+const centerGoodFrac  = Math.max(cfg.eps, Number(centerPack.goodFrac  || 0)); // REAL reference
 
 if (centerGoodFrac <= cfg.eps * 1.01) {
   return {
@@ -1539,31 +1535,72 @@ const cos4 = (deg) => {
   return c * c * c * c;
 };
 
-...
+const thetaStep = Math.max(0.05, Number(cfg.thetaStepDeg || 0.5));
+const maxField  = Math.max(0.5, Number(cfg.maxFieldDeg || 60));
 
-// inside for-loop where you push fieldSamples:
-const goodFrac = clamp(pack.goodFrac, 0, 1);
-const localFrac = clamp(Number(pack.localFrac || 0), 0, 1);
+const fieldSamples = [];
+let consecutiveFails = 0;
 
-// brightness/throughput proxy:
-const gain = clamp(goodFrac * cos4(thetaDeg), 0, 1);
-const gain0 = clamp(centerGoodFrac * cos4(0), cfg.eps, 1);
+for (let thetaDeg = 0; thetaDeg <= maxField + 1e-9; thetaDeg += thetaStep) {
+  const pack = traceBundleAtFieldForSoftIc(work, thetaDeg, wavePreset, sensorX, cfg.raysPerBundle);
+  const rMm = Number.isFinite(pack.rMm) ? Number(pack.rMm) : null;
 
-fieldSamples.push({
-  rMm,
-  thetaDeg,
-  goodFrac,
-  localFrac,                 // houden voor debug
-  gain,                      // <-- nieuw
-  rawRel: clamp(gain / gain0, 0, 1),
-  mountFrac: pack.mountFrac,
-});
+  if (!Number.isFinite(rMm)) {
+    consecutiveFails++;
+    if (consecutiveFails >= Number(cfg.maxConsecutiveMapFails || 8)) break;
+    continue;
+  }
+  consecutiveFails = 0;
 
-// when building curve inputs:
+  const goodFrac = clamp(pack.goodFrac, 0, 1);
+  const localFrac = clamp(Number(pack.localFrac || 0), 0, 1);
+
+  // brightness proxy
+  const gain  = clamp(goodFrac * cos4(thetaDeg), 0, 1);
+  const gain0 = clamp(centerGoodFrac * cos4(0), cfg.eps, 1);
+
+  fieldSamples.push({
+    rMm,
+    thetaDeg,
+    goodFrac,
+    localFrac, // debug
+    gain,
+    rawRel: clamp(gain / gain0, 0, 1),
+    mountFrac: pack.mountFrac,
+  });
+
+  // optional early break if we already far beyond diag (prevents wasting time)
+  if (rMm > halfDiag + Number(cfg.diagMarginMm || 0.75) && fieldSamples.length >= Number(cfg.minSamplesForBreak || 10)) {
+    break;
+  }
+}
+
+// merge / sort
+const merged = fieldSamples
+  .filter((s) => Number.isFinite(s.rMm))
+  .sort((a, b) => a.rMm - b.rMm);
+
+// ensure center sample exists
+if (!merged.length || merged[0].rMm > 1e-6) {
+  merged.unshift({
+    rMm: 0,
+    thetaDeg: 0,
+    goodFrac: Math.max(0, Number(centerPack.goodFrac || 0)),
+    localFrac: centerLocalFrac,
+    gain: clamp(centerGoodFrac * cos4(0), 0, 1),
+    rawRel: 1,
+    mountFrac: centerPack.mountFrac,
+  });
+} else {
+  // make sure first sample has gain
+  merged[0].gain = Math.max(Number(merged[0].gain || 0), clamp(centerGoodFrac * cos4(0), 0, 1));
+  merged[0].rawRel = 1;
+}
+
+// build curve + compute usable circle
 const radialMm  = merged.map((s) => s.rMm);
-const gainCurve = merged.map((s) => clamp(Number(s.gain ?? s.goodFrac ?? 0), 0, 1)); // <-- KEY CHANGE
+const gainCurve = merged.map((s) => clamp(Number(s.gain || 0), 0, 1));
 const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg);
-    const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg);
 
     const relCurve = (uc.relCurve?.length === merged.length)
       ? uc.relCurve
@@ -1609,8 +1646,8 @@ const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg);
       usableCircleDiameterMm: softICmm,
       usableCircleRadiusMm: rEdge,
       relAtCutoff: Number(uc.relAtCutoff || 0),
-      centerGoodFrac: centerLocalFrac,
-      centerLocalFrac,
+      centerGoodFrac,
+centerLocalFrac,
       samples,
       focusLensShift: lensShift,
       focusFailed: false,
