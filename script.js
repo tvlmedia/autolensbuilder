@@ -2345,10 +2345,10 @@
       ? Math.abs(bd.imageCircleDiagGeom - bd.imageCircleDiag) >= 0.35
       : false;
     const icCompactTxt = icSplit
-      ? `${icDiagTxt} illum / ${icGeomTxt} geom`
+      ? `${icGeomTxt} geom / ${icDiagTxt} illum`
       : icDiagTxt;
     const icFullTxt = icSplit
-      ? `${icDiagTxt} illum / ${icGeomTxt} geom / ${icTargetTxt}`
+      ? `${icGeomTxt} geom / ${icDiagTxt} illum / ${icTargetTxt}`
       : `${icDiagTxt} / ${icTargetTxt}`;
     covTxt = !fov
       ? "COV(D): —"
@@ -2410,7 +2410,7 @@
         `Center vignette too high (${bd.vigCenterPct ?? "—"}%). Increase middle/stop apertures.`;
     } else if (!bd.imageCircleOk && ui.footerWarn) {
       ui.footerWarn.textContent =
-        `Image circle too small (illum): ${icDiagTxt}${icSplit ? ` (geom ${icGeomTxt})` : ""}. Required: ${icTargetTxt} (target >= ${IMAGE_CIRCLE_CFG.minDiagMm.toFixed(0)}mm for full frame).`;
+        `Image circle too small (illum): ${icDiagTxt}${icSplit ? `, geom is ${icGeomTxt}` : ""}. Required: ${icTargetTxt} (target >= ${IMAGE_CIRCLE_CFG.minDiagMm.toFixed(0)}mm for full frame).`;
     } else if (phys.airGapCount < PHYS_CFG.minAirGapsPreferred && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Few air gaps (${phys.airGapCount}); aim for >= ${PHYS_CFG.minAirGapsPreferred} for practical designs.`;
@@ -2834,7 +2834,7 @@
     guardFailPenalty: 900000.0,
     maxSurfaceCount: 32,
   };
-  const AD_BUILD_TAG = "v2-rescue-r11";
+  const AD_BUILD_TAG = "v2-rescue-r12";
 
   const AD_GLASS_CLASSES = {
     CROWN: ["N-BK7HT", "N-BAK4", "N-BAK2", "N-K5", "N-PSK3", "N-SK14"],
