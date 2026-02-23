@@ -1122,6 +1122,45 @@
     return endRay.p.y + t * endRay.d.y;
   }
 
+  function chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, fieldDeg) {
+    const chief = buildChiefRay(surfaces, fieldDeg);
+    const tr = traceRayForward(clone(chief), surfaces, wavePreset);
+    if (!tr || tr.vignetted || tr.tir) return null;
+    const y = rayHitYAtX(tr.endRay, sensorX);
+    return Number.isFinite(y) ? Math.abs(y) : null;
+  }
+
+  // Inverse chief mapping: which field angle lands chief ray at this sensor half-size.
+  function requiredFieldForSensorHalfMm(surfaces, wavePreset, sensorX, targetHalfMm, maxDeg = 80) {
+    const tgt = Math.max(0, Number(targetHalfMm) || 0);
+    if (tgt <= 1e-9) return 0;
+
+    let lo = 0;
+    let yLo = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, lo);
+    if (!Number.isFinite(yLo)) return null;
+    if (yLo >= tgt) return 0;
+
+    let hi = 0.75;
+    let yHi = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, hi);
+    while (Number.isFinite(yHi) && yHi < tgt && hi < maxDeg) {
+      lo = hi;
+      yLo = yHi;
+      hi = Math.min(maxDeg, hi * 1.45 + 0.4);
+      yHi = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, hi);
+    }
+
+    if (!Number.isFinite(yHi) || yHi < tgt) return null;
+
+    for (let i = 0; i < 28; i++) {
+      const mid = 0.5 * (lo + hi);
+      const yMid = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, mid);
+      if (!Number.isFinite(yMid)) { hi = mid; continue; }
+      if (yMid >= tgt) hi = mid;
+      else lo = mid;
+    }
+    return hi;
+  }
+
   function coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, halfH, rayCount = 31) {
     const covRays = Math.max(
       COVERAGE_CFG.covRayCountMin,
@@ -2216,9 +2255,7 @@
     const icTargetDiag = (covMode === "d") ? (2 * covHalfMm) : null;
     const maxField = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, covHalfMm, strictRayCount);
     const maxFieldIc = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, icProbeHalfMm, strictRayCount);
-    const reqFloor = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
-    const reqFromFov = coversSensorYesNo({ fov, maxField, mode: covMode, marginDeg: COVERAGE_CFG.marginDeg }).req;
-    const req = Number.isFinite(reqFloor) ? reqFloor : reqFromFov;
+    const req = requiredFieldForSensorHalfMm(lens.surfaces, wavePreset, sensorX, covHalfMm);
     const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
 
     let covTxt = !fov
@@ -2935,7 +2972,7 @@
     const icTargetDiag = (covMode === "d") ? (2 * covHalfMm) : null;
     const maxField = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfMm, rayCount);
     const maxFieldIc = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, icProbeHalfMm, rayCount);
-    const req = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
+    const req = requiredFieldForSensorHalfMm(surfaces, wavePreset, sensorX, covHalfMm);
     const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
 
     const rearVx = lastPhysicalVertexX(surfaces);
