@@ -32,6 +32,7 @@
     bfl: $("#badgeBfl"),
     tstop: $("#badgeT"),
     vig: $("#badgeVig"),
+    imgCircle: $("#badgeIC"),
     dist: $("#badgeDist"),
     fov: $("#badgeFov"),
     merit: $("#badgeMerit"),
@@ -42,6 +43,7 @@
     eflTop: $("#badgeEflTop"),
     bflTop: $("#badgeBflTop"),
     tstopTop: $("#badgeTTop"),
+    imgCircleTop: $("#badgeICTop"),
     fovTop: $("#badgeFovTop"),
     distTop: $("#badgeDistTop"),
     meritTop: $("#badgeMeritTop"),
@@ -81,6 +83,7 @@
     // Optimizer
     optTargetFL: $("#optTargetFL"),
     optTargetT: $("#optTargetT"),
+    optTargetIC: $("#optTargetIC"),
     optIters: $("#optIters"),
     optPop: $("#optPop"),
     optLog: $("#optLog"),
@@ -1224,6 +1227,90 @@
     return Math.max(0.1, d * 0.5);
   }
 
+  const IMG_CIRCLE_CFG = {
+    subtleVignetteFrac: 0.08, // allow a little edge shading, reject obvious hard circular cutoff
+    minValidFrac: 0.90,       // keep most rays alive at the claimed edge
+    maxFieldDeg: 60,
+    coarseStepDeg: 1.5,
+    refineIters: 10,
+  };
+
+  function defaultTargetImageCircleMm(sensorW, sensorH) {
+    return Math.hypot(sensorW, sensorH);
+  }
+
+  function getTargetImageCircleMm(sensorW, sensorH) {
+    const v = num(ui.optTargetIC?.value, NaN);
+    if (Number.isFinite(v) && v > 0.1) return v;
+    return defaultTargetImageCircleMm(sensorW, sensorH);
+  }
+
+  function imageCircleEdgeSample(surfaces, fieldDeg, rayCount, wavePreset, sensorX, opts = {}) {
+    const minRays = Math.max(9, Number(opts.minRays || 15));
+    const maxRays = Math.max(minRays, Number(opts.maxRays || 41));
+    const sampleRays = Math.max(minRays, Math.min(maxRays, (rayCount | 0)));
+    const pack = traceBundleAtField(surfaces, fieldDeg, sampleRays, wavePreset, sensorX);
+    const validFrac = pack.n / Math.max(1, sampleRays);
+    const maxVig = Number.isFinite(opts.subtleVignetteFrac) ? opts.subtleVignetteFrac : IMG_CIRCLE_CFG.subtleVignetteFrac;
+    const minValid = Number.isFinite(opts.minValidFrac) ? opts.minValidFrac : IMG_CIRCLE_CFG.minValidFrac;
+    if (pack.vigFrac > maxVig) return null;
+    if (validFrac < minValid) return null;
+
+    const chief = buildChiefRay(surfaces, fieldDeg);
+    const chiefTr = traceRayForward(clone(chief), surfaces, wavePreset);
+    if (!chiefTr || chiefTr.vignetted || chiefTr.tir || !chiefTr.endRay) return null;
+    const y = rayHitYAtX(chiefTr.endRay, sensorX);
+    if (!Number.isFinite(y)) return null;
+
+    return {
+      halfSizeMm: Math.abs(y),
+      vigFrac: pack.vigFrac,
+      validFrac,
+      fieldDeg,
+    };
+  }
+
+  function estimateImageCircleMm(surfaces, wavePreset, sensorX, rayCount, opts = {}) {
+    const hiMax = Number.isFinite(opts.maxFieldDeg) ? opts.maxFieldDeg : IMG_CIRCLE_CFG.maxFieldDeg;
+    const step = Number.isFinite(opts.coarseStepDeg) ? opts.coarseStepDeg : IMG_CIRCLE_CFG.coarseStepDeg;
+    const refineIters = Number.isFinite(opts.refineIters) ? opts.refineIters : IMG_CIRCLE_CFG.refineIters;
+    let loField = 0;
+    let hiField = step;
+    let best = imageCircleEdgeSample(surfaces, 0, rayCount, wavePreset, sensorX, opts);
+    if (!best) return null;
+
+    for (let f = step; f <= hiMax + 1e-9; f += step) {
+      const sample = imageCircleEdgeSample(surfaces, f, rayCount, wavePreset, sensorX, opts);
+      if (!sample) {
+        hiField = f;
+        break;
+      }
+      best = sample;
+      loField = f;
+      hiField = Math.min(hiMax, f + step);
+    }
+
+    for (let i = 0; i < refineIters; i++) {
+      const mid = 0.5 * (loField + hiField);
+      const sample = imageCircleEdgeSample(surfaces, mid, rayCount, wavePreset, sensorX, opts);
+      if (sample) {
+        best = sample;
+        loField = mid;
+      } else {
+        hiField = mid;
+      }
+    }
+
+    if (!best || !Number.isFinite(best.halfSizeMm)) return null;
+    return {
+      diameterMm: Math.max(0, best.halfSizeMm * 2),
+      halfSizeMm: best.halfSizeMm,
+      edgeFieldDeg: best.fieldDeg,
+      vigFrac: best.vigFrac,
+      validFrac: best.validFrac,
+    };
+  }
+
   function estimateDistortionPct(surfaces, wavePreset, sensorX, sensorW, sensorH, efl, mode = "d") {
     const req = requiredHalfFieldDeg(efl, sensorW, sensorH, mode);
     const idealHalf = coverageHalfSizeMm(sensorW, sensorH, mode);
@@ -1255,6 +1342,7 @@
       renderScale: ui.renderScale?.value || "1.25",
       optTargetFL: ui.optTargetFL?.value || "75",
       optTargetT: ui.optTargetT?.value || "2.0",
+      optTargetIC: ui.optTargetIC?.value || "44.7",
       optIters: ui.optIters?.value || "2000",
       optPop: ui.optPop?.value || "safe",
     };
@@ -1275,6 +1363,7 @@
     set(ui.renderScale, snap.renderScale);
     set(ui.optTargetFL, snap.optTargetFL);
     set(ui.optTargetT, snap.optTargetT);
+    set(ui.optTargetIC, snap.optTargetIC);
     set(ui.optIters, snap.optIters);
     set(ui.optPop, snap.optPop);
   }
@@ -1424,6 +1513,7 @@
     // target terms (optimizer uses these)
     eflWeight: 0.35,          // penalty per mm error (squared)
     tWeight: 10.0,            // penalty per T error (squared)
+    imgCircleWeight: 10.0,    // penalty for missing target image circle (mm shortfall squared)
     bflMin: 52.0,             // for PL: discourage too-short backfocus
     bflWeight: 6.0,
     lowValidPenalty: 450.0,
@@ -1458,6 +1548,8 @@
     efl, T, bfl,
     targetEfl = null,
     targetT = null,
+    imageCircleMm = null,
+    targetImageCircleMm = null,
     physPenalty = 0,
     hardInvalid = false,
   }){
@@ -1517,6 +1609,10 @@
       const d = (T - targetT);
       merit += MERIT_CFG.tWeight * (d * d);
     }
+    if (Number.isFinite(targetImageCircleMm) && Number.isFinite(imageCircleMm)){
+      const shortfall = Math.max(0, targetImageCircleMm - imageCircleMm);
+      merit += MERIT_CFG.imgCircleWeight * (shortfall * shortfall);
+    }
 
     const minValidTarget = Math.max(7, Math.floor(rayCount * 0.45));
     if (validMin < minValidTarget) {
@@ -1534,6 +1630,8 @@
       fields: fields.map(v => Number.isFinite(v) ? v : 0),
       vigCenterPct: Math.round(vigCenter * 100),
       vigMidPct: Math.round(vigMid * 100),
+      imageCircleMm: Number.isFinite(imageCircleMm) ? imageCircleMm : null,
+      targetImageCircleMm: Number.isFinite(targetImageCircleMm) ? targetImageCircleMm : null,
       physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
       hardInvalid: !!hardInvalid,
     };
@@ -2034,6 +2132,11 @@
       ? "FOV: —"
       : `FOV: H ${fov.hfov.toFixed(1)}° • V ${fov.vfov.toFixed(1)}° • D ${fov.dfov.toFixed(1)}°`;
 
+    const targetImageCircle = getTargetImageCircleMm(sensorW, sensorH);
+    const imageCircle = estimateImageCircleMm(lens.surfaces, wavePreset, sensorX, rayCount);
+    const imageCircleMm = imageCircle?.diameterMm ?? null;
+    const imageCircleDelta = Number.isFinite(imageCircleMm) ? (imageCircleMm - targetImageCircle) : null;
+
     const distPct = estimateDistortionPct(lens.surfaces, wavePreset, sensorX, sensorW, sensorH, efl, "d");
 
     const rearVx = lastPhysicalVertexX(lens.surfaces);
@@ -2050,6 +2153,8 @@
       efl, T, bfl,
       targetEfl: num(ui.optTargetFL?.value, NaN),
       targetT: num(ui.optTargetT?.value, NaN),
+      imageCircleMm,
+      targetImageCircleMm: targetImageCircle,
       physPenalty: phys.penalty,
       hardInvalid: phys.hardFail,
     });
@@ -2084,12 +2189,18 @@
     if (ui.bfl) ui.bfl.textContent = `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstop) ui.tstop.textContent = `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
     if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
+    if (ui.imgCircle) {
+      ui.imgCircle.textContent = Number.isFinite(imageCircleMm)
+        ? `ImgCircle: ${imageCircleMm.toFixed(2)}mm (target ${targetImageCircle.toFixed(2)}mm)`
+        : `ImgCircle: — (target ${targetImageCircle.toFixed(2)}mm)`;
+    }
     if (ui.dist) ui.dist.textContent = `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
     if (ui.fov) ui.fov.textContent = fovTxt;
 
     if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
     if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
+    if (ui.imgCircleTop) ui.imgCircleTop.textContent = ui.imgCircle?.textContent || "ImgCircle: —";
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.distTop) ui.distTop.textContent = ui.dist?.textContent || `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
 
@@ -2101,6 +2212,9 @@
         `Few air gaps (${phys.airGapCount}); aim for >= ${PHYS_CFG.minAirGapsPreferred} for practical designs.`;
     } else if (tirCount > 0 && ui.footerWarn) {
       ui.footerWarn.textContent = `TIR on ${tirCount} rays (check glass / curvature).`;
+    } else if (Number.isFinite(imageCircleDelta) && imageCircleDelta < -0.05 && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `Image circle too small by ${Math.abs(imageCircleDelta).toFixed(2)}mm (target ${targetImageCircle.toFixed(2)}mm).`;
     }
 
     if (ui.status) {
@@ -2108,6 +2222,9 @@
         `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${meritTxt}`;
     }
     if (ui.metaInfo) ui.metaInfo.textContent = `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm`;
+    if (ui.metaInfo && Number.isFinite(imageCircleMm)) {
+      ui.metaInfo.textContent += ` • IC ${imageCircleMm.toFixed(2)}mm`;
+    }
 
     resizeCanvasToCSS();
     const r = canvas.getBoundingClientRect();
@@ -2134,6 +2251,7 @@
       `EFL ${eflTxt}`,
       `BFL ${bfl == null ? "—" : bfl.toFixed(2) + "mm"}`,
       tTxt,
+      `IC ${Number.isFinite(imageCircleMm) ? imageCircleMm.toFixed(2) + "mm" : "—"} / ${targetImageCircle.toFixed(2)}mm`,
       fovTxt,
       rearTxt,
       lenTxt,
@@ -2630,7 +2748,7 @@
     return sanitizeLens(L);
   }
 
-  function evalLensMerit(lensObj, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH}){
+  function evalLensMerit(lensObj, {targetEfl, targetT, targetImageCircleMm, fieldAngle, rayCount, wavePreset, sensorW, sensorH}){
     const tmp = clone(lensObj);
     const surfaces = tmp.surfaces;
 
@@ -2646,6 +2764,14 @@
     const sensorX = 0.0;
     computeVertices(surfaces, lensShift, sensorX);
     const phys = evaluatePhysicalConstraints(surfaces);
+    const imageCircle = estimateImageCircleMm(surfaces, wavePreset, sensorX, rayCount, {
+      maxFieldDeg: 55,
+      coarseStepDeg: 4.0,
+      refineIters: 4,
+      minRays: 11,
+      maxRays: 23,
+    });
+    const imageCircleMm = imageCircle?.diameterMm ?? null;
 
     if (phys.hardFail) {
       const score = MERIT_CFG.hardInvalidPenalty + Math.max(0, Number(phys.penalty || 0));
@@ -2656,6 +2782,7 @@
         bfl: null,
         intrusion: 0,
         vigFrac: 1,
+        imageCircleMm,
         lensShift,
         rms0: null,
         rmsE: null,
@@ -2665,6 +2792,8 @@
           vigPct: 100,
           intrusion: null,
           fields: [0, 0, 0],
+          imageCircleMm,
+          targetImageCircleMm: Number.isFinite(targetImageCircleMm) ? targetImageCircleMm : null,
           physPenalty: Number(phys.penalty || 0),
           hardInvalid: true,
         },
@@ -2695,6 +2824,8 @@
       efl, T, bfl,
       targetEfl,
       targetT,
+      imageCircleMm,
+      targetImageCircleMm,
       physPenalty: phys.penalty,
       hardInvalid: phys.hardFail,
     });
@@ -2709,6 +2840,7 @@
       bfl,
       intrusion,
       vigFrac,
+      imageCircleMm,
       lensShift,
       rms0: meritRes.breakdown.rmsCenter,
       rmsE: meritRes.breakdown.rmsEdge,
@@ -2727,6 +2859,7 @@
 
     // snapshot sensor settings
     const { w: sensorW, h: sensorH } = getSensorWH();
+    const targetImageCircleMm = getTargetImageCircleMm(sensorW, sensorH);
     const fieldAngle = num(ui.fieldAngle?.value, 0);
     const rayCount = Math.max(9, Math.min(61, (num(ui.rayCount?.value, 31) | 0))); // limit for speed
     const wavePreset = ui.wavePreset?.value || "d";
@@ -2735,7 +2868,7 @@
     const topo = captureTopology(startLens);
 
     let cur = startLens;
-    let curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+    let curEval = evalLensMerit(cur, {targetEfl, targetT, targetImageCircleMm, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
 
     // annealing-ish
@@ -2753,7 +2886,7 @@
       const temp = temp0 * (1 - a) + temp1 * a;
 
       const cand = mutateLens(cur, mode, topo);
-      const candEval = evalLensMerit(cand, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+      const candEval = evalLensMerit(cand, {targetEfl, targetT, targetImageCircleMm, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
 
       const d = candEval.score - curEval.score;
       const accept = (d <= 0) || (Math.random() < Math.exp(-d / Math.max(1e-9, temp)));
@@ -2772,6 +2905,7 @@
             `score ${best.eval.score.toFixed(2)}\n` +
             `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
             `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
+            `IC ${Number.isFinite(best.eval.imageCircleMm)?best.eval.imageCircleMm.toFixed(2):"—"}mm (target ${targetImageCircleMm.toFixed(2)}mm)\n` +
             `INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
             `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
           );
@@ -2786,7 +2920,7 @@
           setOptLog(
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
             `current ${curEval.score.toFixed(2)} • best ${best.eval.score.toFixed(2)} @${best.iter}\n` +
-            `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • INTR ${best.eval.intrusion.toFixed(2)}mm\n`
+            `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • IC ${Number.isFinite(best.eval.imageCircleMm)?best.eval.imageCircleMm.toFixed(2):"—"}mm • INTR ${best.eval.intrusion.toFixed(2)}mm\n`
           );
         }
         // yield to UI
@@ -2805,6 +2939,7 @@
         `BEST score ${best.eval.score.toFixed(2)}\n` +
         `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
         `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
+        `IC ${Number.isFinite(best.eval.imageCircleMm)?best.eval.imageCircleMm.toFixed(2):"—"}mm (target ${targetImageCircleMm.toFixed(2)}mm)\n` +
         `INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
         `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
         `Click “Apply best” to load.`
@@ -2836,6 +2971,7 @@
     const targetEfl = num(ui.optTargetFL?.value, 75);
     const targetT = num(ui.optTargetT?.value, 2.0);
     const { w: sensorW, h: sensorH } = getSensorWH();
+    const targetImageCircleMm = getTargetImageCircleMm(sensorW, sensorH);
     const fieldAngle = num(ui.fieldAngle?.value, 0);
     const rayCount = Math.max(9, Math.min(61, (num(ui.rayCount?.value, 31) | 0)));
     const wavePreset = ui.wavePreset?.value || "d";
@@ -2843,7 +2979,7 @@
     const t0 = performance.now();
     let best = Infinity;
     for (let i=0;i<N;i++){
-      const res = evalLensMerit(lens, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+      const res = evalLensMerit(lens, {targetEfl, targetT, targetImageCircleMm, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
       if (res.score < best) best = res.score;
     }
     const t1 = performance.now();
@@ -2907,11 +3043,11 @@
     ui.btnOptApply?.addEventListener("click", applyBest);
     ui.btnOptBench?.addEventListener("click", benchOptimizer);
 
-    ["optTargetFL","optTargetT","optIters","optPop"].forEach((id)=>{
+    ["optTargetFL","optTargetT","optTargetIC","optIters","optPop"].forEach((id)=>{
       ui[id]?.addEventListener("change", () => { scheduleRenderAll(); scheduleAutosave(); });
       ui[id]?.addEventListener("input", () => {
         // don't rerender constantly for iters/preset; but update merit targets
-        if (id === "optTargetFL" || id === "optTargetT") scheduleRenderAll();
+        if (id === "optTargetFL" || id === "optTargetT" || id === "optTargetIC") scheduleRenderAll();
         scheduleAutosave();
       });
     });
