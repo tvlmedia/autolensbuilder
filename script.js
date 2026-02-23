@@ -1070,12 +1070,13 @@
       const chiefY = rayHitYAtX(chiefTr.endRay, sensorX);
       if (!Number.isFinite(chiefY) || Math.abs(chiefY) > halfH) { hi = mid; continue; }
 
-      const pack = traceBundleAtField(surfaces, mid, covRays, wavePreset, sensorX);
+      const pack = traceBundleAtField(surfaces, mid, covRays, wavePreset, sensorX, halfH);
       const validFrac = (pack.n || 0) / Math.max(1, covRays);
       const passVig = Number.isFinite(pack.vigFrac) && pack.vigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac;
       const passValid = Number.isFinite(validFrac) && validFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
+      const passInside = Number.isFinite(pack.insideFrac) && pack.insideFrac >= IMAGE_CIRCLE_CFG.minReqInsideFrac;
 
-      if (passVig && passValid) { best = mid; lo = mid; }
+      if (passVig && passValid && passInside) { best = mid; lo = mid; }
       else hi = mid;
     }
     return best;
@@ -1179,6 +1180,8 @@
     minDiagMm: 45.0,        // full-frame coverage floor with small margin
     maxReqVigFrac: 0.03,    // strict: edge field should have almost no clipped rays
     minReqValidFrac: 0.90,  // strict: most rays must remain valid at required edge field
+    minReqInsideFrac: 0.95, // strict: edge bundle should mostly land inside sensor limit
+    sensorClipTolMm: 0.08,  // tiny tolerance for floating-point/rounding at the edge
   };
 
   function halfFieldFromDiagDeg(efl, diagMm) {
@@ -1344,18 +1347,41 @@
   }
 
   // -------------------- spot RMS + autofocus core --------------------
-  function spotRmsAtSensorX(traces, sensorX) {
+  function bundleStatsAtSensorX(traces, sensorX, sensorHalfMm = null) {
     const ys = [];
+    let insideCount = 0;
     for (const tr of traces) {
       if (!tr || tr.vignetted || tr.tir) continue;
       const y = rayHitYAtX(tr.endRay, sensorX);
       if (y == null) continue;
       ys.push(y);
+      if (Number.isFinite(sensorHalfMm) && Math.abs(y) <= sensorHalfMm + IMAGE_CIRCLE_CFG.sensorClipTolMm) {
+        insideCount++;
+      }
     }
-    if (ys.length < 5) return { rms: null, n: ys.length };
+    if (ys.length < 5) {
+      return {
+        rms: null,
+        n: ys.length,
+        insideFrac: Number.isFinite(sensorHalfMm) ? (insideCount / Math.max(1, traces.length)) : null,
+        insideCount,
+        maxAbsY: ys.length ? Math.max(...ys.map((v) => Math.abs(v))) : null,
+      };
+    }
     const mean = ys.reduce((a, b) => a + b, 0) / ys.length;
     const rms = Math.sqrt(ys.reduce((acc, y) => acc + (y - mean) ** 2, 0) / ys.length);
-    return { rms, n: ys.length };
+    return {
+      rms,
+      n: ys.length,
+      insideFrac: Number.isFinite(sensorHalfMm) ? (insideCount / Math.max(1, traces.length)) : null,
+      insideCount,
+      maxAbsY: ys.length ? Math.max(...ys.map((v) => Math.abs(v))) : null,
+    };
+  }
+
+  function spotRmsAtSensorX(traces, sensorX) {
+    const st = bundleStatsAtSensorX(traces, sensorX, null);
+    return { rms: st.rms, n: st.n };
   }
 
   function bestLensShiftForDesign(surfaces, fieldAngle, rayCount, wavePreset) {
@@ -1436,15 +1462,25 @@
     imageCircleShortfallWeight: 180.0,
     imageCircleReqVigWeight: 1400.0,
     imageCircleReqValidWeight: 900.0,
+    imageCircleReqInsideWeight: 1400.0,
   };
 
-  function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX){
+  function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX, sensorHalfMm = null){
     const rays = buildRays(surfaces, fieldDeg, rayCount);
     const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
     const vCount = traces.filter((t) => t.vignetted).length;
     const vigFrac = traces.length ? (vCount / traces.length) : 1;
-    const { rms, n } = spotRmsAtSensorX(traces, sensorX);
-    return { traces, rms, n, vigFrac, vCount };
+    const st = bundleStatsAtSensorX(traces, sensorX, sensorHalfMm);
+    return {
+      traces,
+      rms: st.rms,
+      n: st.n,
+      vigFrac,
+      vCount,
+      insideFrac: st.insideFrac,
+      insideCount: st.insideCount,
+      maxAbsY: st.maxAbsY,
+    };
   }
 
   function computeMeritV1({
@@ -1454,6 +1490,7 @@
     rayCount,
     fov, maxField, covers, req,
     icTargetDiag = null,
+    reqHalfMm = null,
     intrusion,
     efl, T, bfl,
     targetEfl = null,
@@ -1520,10 +1557,12 @@
 
     let reqVigFrac = null;
     let reqValidFrac = null;
+    let reqInsideFrac = null;
     if (Number.isFinite(req) && req > 0) {
-      const packReq = traceBundleAtField(surfaces, req, rayCount, wavePreset, sensorX);
+      const packReq = traceBundleAtField(surfaces, req, rayCount, wavePreset, sensorX, reqHalfMm);
       reqVigFrac = packReq.vigFrac;
       reqValidFrac = (packReq.n || 0) / Math.max(1, rayCount);
+      reqInsideFrac = packReq.insideFrac;
       if (Number.isFinite(reqVigFrac) && reqVigFrac > IMAGE_CIRCLE_CFG.maxReqVigFrac) {
         const d = reqVigFrac - IMAGE_CIRCLE_CFG.maxReqVigFrac;
         merit += MERIT_CFG.imageCircleReqVigWeight * (d * d);
@@ -1531,6 +1570,10 @@
       if (Number.isFinite(reqValidFrac) && reqValidFrac < IMAGE_CIRCLE_CFG.minReqValidFrac) {
         const d = IMAGE_CIRCLE_CFG.minReqValidFrac - reqValidFrac;
         merit += MERIT_CFG.imageCircleReqValidWeight * (d * d);
+      }
+      if (Number.isFinite(reqInsideFrac) && reqInsideFrac < IMAGE_CIRCLE_CFG.minReqInsideFrac) {
+        const d = IMAGE_CIRCLE_CFG.minReqInsideFrac - reqInsideFrac;
+        merit += MERIT_CFG.imageCircleReqInsideWeight * (d * d);
       }
     }
 
@@ -1570,7 +1613,8 @@
       imageCircleDiag + 0.05 >= imageCircleTarget;
     const reqVigOk = !Number.isFinite(reqVigFrac) || reqVigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac;
     const reqValidOk = !Number.isFinite(reqValidFrac) || reqValidFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
-    const coversStrict = !!covers && imageCircleOk && reqVigOk && reqValidOk;
+    const reqInsideOk = !Number.isFinite(reqInsideFrac) || reqInsideFrac >= IMAGE_CIRCLE_CFG.minReqInsideFrac;
+    const coversStrict = !!covers && imageCircleOk && reqVigOk && reqValidOk && reqInsideOk;
 
     const breakdown = {
       rmsCenter, rmsEdge,
@@ -1586,6 +1630,7 @@
       imageCircleOk,
       reqVigPct: Number.isFinite(reqVigFrac) ? Math.round(reqVigFrac * 100) : null,
       reqValidPct: Number.isFinite(reqValidFrac) ? Math.round(reqValidFrac * 100) : null,
+      reqInsidePct: Number.isFinite(reqInsideFrac) ? Math.round(reqInsideFrac * 100) : null,
       physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
       hardInvalid: !!hardInvalid,
     };
@@ -2111,6 +2156,7 @@
       rayCount,
       fov, maxField, covers, req,
       icTargetDiag,
+      reqHalfMm: covHalfMm,
       intrusion,
       efl, T, bfl,
       targetEfl: Number(ui.optTargetFL?.value || NaN),
@@ -2134,6 +2180,7 @@
       `${Number.isFinite(bd.vigCenterPct) ? ` • V0 ${bd.vigCenterPct}%` : ""}` +
       `${Number.isFinite(bd.vigMidPct) ? ` • Vmid ${bd.vigMidPct}%` : ""}` +
       `${Number.isFinite(bd.reqVigPct) ? ` • Vreq ${bd.reqVigPct}%` : ""}` +
+      `${Number.isFinite(bd.reqInsidePct) ? ` • Ireq ${bd.reqInsidePct}%` : ""}` +
       `${Number.isFinite(bd.imageCircleDiag) ? ` • IC ${bd.imageCircleDiag.toFixed(1)}mm` : ""}` +
       `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""}` +
       `${bd.physPenalty > 0 ? ` • PHYS +${bd.physPenalty.toFixed(1)}` : ""}` +
@@ -2176,6 +2223,9 @@
     } else if (!bd.imageCircleOk && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Image circle too small: ${icDiagTxt}. Required: ${icTargetTxt} (target >= ${IMAGE_CIRCLE_CFG.minDiagMm.toFixed(0)}mm for full frame).`;
+    } else if (Number.isFinite(bd.reqInsidePct) && bd.reqInsidePct < Math.round(IMAGE_CIRCLE_CFG.minReqInsideFrac * 100) && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `Edge spill: only ${bd.reqInsidePct}% of rays stay inside required sensor edge (need >= ${Math.round(IMAGE_CIRCLE_CFG.minReqInsideFrac * 100)}%).`;
     } else if (phys.airGapCount < PHYS_CFG.minAirGapsPreferred && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Few air gaps (${phys.airGapCount}); aim for >= ${PHYS_CFG.minAirGapsPreferred} for practical designs.`;
@@ -2781,6 +2831,7 @@
       rayCount,
       fov, maxField, covers, req,
       icTargetDiag,
+      reqHalfMm: covHalfMm,
       intrusion,
       efl, T, bfl,
       targetEfl,
