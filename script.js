@@ -754,6 +754,13 @@
     planeRefractiveWeight: 520.0,
     planeNearStopExtraWeight: 880.0,
   };
+  const MOUNT_TRACE_CFG = {
+    enabled: true,
+    throatR: 27.0,      // PL throat radius (Ø54)
+    lensLip: 3.0,       // lens-side extension before flange plane
+    camDepth: 14.0,     // camera-side depth after flange plane
+    clearanceMm: 0.08,  // tiny safety clearance to avoid optimistic edge cases
+  };
 
   function minGapBetweenSurfaces(sFront, sBack, yMax, samples = 11) {
     const n = Math.max(3, samples | 0);
@@ -961,6 +968,46 @@
   }
 
   // -------------------- tracing --------------------
+  function mountClipHitAlongRay(ray, tMax = Infinity) {
+    if (!MOUNT_TRACE_CFG.enabled) return null;
+    const dx = ray?.d?.x;
+    const dy = ray?.d?.y;
+    if (!Number.isFinite(dx) || !Number.isFinite(dy) || Math.abs(dx) < 1e-12) return null;
+
+    const xFlange = -PL_FFD;
+    const xA = xFlange - MOUNT_TRACE_CFG.lensLip;
+    const xB = xFlange + MOUNT_TRACE_CFG.camDepth;
+
+    const tA = (xA - ray.p.x) / dx;
+    const tB = (xB - ray.p.x) / dx;
+
+    let t0 = Math.max(1e-9, Math.min(tA, tB));
+    let t1 = Math.max(tA, tB);
+    if (Number.isFinite(tMax)) t1 = Math.min(t1, tMax - 1e-9);
+    if (!(t1 >= t0)) return null;
+
+    const yAt = (t) => ray.p.y + dy * t;
+    const lim = Math.max(0.1, MOUNT_TRACE_CFG.throatR - Math.max(0, MOUNT_TRACE_CFG.clearanceMm || 0));
+    const y0 = yAt(t0);
+    const y1 = yAt(t1);
+
+    if (Math.abs(y0) <= lim && Math.abs(y1) <= lim) return null;
+
+    let tClip = t0;
+    if (Math.abs(y0) <= lim && Math.abs(dy) > 1e-12) {
+      const roots = [
+        ( lim - ray.p.y) / dy,
+        (-lim - ray.p.y) / dy,
+      ].filter((t) => t >= t0 - 1e-9 && t <= t1 + 1e-9);
+      if (roots.length) tClip = Math.max(t0, Math.min(...roots));
+    }
+
+    return {
+      t: tClip,
+      hit: { x: ray.p.x + dx * tClip, y: yAt(tClip) },
+    };
+  }
+
   function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     const skipIMS = !!opts.skipIMS;
 
@@ -981,6 +1028,11 @@
       if (skipIMS && isIMS) continue;
 
       const hitInfo = intersectSurface(ray, s);
+      const mountHit = (!skipIMS && nBefore <= 1.000001)
+        ? mountClipHitAlongRay(ray, hitInfo?.t ?? Infinity)
+        : null;
+      if (mountHit) { pts.push(mountHit.hit); vignetted = true; break; }
+
       if (!hitInfo) { vignetted = true; break; }
 
       pts.push(hitInfo.hit);
@@ -1011,16 +1063,21 @@
   }
 
   // -------------------- ray bundles --------------------
+  const RAY_BUNDLE_CFG = {
+    apFill: 0.999, // sample almost full clear aperture (avoid optimistic vignette estimates)
+  };
+
   function getRayReferencePlane(surfaces) {
+    const apFill = Math.max(0.5, Math.min(1.0, Number(RAY_BUNDLE_CFG.apFill || 1.0)));
     const stopIdx = findStopSurfaceIndex(surfaces);
     if (stopIdx >= 0) {
       const s = surfaces[stopIdx];
-      return { xRef: s.vx, apRef: Math.max(1e-3, Number(s.ap || 10) * 0.98), refIdx: stopIdx };
+      return { xRef: s.vx, apRef: Math.max(1e-3, Number(s.ap || 10) * apFill), refIdx: stopIdx };
     }
     let refIdx = 1;
     if (!surfaces[refIdx] || String(surfaces[refIdx].type).toUpperCase() === "IMS") refIdx = 0;
     const s = surfaces[refIdx] || surfaces[0];
-    return { xRef: s.vx, apRef: Math.max(1e-3, Number(s.ap || 10) * 0.98), refIdx };
+    return { xRef: s.vx, apRef: Math.max(1e-3, Number(s.ap || 10) * apFill), refIdx };
   }
 
   function buildRays(surfaces, fieldAngleDeg, count) {
@@ -1031,7 +1088,7 @@
     const xStart = (surfaces[0]?.vx ?? 0) - 80;
     const { xRef, apRef } = getRayReferencePlane(surfaces);
 
-    const hMax = apRef * 0.98;
+    const hMax = apRef;
     const rays = [];
     const tanT = Math.abs(dir.x) < 1e-9 ? 0 : dir.y / dir.x;
 
@@ -1186,8 +1243,8 @@
     minSensorW: 36.0,       // always at least full-frame
     minSensorH: 24.0,
     maxFieldIters: 16,      // binary-search depth for usable-field estimate
-    covRayCountMin: 9,      // keep this low-ish for optimizer speed
-    covRayCountMax: 17,
+    covRayCountMin: 9,
+    covRayCountMax: 101,
     displayRayCount: 101,   // strict coverage/IC verification for UI readout
     icProbeHalfMm: 60.0,    // probe larger image circles (diag up to 120mm) for reporting
   };
@@ -1957,10 +2014,10 @@
   function drawPLMountCutout(world, xFlange, opts = {}) {
     if (!ctx) return;
 
-    const throatR = Number.isFinite(opts.throatR) ? opts.throatR : 27;
+    const throatR = Number.isFinite(opts.throatR) ? opts.throatR : MOUNT_TRACE_CFG.throatR;
     const outerR  = Number.isFinite(opts.outerR)  ? opts.outerR  : 31;
-    const camDepth= Number.isFinite(opts.camDepth)? opts.camDepth: 14;
-    const lensLip = Number.isFinite(opts.lensLip) ? opts.lensLip : 3;
+    const camDepth= Number.isFinite(opts.camDepth)? opts.camDepth: MOUNT_TRACE_CFG.camDepth;
+    const lensLip = Number.isFinite(opts.lensLip) ? opts.lensLip : MOUNT_TRACE_CFG.lensLip;
     const flangeT = Number.isFinite(opts.flangeT) ? opts.flangeT : 2.0;
 
     const P = (x, y) => worldToScreen({ x, y }, world);
