@@ -1237,9 +1237,7 @@
     illumThreshold: 0.20,
     mountMaxFrac: 0.03,
     hardVigFrac: 0.35,
-    hardMountMaxFrac: 0.005,
-    hardVigMaxFrac: 0.12,
-    hardMinValidFrac: 0.70,
+    hardMountMaxFrac: 0.015,
     // fallback pass/fail gate to avoid calling severe clipping "acceptable"
     subtleVignetteFrac: 0.12,
     minValidFrac: 0.55,
@@ -1380,29 +1378,25 @@
 
     const pack = traceIcBundleAtField(surfaces, thetaDeg, rayCount, wavePreset, sensorX, opts);
     const mountMax = Number.isFinite(opts.mountMaxFrac) ? opts.mountMaxFrac : IMG_CIRCLE_CFG.mountMaxFrac;
-    const hardVig = Number.isFinite(opts.hardVigFrac) ? opts.hardVigFrac : IMG_CIRCLE_CFG.hardVigFrac;
-    const minValid = Number.isFinite(opts.minValidFrac) ? opts.minValidFrac : IMG_CIRCLE_CFG.minValidFrac;
     const hardMountMax = Number.isFinite(opts.hardMountMaxFrac) ? opts.hardMountMaxFrac : IMG_CIRCLE_CFG.hardMountMaxFrac;
-    const hardVigMax = Number.isFinite(opts.hardVigMaxFrac) ? opts.hardVigMaxFrac : IMG_CIRCLE_CFG.hardVigMaxFrac;
-    const hardMinValid = Number.isFinite(opts.hardMinValidFrac) ? opts.hardMinValidFrac : IMG_CIRCLE_CFG.hardMinValidFrac;
-    const centerTol = Number.isFinite(opts.centerRadiusTolMm) ? opts.centerRadiusTolMm : IMG_CIRCLE_CFG.centerRadiusTolMm;
     const exp = Math.max(1, Number(opts.illumExponent || IMG_CIRCLE_CFG.illumExponent || 1));
 
     const centerRef = Math.max(1e-6, Number(centerGoodFrac || 0));
     let relIllum = Math.pow(pack.goodFrac / centerRef, exp);
     relIllum = clamp(relIllum, 0, 1);
-    if (pack.mountFrac > mountMax) relIllum = 0;
+    if (pack.mountFrac > mountMax) relIllum = 0; // hard mechanical cutoff zeroes illumination
     if (pack.vigFrac > hardVig) relIllum = 0;
 
     const threshold = Number.isFinite(opts.illumThreshold) ? opts.illumThreshold : IMG_CIRCLE_CFG.illumThreshold;
-    const isNearCenter = Math.abs(rTargetMm) <= centerTol;
-    const softPass = relIllum >= threshold && pack.mountFrac <= mountMax && (isNearCenter || pack.validFrac >= minValid);
-    const hardPass = pack.mountFrac <= hardMountMax && pack.vigFrac <= hardVigMax && (isNearCenter || pack.validFrac >= hardMinValid);
+    const softPass = relIllum >= threshold;
+    const hardPass = pack.mountFrac <= hardMountMax;
+    const stopsDown = relIllum > 1e-9 ? -Math.log2(relIllum) : Infinity;
 
     return {
       rTargetMm,
       thetaDeg,
       relIllum,
+      stopsDown,
       validFrac: pack.validFrac,
       vigFrac: pack.vigFrac,
       mountFrac: pack.mountFrac,
@@ -1438,7 +1432,7 @@
       if (s.hardPass) lastHardPass = s;
     }
 
-    let edgeR = lastPass ? lastPass.rTargetMm : 0;
+    let softEdgeR = lastPass ? lastPass.rTargetMm : 0;
     if (lastPass && firstFailAfterPass) {
       const r0 = lastPass.rTargetMm;
       const r1 = firstFailAfterPass.rTargetMm;
@@ -1447,21 +1441,24 @@
       if (Number.isFinite(i0) && Number.isFinite(i1) && Math.abs(i1 - i0) > 1e-9 && r1 > r0) {
         const a = (threshold - i0) / (i1 - i0);
         const k = clamp(a, 0, 1);
-        edgeR = r0 + (r1 - r0) * k;
+        softEdgeR = r0 + (r1 - r0) * k;
       }
     }
 
-    edgeR = clamp(edgeR, 0, Math.max(0, diagHalf));
+    softEdgeR = clamp(softEdgeR, 0, Math.max(0, diagHalf));
     const hardEdgeR = clamp(lastHardPass ? lastHardPass.rTargetMm : 0, 0, Math.max(0, diagHalf));
-    const softDiagRelIllum = samples.length ? Number(samples[samples.length - 1].relIllum || 0) : 0;
-    const softDiagMountFrac = samples.length ? Number(samples[samples.length - 1].mountFrac || 1) : 1;
-    const softDiagVigFrac = samples.length ? Number(samples[samples.length - 1].vigFrac || 1) : 1;
+    const diagSample = samples.length ? samples[samples.length - 1] : null;
+    const softDiagRelIllum = diagSample ? Number(diagSample.relIllum || 0) : 0;
+    const softDiagStopsDown = diagSample ? Number(diagSample.stopsDown) : Infinity;
+    const softDiagMountFrac = diagSample ? Number(diagSample.mountFrac || 1) : 1;
+    const softDiagVigFrac = diagSample ? Number(diagSample.vigFrac || 1) : 1;
+    const hardFail = softDiagMountFrac > (Number.isFinite(opts.hardMountMaxFrac) ? opts.hardMountMaxFrac : IMG_CIRCLE_CFG.hardMountMaxFrac);
 
     return {
       diameterMm: Math.max(0, hardEdgeR * 2), // compatibility: IC now means HardIC
       hardDiameterMm: Math.max(0, hardEdgeR * 2),
-      softDiameterMm: Math.max(0, edgeR * 2),
-      halfSizeMm: edgeR,
+      softDiameterMm: Math.max(0, softEdgeR * 2),
+      halfSizeMm: softEdgeR,
       sensorDiagHalfMm: diagHalf,
       relIllumAtEdge: lastPass ? lastPass.relIllum : 0,
       centerGoodFrac,
@@ -1469,8 +1466,10 @@
       centerVigFrac: centerPack.vigFrac,
       centerMountFrac: centerPack.mountFrac,
       softDiagRelIllum,
+      softDiagStopsDown,
       softDiagMountFrac,
       softDiagVigFrac,
+      hardFail,
       samples,
     };
   }
@@ -1678,6 +1677,7 @@
     eflWeight: 0.35,          // penalty per mm error (squared)
     tWeight: 10.0,            // penalty per T error (squared)
     imgCircleWeight: 250.0,   // HardIC feasibility penalty (avoid black ring)
+    hardCutoffWeight: 4000.0, // strong extra penalty when diag has mechanical cutoff
     softIllumWeight: 18.0,    // optional look penalty (corner falloff preference)
     desiredSoftDiagIllum: null, // e.g. 0.25 if you want cleaner corners
     centerIllumWeight: 900.0, // heavy penalty when center throughput is already too low
@@ -1718,6 +1718,7 @@
     imageCircleMm = null,
     targetImageCircleMm = null,
     softDiagIllum = null,
+    hardCutoff = false,
     centerGoodFrac = null,
     physPenalty = 0,
     hardInvalid = false,
@@ -1782,6 +1783,9 @@
       const shortfall = Math.max(0, targetImageCircleMm - imageCircleMm);
       merit += MERIT_CFG.imgCircleWeight * (shortfall * shortfall);
     }
+    if (hardCutoff) {
+      merit += MERIT_CFG.hardCutoffWeight;
+    }
     const desiredSoft = Number.isFinite(MERIT_CFG.desiredSoftDiagIllum) ? MERIT_CFG.desiredSoftDiagIllum : null;
     if (Number.isFinite(desiredSoft) && Number.isFinite(softDiagIllum)) {
       const shortfall = Math.max(0, desiredSoft - softDiagIllum);
@@ -1814,6 +1818,7 @@
       imageCircleMm: Number.isFinite(imageCircleMm) ? imageCircleMm : null,
       targetImageCircleMm: Number.isFinite(targetImageCircleMm) ? targetImageCircleMm : null,
       softDiagIllum: Number.isFinite(softDiagIllum) ? softDiagIllum : null,
+      hardCutoff: !!hardCutoff,
       centerGoodFrac: Number.isFinite(centerGoodFrac) ? centerGoodFrac : null,
       physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
       hardInvalid: !!hardInvalid,
@@ -2319,6 +2324,9 @@
     const imageCircle = estimateImageCircleIllumMm(lens.surfaces, wavePreset, sensorX, rayCount, sensorW, sensorH);
     const imageCircleMm = imageCircle?.hardDiameterMm ?? imageCircle?.diameterMm ?? null;
     const softDiagIllum = Number(imageCircle?.softDiagRelIllum);
+    const softDiagStopsDown = Number(imageCircle?.softDiagStopsDown);
+    const hardFail = !!imageCircle?.hardFail;
+    const softDiagMountFrac = Number(imageCircle?.softDiagMountFrac);
     const imageCircleDelta = Number.isFinite(imageCircleMm) ? (imageCircleMm - targetImageCircle) : null;
     const centerGoodFrac = Number(imageCircle?.centerGoodFrac);
 
@@ -2341,6 +2349,7 @@
       imageCircleMm,
       targetImageCircleMm: targetImageCircle,
       softDiagIllum,
+      hardCutoff: hardFail,
       centerGoodFrac,
       physPenalty: phys.penalty,
       hardInvalid: phys.hardFail,
@@ -2378,7 +2387,7 @@
     if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
     if (ui.imgCircle) {
       ui.imgCircle.textContent = Number.isFinite(imageCircleMm)
-        ? `HardIC: ${imageCircleMm.toFixed(2)}mm (target ${targetImageCircle.toFixed(2)}mm) • Soft@D ${(Number.isFinite(softDiagIllum) ? (softDiagIllum * 100).toFixed(0) : "—")}%`
+        ? `HardIC: ${imageCircleMm.toFixed(2)}mm (target ${targetImageCircle.toFixed(2)}mm) • Soft@D ${(Number.isFinite(softDiagIllum) ? (softDiagIllum * 100).toFixed(0) : "—")}% (${Number.isFinite(softDiagStopsDown) ? softDiagStopsDown.toFixed(2) : "—"}st)`
         : `ImgCircle: — (target ${targetImageCircle.toFixed(2)}mm)`;
     }
     if (ui.dist) ui.dist.textContent = `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
@@ -2399,6 +2408,9 @@
         `Few air gaps (${phys.airGapCount}); aim for >= ${PHYS_CFG.minAirGapsPreferred} for practical designs.`;
     } else if (tirCount > 0 && ui.footerWarn) {
       ui.footerWarn.textContent = `TIR on ${tirCount} rays (check glass / curvature).`;
+    } else if (hardFail && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `Hard cutoff risk on sensor diag (mount clip ${(Number.isFinite(softDiagMountFrac) ? (softDiagMountFrac * 100).toFixed(1) : "—")}%).`;
     } else if (Number.isFinite(centerGoodFrac) && centerGoodFrac < IMG_CIRCLE_CFG.centerGoodMin && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Low center throughput (${(centerGoodFrac * 100).toFixed(0)}%); strong central clipping likely.`;
@@ -2957,6 +2969,7 @@
     const imageCircle = estimateImageCircleIllumMm(surfaces, wavePreset, sensorX, rayCount, sensorW, sensorH);
     const imageCircleMm = imageCircle?.hardDiameterMm ?? imageCircle?.diameterMm ?? null;
     const softDiagIllum = Number(imageCircle?.softDiagRelIllum);
+    const hardCutoff = !!imageCircle?.hardFail;
     const centerGoodFrac = Number(imageCircle?.centerGoodFrac);
 
     if (phys.hardFail) {
@@ -3015,6 +3028,7 @@
       imageCircleMm,
       targetImageCircleMm,
       softDiagIllum,
+      hardCutoff,
       centerGoodFrac,
       physPenalty: phys.penalty,
       hardInvalid: phys.hardFail,
