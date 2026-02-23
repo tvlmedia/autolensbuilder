@@ -1257,17 +1257,13 @@
   }
 
   const SOFT_IC_CFG = {
-    raysPerBundle: 41,
     thresholdRel: 0.35, // usable circle @ 35% of center illumination
-    localBandMm: 1.0,   // local brightness band around chief-field radius
-    thetaStepDeg: 0.5,
-    maxFieldDeg: 60,
-    diagMarginMm: 0.75,
-    maxConsecutiveMapFails: 8,
-    minSamplesForBreak: 10,
+    bgLutSamples: 220,   // IC-only LUT samples across sensor diagonal
+    bgPupilSqrt: 10,     // sqrt(samples) over stop disk
+    bgObjDistMm: 2000,   // object plane distance for reverse ray hit test
+    bgStartEpsMm: 0.05,  // avoid exact sensor plane degeneracy
     minSamplesForCurve: 8,
     smoothingHalfWindow: 3,
-    drasticSlopePerMm: 0.10,
     eps: 1e-6,
   };
 
@@ -1285,6 +1281,260 @@
     if (!tr || !tr.endRay || tr.tir) return null;
     const y = rayHitYAtX(tr.endRay, sensorX);
     return Number.isFinite(y) ? Math.abs(y) : null;
+  }
+
+  // -------------------- IC-only background helpers (ported from Render Engine) --------------------
+  function normalize3(v) {
+    const m = Math.hypot(v.x, v.y, v.z);
+    if (m < 1e-12) return { x: 0, y: 0, z: 0 };
+    return { x: v.x / m, y: v.y / m, z: v.z / m };
+  }
+  function dot3(a, b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+  function add3(a, b) { return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }; }
+  function mul3(a, s) { return { x: a.x * s, y: a.y * s, z: a.z * s }; }
+
+  function refract3(I, N, n1, n2) {
+    I = normalize3(I);
+    N = normalize3(N);
+    if (dot3(I, N) > 0) N = mul3(N, -1);
+    const cosi = -dot3(N, I);
+    const eta = n1 / n2;
+    const k = 1 - eta * eta * (1 - cosi * cosi);
+    if (k < 0) return null;
+    const T = add3(mul3(I, eta), mul3(N, eta * cosi - Math.sqrt(k)));
+    return normalize3(T);
+  }
+
+  function intersectSurface3D(ray, surf) {
+    const vx = surf.vx;
+    const R = Number(surf.R || 0);
+    const ap = Math.max(0, Number(surf.ap || 0));
+
+    if (Math.abs(R) < 1e-9) {
+      if (Math.abs(ray.d.x) < 1e-12) return null;
+      const t = (vx - ray.p.x) / ray.d.x;
+      if (!Number.isFinite(t) || t <= 1e-9) return null;
+      const hit = add3(ray.p, mul3(ray.d, t));
+      const r = Math.hypot(hit.y, hit.z);
+      const vignetted = r > ap + 1e-9;
+      return { hit, t, vignetted, normal: { x: -1, y: 0, z: 0 } };
+    }
+
+    const cx = vx + R;
+    const rad = Math.abs(R);
+    const px = ray.p.x - cx;
+    const py = ray.p.y;
+    const pz = ray.p.z;
+    const dx = ray.d.x;
+    const dy = ray.d.y;
+    const dz = ray.d.z;
+
+    const A = dx * dx + dy * dy + dz * dz;
+    const B = 2 * (px * dx + py * dy + pz * dz);
+    const C = px * px + py * py + pz * pz - rad * rad;
+    const disc = B * B - 4 * A * C;
+    if (disc < 0) return null;
+
+    const sdisc = Math.sqrt(disc);
+    const t1 = (-B - sdisc) / (2 * A);
+    const t2 = (-B + sdisc) / (2 * A);
+
+    let t = null;
+    if (t1 > 1e-9 && t2 > 1e-9) t = Math.min(t1, t2);
+    else if (t1 > 1e-9) t = t1;
+    else if (t2 > 1e-9) t = t2;
+    else return null;
+
+    const hit = add3(ray.p, mul3(ray.d, t));
+    const r = Math.hypot(hit.y, hit.z);
+    const vignetted = r > ap + 1e-9;
+    const normal = normalize3({ x: hit.x - cx, y: hit.y, z: hit.z });
+    return { hit, t, vignetted, normal };
+  }
+
+  function traceRayReverse3D(ray, surfaces, wavePreset) {
+    let vignetted = false;
+    let tir = false;
+
+    for (let i = surfaces.length - 1; i >= 0; i--) {
+      const s = surfaces[i];
+      const type = String(s?.type || "").toUpperCase();
+      const isIMS = type === "IMS";
+      const isMECH = type === "MECH" || type === "BAFFLE" || type === "HOUSING";
+
+      const hitInfo = intersectSurface3D(ray, s);
+      if (!hitInfo) { vignetted = true; break; }
+      if (!isIMS && hitInfo.vignetted) { vignetted = true; break; }
+
+      if (isIMS || isMECH) {
+        ray = { p: hitInfo.hit, d: ray.d };
+        continue;
+      }
+
+      const nRight = glassN(String(s.glass || "AIR"), wavePreset);
+      const nLeft = (i === 0) ? 1.0 : glassN(String(surfaces[i - 1].glass || "AIR"), wavePreset);
+
+      if (Math.abs(nLeft - nRight) < 1e-9) {
+        ray = { p: hitInfo.hit, d: ray.d };
+        continue;
+      }
+
+      const newDir = refract3(ray.d, hitInfo.normal, nRight, nLeft);
+      if (!newDir) { tir = true; break; }
+      ray = { p: hitInfo.hit, d: newDir };
+    }
+
+    return { vignetted, tir, endRay: ray };
+  }
+
+  function intersectPlaneX3D(ray, xPlane) {
+    if (!ray?.d || Math.abs(ray.d.x) < 1e-12) return null;
+    const t = (xPlane - ray.p.x) / ray.d.x;
+    if (!Number.isFinite(t) || t <= 1e-9) return null;
+    return add3(ray.p, mul3(ray.d, t));
+  }
+
+  function samplePupilDisk(stopAp, u, v) {
+    const a = u * 2 - 1;
+    const b = v * 2 - 1;
+    let r, phi;
+    if (a === 0 && b === 0) { r = 0; phi = 0; }
+    else if (Math.abs(a) > Math.abs(b)) { r = a; phi = (Math.PI / 4) * (b / a); }
+    else { r = b; phi = (Math.PI / 2) - (Math.PI / 4) * (a / b); }
+
+    const rr = Math.abs(r) * Math.max(1e-6, Number(stopAp || 0));
+    return { y: rr * Math.cos(phi), z: rr * Math.sin(phi) };
+  }
+
+  function naturalCos4AtSensorRadius(surfaces, sensorX, rMm) {
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    const stopSurf = stopIdx >= 0 ? surfaces[stopIdx] : surfaces[0];
+    const xStop = Number(stopSurf?.vx);
+    const sx = Number(sensorX) + Number(SOFT_IC_CFG.bgStartEpsMm || 0.05);
+    if (!Number.isFinite(xStop) || !Number.isFinite(sx)) return 1.0;
+    const rr = Math.max(0, Number(rMm || 0));
+    const dir = normalize3({ x: xStop - sx, y: -rr, z: 0 });
+    const c = clamp(Math.abs(dir.x), 0, 1);
+    return c * c * c * c;
+  }
+
+  function estimateUsableCircleBackgroundLut(surfaces, sensorW, sensorH, wavePreset, rayCount) {
+    const cfg = SOFT_IC_CFG;
+    const sensorX = 0.0;
+    const halfDiag = 0.5 * Math.hypot(sensorW, sensorH);
+    const work = clone(surfaces);
+
+    const af = bestLensShiftForDesign(work, 0, Math.max(21, rayCount | 0), wavePreset);
+    if (!af.ok) {
+      return {
+        softICmm: 0, rEdge: 0,
+        relMin: Number(cfg.thresholdRel || 0.35),
+        thresholdRel: Number(cfg.thresholdRel || 0.35),
+        usableCircleDiameterMm: 0,
+        usableCircleRadiusMm: 0,
+        relAtCutoff: 0,
+        centerGoodFrac: 0,
+        samples: [],
+        focusLensShift: 0,
+        focusFailed: true,
+        drasticDropRadiusMm: null,
+      };
+    }
+
+    const lensShift = af.shift;
+    computeVertices(work, lensShift, sensorX);
+
+    const stopIdx = findStopSurfaceIndex(work);
+    const stopSurf = stopIdx >= 0 ? work[stopIdx] : work[0];
+    const stopAp = Math.max(1e-6, Number(stopSurf?.ap || 0));
+    const xStop = Number(stopSurf?.vx);
+    if (!(stopAp > 0) || !Number.isFinite(xStop)) {
+      return {
+        softICmm: 0, rEdge: 0,
+        relMin: Number(cfg.thresholdRel || 0.35),
+        thresholdRel: Number(cfg.thresholdRel || 0.35),
+        usableCircleDiameterMm: 0,
+        usableCircleRadiusMm: 0,
+        relAtCutoff: 0,
+        centerGoodFrac: 0,
+        samples: [],
+        focusLensShift: lensShift,
+        focusFailed: false,
+        drasticDropRadiusMm: null,
+      };
+    }
+
+    const lutN = Math.max(96, Math.min(900, Number(cfg.bgLutSamples || 220) | 0));
+    const pupilSqrt = Math.max(4, Math.min(24, Number(cfg.bgPupilSqrt || 10) | 0));
+    const startX = sensorX + Number(cfg.bgStartEpsMm || 0.05);
+    const xObjPlane = (work[0]?.vx ?? 0) - Math.max(100, Number(cfg.bgObjDistMm || 2000));
+
+    const radialMm = new Float64Array(lutN);
+    const gainCurve = new Float64Array(lutN);
+
+    for (let k = 0; k < lutN; k++) {
+      const a = lutN > 1 ? (k / (lutN - 1)) : 0;
+      const rS = a * halfDiag;
+      radialMm[k] = rS;
+
+      const pS = { x: startX, y: rS, z: 0 };
+      const natural = naturalCos4AtSensorRadius(work, sensorX, rS);
+
+      let ok = 0;
+      let total = 0;
+      for (let iy = 0; iy < pupilSqrt; iy++) {
+        for (let ix = 0; ix < pupilSqrt; ix++) {
+          const uu = (ix + 0.5) / pupilSqrt;
+          const vv = (iy + 0.5) / pupilSqrt;
+          const pp = samplePupilDisk(stopAp, uu, vv);
+          const target = { x: xStop, y: pp.y, z: pp.z };
+          const dir = normalize3({ x: target.x - pS.x, y: target.y - pS.y, z: target.z - pS.z });
+
+          const tr = traceRayReverse3D({ p: pS, d: dir }, work, wavePreset);
+          total++;
+          if (tr.vignetted || tr.tir || !tr.endRay) continue;
+          const hitObj = intersectPlaneX3D(tr.endRay, xObjPlane);
+          if (!hitObj) continue;
+          ok++;
+        }
+      }
+
+      const trans = total ? (ok / total) : 0;
+      gainCurve[k] = clamp(trans * natural, 0, 1);
+    }
+
+    const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg);
+    const relCurve = uc.relCurve?.length === lutN ? uc.relCurve : Array.from({ length: lutN }, () => 0);
+
+    const samples = Array.from({ length: lutN }, (_, i) => {
+      const relIllum = clamp(Number(relCurve[i] || 0), 0, 1);
+      return {
+        rMm: Number(radialMm[i] || 0),
+        thetaDeg: null,
+        gain: Number(gainCurve[i] || 0),
+        relIllum,
+        stopsDown: relIllum > cfg.eps ? -Math.log2(relIllum) : Infinity,
+      };
+    });
+
+    const rEdge = uc.valid ? clamp(Number(uc.radiusMm || 0), 0, halfDiag) : 0;
+    const softICmm = uc.valid ? clamp(Number(uc.diameterMm || 0), 0, 2 * halfDiag) : 0;
+    const centerGoodFrac = gainCurve.length ? clamp(Number(gainCurve[0] || 0), 0, 1) : 0;
+
+    return {
+      softICmm,
+      rEdge,
+      relMin: Number(uc.thresholdRel || cfg.thresholdRel || 0.35),
+      thresholdRel: Number(uc.thresholdRel || cfg.thresholdRel || 0.35),
+      usableCircleDiameterMm: softICmm,
+      usableCircleRadiusMm: rEdge,
+      relAtCutoff: Number(uc.relAtCutoff || 0),
+      centerGoodFrac,
+      samples,
+      focusLensShift: lensShift,
+      focusFailed: false,
+      drasticDropRadiusMm: null,
+    };
   }
 
   function traceBundleAtFieldForSoftIc(surfaces, fieldDeg, wavePreset, sensorX, raysPerBundle) {
@@ -1342,9 +1592,9 @@
     };
   }
 
-  function computeUsableCircleFromRadialCurve(radialMm, relCurveIn, cfg = SOFT_IC_CFG) {
+  function computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg = SOFT_IC_CFG) {
     const minN = Math.max(3, Number(cfg.minSamplesForCurve || 8) | 0);
-    const n = Math.min(radialMm?.length || 0, relCurveIn?.length || 0);
+    const n = Math.min(radialMm?.length || 0, gainCurve?.length || 0);
     if (n < minN) {
       return {
         valid: false,
@@ -1361,9 +1611,9 @@
     const pairs = [];
     for (let i = 0; i < n; i++) {
       const ri = Number(radialMm[i]);
-      const reli = Number(relCurveIn[i]);
-      if (!Number.isFinite(ri) || !Number.isFinite(reli) || ri < 0) continue;
-      pairs.push({ r: ri, rel: clamp(reli, 0, 1) });
+      const gi = Number(gainCurve[i]);
+      if (!Number.isFinite(ri) || !Number.isFinite(gi) || ri < 0) continue;
+      pairs.push({ r: ri, g: Math.max(0, gi) });
     }
     if (pairs.length < minN) {
       return {
@@ -1380,15 +1630,15 @@
 
     pairs.sort((a, b) => a.r - b.r);
     const r = [];
-    const relSrc = [];
+    const g = [];
     for (const p of pairs) {
       if (r.length && p.r <= r[r.length - 1] + 1e-6) {
         // Conservative merge for near-duplicate radius samples.
-        relSrc[relSrc.length - 1] = Math.min(relSrc[relSrc.length - 1], p.rel);
+        g[g.length - 1] = Math.min(g[g.length - 1], p.g);
         continue;
       }
       r.push(p.r);
-      relSrc.push(p.rel);
+      g.push(p.g);
     }
     if (r.length < minN) {
       return {
@@ -1412,16 +1662,33 @@
       for (let k = -halfWin; k <= halfWin; k++) {
         const j = i + k;
         if (j < 0 || j >= m) continue;
-        sum += relSrc[j];
+        sum += g[j];
         cnt++;
       }
-      smoothed[i] = clamp(cnt ? (sum / cnt) : relSrc[i], 0, 1);
+      smoothed[i] = cnt ? (sum / cnt) : g[i];
+    }
+
+    const refN = Math.max(6, Math.min(m, Math.floor(m * 0.06)));
+    let ref = 0;
+    for (let i = 0; i < refN; i++) ref += smoothed[i];
+    ref /= Math.max(1, refN);
+    if (!(ref > Number(cfg.eps || 1e-6))) {
+      return {
+        valid: false,
+        radiusMm: 0,
+        diameterMm: 0,
+        thresholdRel: Number(cfg.thresholdRel || 0.35),
+        relAtCutoff: 0,
+        radialMm: r,
+        relCurve: Array.from({ length: m }, () => 0),
+        smoothedCurve: Array.from(smoothed),
+      };
     }
 
     const rel = new Float64Array(m);
-    rel[0] = smoothed[0];
+    rel[0] = smoothed[0] / ref;
     for (let i = 1; i < m; i++) {
-      const v = smoothed[i];
+      const v = smoothed[i] / ref;
       // Match render-engine behavior: force monotone non-increasing falloff.
       rel[i] = Math.min(v, rel[i - 1]);
     }
@@ -1656,23 +1923,33 @@
   }
 
   function getSoftIcForCurrentLens(surfaces, sensorW, sensorH, wavePreset, rayCount) {
-    // Image Circle calculation intentionally disabled for now.
-    return {
-      softICmm: 0,
-      rEdge: 0,
-      relMin: Number(SOFT_IC_CFG.thresholdRel || 0.35),
-      thresholdRel: Number(SOFT_IC_CFG.thresholdRel || 0.35),
-      usableCircleDiameterMm: 0,
-      usableCircleRadiusMm: 0,
-      relAtCutoff: 0,
-      centerGoodFrac: 0,
-      centerLocalFrac: 0,
-      samples: [],
-      focusLensShift: 0,
-      focusFailed: false,
-      drasticDropRadiusMm: null,
-      disabled: true,
+    const keyObj = {
+      wavePreset,
+      rayCount,
+      sensorW: Number(sensorW).toFixed(3),
+      sensorH: Number(sensorH).toFixed(3),
+      softCfg: {
+        thresholdRel: Number(SOFT_IC_CFG.thresholdRel).toFixed(4),
+        bgLutSamples: Number(SOFT_IC_CFG.bgLutSamples).toFixed(0),
+        bgPupilSqrt: Number(SOFT_IC_CFG.bgPupilSqrt).toFixed(0),
+        bgObjDistMm: Number(SOFT_IC_CFG.bgObjDistMm).toFixed(2),
+        smoothingHalfWindow: Number(SOFT_IC_CFG.smoothingHalfWindow).toFixed(0),
+      },
+      surfaces: (surfaces || []).map((s) => ({
+        type: String(s.type || ""),
+        R: Number(s.R || 0).toFixed(6),
+        t: Number(s.t || 0).toFixed(6),
+        ap: Number(s.ap || 0).toFixed(6),
+        glass: String(s.glass || "AIR"),
+        stop: !!s.stop,
+      })),
     };
+    const key = JSON.stringify(keyObj);
+    if (key === _softIcCacheKey && _softIcCacheVal) return _softIcCacheVal;
+    const val = estimateUsableCircleBackgroundLut(surfaces, sensorW, sensorH, wavePreset, rayCount);
+    _softIcCacheKey = key;
+    _softIcCacheVal = val;
+    return val;
   }
 
   function estimateDistortionPct(surfaces, wavePreset, sensorX, sensorW, sensorH, efl, mode = "d") {
@@ -2488,7 +2765,15 @@
       ? "FOV: —"
       : `FOV: H ${fov.hfov.toFixed(1)}° • V ${fov.vfov.toFixed(1)}° • D ${fov.dfov.toFixed(1)}°`;
 
-    const softIcTxt = "IC: —";
+    const softIc = getSoftIcForCurrentLens(lens.surfaces, sensorW, sensorH, wavePreset, rayCount);
+    const icDiameterMm = Number(
+      softIc?.usableCircleDiameterMm ?? softIc?.softICmm ?? 0
+    );
+    const softIcValid = Number.isFinite(icDiameterMm) && icDiameterMm > 0.1;
+    const softIcTxt = softIcValid ? `IC: Ø${icDiameterMm.toFixed(1)}mm` : "IC: —";
+    const softIcDetailTxt = softIcValid
+      ? `Image Circle: Ø${icDiameterMm.toFixed(1)}mm (IC${Math.round(Number(softIc?.thresholdRel || SOFT_IC_CFG.thresholdRel || 0.35) * 100)}%)`
+      : "Image Circle: —";
 
     const distPct = estimateDistortionPct(lens.surfaces, wavePreset, sensorX, sensorW, sensorH, efl, "d");
 
@@ -2542,16 +2827,14 @@
       ui.tstop.textContent = `T_eff≈ ${T == null ? "—" : "T" + T.toFixed(2)} (${Tgeom == null ? "geom —" : "geom T" + Tgeom.toFixed(2)})`;
     }
     if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
-    if (ui.softIC) {
-      ui.softIC.textContent = softIcTxt;
-    }
+    if (ui.softIC) ui.softIC.textContent = softIcDetailTxt;
     if (ui.dist) ui.dist.textContent = `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
     if (ui.fov) ui.fov.textContent = fovTxt;
 
     if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
     if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T_eff≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
-    if (ui.softICTop) ui.softICTop.textContent = ui.softIC?.textContent || "IC: —";
+    if (ui.softICTop) ui.softICTop.textContent = softIcTxt;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.distTop) ui.distTop.textContent = ui.dist?.textContent || `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
 
@@ -2575,7 +2858,7 @@
     if (ui.metaInfo) {
       ui.metaInfo.textContent =
         `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm • ` +
-        "IC —";
+        (softIcValid ? `IC ${icDiameterMm.toFixed(1)}mm` : "IC —");
     }
 
     resizeCanvasToCSS();
