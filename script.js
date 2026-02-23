@@ -1520,9 +1520,10 @@
     computeVertices(work, lensShift, sensorX);
 
     const centerPack = traceBundleAtFieldForSoftIc(work, 0, wavePreset, sensorX, cfg.raysPerBundle);
-    const centerGoodFrac  = Math.max(cfg.eps, Number(centerPack.goodFrac || 0));
-const centerNatural   = naturalCos4AtSensorRadius(work, 0, sensorX); // is ~1
-const centerGain      = Math.max(cfg.eps, centerGoodFrac * centerNatural);
+    const centerGoodFrac = Math.max(cfg.eps, Number(centerPack.goodFrac || 0));
+    const centerLocalFrac = Math.max(cfg.eps, Number(centerPack.localFrac || 0));
+    const centerNatural = naturalCos4AtSensorRadius(work, 0, sensorX);
+    const centerGain = Math.max(cfg.eps, centerGoodFrac * centerNatural);
     if (centerGain <= cfg.eps * 1.01) {
       return {
         softICmm: 0,
@@ -1532,7 +1533,7 @@ const centerGain      = Math.max(cfg.eps, centerGoodFrac * centerNatural);
         usableCircleDiameterMm: 0,
         usableCircleRadiusMm: 0,
         relAtCutoff: 0,
-        centerGoodFrac: centerGain,
+        centerGoodFrac,
         centerLocalFrac,
         centerGain,
         samples: [],
@@ -1564,10 +1565,10 @@ const centerGain      = Math.max(cfg.eps, centerGoodFrac * centerNatural);
       }
       mapFailRun = 0;
 
-     const goodFrac = clamp(pack.goodFrac, 0, 1);
-const naturalGain = naturalCos4AtSensorRadius(work, rMm, sensorX);
-const gain = clamp(goodFrac * naturalGain, 0, 1);
-rawRel = clamp(gain / centerGain, 0, 1);
+      const goodFrac = clamp(pack.goodFrac, 0, 1);
+      const localFrac = clamp(Number(pack.localFrac || 0), 0, 1);
+      const naturalGain = naturalCos4AtSensorRadius(work, rMm, sensorX);
+      const gain = clamp(goodFrac * naturalGain, 0, 1);
       fieldSamples.push({
         rMm,
         thetaDeg,
@@ -1598,7 +1599,7 @@ rawRel = clamp(gain / centerGain, 0, 1);
         usableCircleDiameterMm: 0,
         usableCircleRadiusMm: 0,
         relAtCutoff: 0,
-        centerGoodFrac: centerGain,
+        centerGoodFrac,
         centerLocalFrac,
         centerGain,
         samples: [],
@@ -1627,7 +1628,7 @@ rawRel = clamp(gain / centerGain, 0, 1);
       merged.unshift({
         rMm: 0,
         thetaDeg: 0,
-        goodFrac: Math.max(0, Number(centerPack.goodFrac || 0)),
+        goodFrac: centerGoodFrac,
         localFrac: centerLocalFrac,
         gain: centerGain,
         rawRel: 1,
@@ -1635,7 +1636,7 @@ rawRel = clamp(gain / centerGain, 0, 1);
       });
     } else {
       merged[0].rMm = 0;
-      merged[0].goodFrac = Math.max(merged[0].goodFrac, Number(centerPack.goodFrac || 0));
+      merged[0].goodFrac = Math.max(merged[0].goodFrac, centerGoodFrac);
       merged[0].localFrac = Math.max(merged[0].localFrac, centerLocalFrac);
       merged[0].gain = Math.max(Number(merged[0].gain || 0), centerGain);
       merged[0].rawRel = 1;
@@ -1690,7 +1691,7 @@ rawRel = clamp(gain / centerGain, 0, 1);
       usableCircleDiameterMm: softICmm,
       usableCircleRadiusMm: rEdge,
       relAtCutoff: Number(uc.relAtCutoff || 0),
-      centerGoodFrac: centerGain,
+      centerGoodFrac,
       centerLocalFrac,
       centerGain,
       samples,
