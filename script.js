@@ -1276,6 +1276,12 @@
     smoothingHalfWindow: 2,
   };
 
+  const OPT_STAGE_CFG = {
+    flBandRel: 0.05,      // once FL is in +/-5%, keep all accepted updates in this band
+    icPassFrac: 0.95,     // IC phase is "good enough" at >=95% of requested IC
+    tGoodAbs: 0.25,       // T phase considered good when absolute T error <= 0.25
+  };
+
   function softIcLabel(cfg = SOFT_IC_CFG) {
     const pct = Math.round(Number(cfg?.thresholdRel ?? 0) * 100);
     return `IC${pct}%`;
@@ -3534,33 +3540,116 @@
     };
   }
 
-  function evalSortKey(ev, targetIC) {
-    const score = Number.isFinite(ev?.score) ? Number(ev.score) : 1e9;
-    if (!(Number.isFinite(targetIC) && targetIC > 0)) {
-      return { shortfall: 0, score };
+  function stageName(stage) {
+    if (stage === 0) return "FL lock";
+    if (stage === 1) return "IC growth";
+    if (stage === 2) return "T tune";
+    return "Sharpness";
+  }
+
+  function buildOptPriority(evalRes, { targetEfl, targetIC, targetT }) {
+    const efl = Number(evalRes?.efl);
+    const T = Number(evalRes?.T);
+    const score = Number.isFinite(evalRes?.score) ? Number(evalRes.score) : 1e9;
+
+    const eflErrRel = Number.isFinite(efl) && targetEfl > 1e-9
+      ? Math.abs(efl - targetEfl) / targetEfl
+      : Infinity;
+    const flInBand = eflErrRel <= OPT_STAGE_CFG.flBandRel;
+
+    const icMeasured = Number.isFinite(evalRes?.softIcMm) ? Number(evalRes.softIcMm) : 0;
+    const icGoalMm = targetIC > 0 ? (targetIC * OPT_STAGE_CFG.icPassFrac) : 0;
+    const icNeedMm = targetIC > 0 ? Math.max(0, icGoalMm - icMeasured) : 0;
+    const icGood = targetIC <= 0 || icNeedMm <= 0;
+
+    const tErrAbs = targetT > 0 && Number.isFinite(T)
+      ? Math.abs(T - targetT)
+      : (targetT > 0 ? Infinity : 0);
+    const tGood = targetT <= 0 || tErrAbs <= OPT_STAGE_CFG.tGoodAbs;
+
+    const rms0 = Number(evalRes?.rms0);
+    const rmsE = Number(evalRes?.rmsE);
+    const vigFrac = Number(evalRes?.vigFrac);
+    const sharpness = (Number.isFinite(rms0) ? rms0 : 999) +
+      1.7 * (Number.isFinite(rmsE) ? rmsE : 999) +
+      0.5 * (Number.isFinite(vigFrac) ? vigFrac : 1);
+
+    let stage = 0;
+    if (flInBand) {
+      if (!icGood) stage = 1;
+      else if (!tGood) stage = 2;
+      else stage = 3;
     }
-    const measured = Number.isFinite(ev?.softIcMm) ? Number(ev.softIcMm) : 0;
+
     return {
-      shortfall: Math.max(0, Number(targetIC) - measured),
+      stage,
+      stageName: stageName(stage),
       score,
+      efl,
+      eflErrRel,
+      flInBand,
+      icMeasured,
+      icGoalMm,
+      icNeedMm,
+      icGood,
+      T,
+      tErrAbs,
+      tGood,
+      sharpness,
     };
   }
 
-  function isEvalBetterForTarget(a, b, targetIC) {
-    if (!b) return true;
-    const ka = evalSortKey(a, targetIC);
-    const kb = evalSortKey(b, targetIC);
-    if (Number.isFinite(targetIC) && targetIC > 0) {
-      if (Math.abs(ka.shortfall - kb.shortfall) > 0.02) return ka.shortfall < kb.shortfall;
+  function compareEvalByPlan(a, b, targets) {
+    if (!b) return -1;
+    const A = buildOptPriority(a, targets);
+    const B = buildOptPriority(b, targets);
+
+    if (A.stage !== B.stage) return A.stage - B.stage;
+
+    if (A.stage === 0 && Math.abs(A.eflErrRel - B.eflErrRel) > 1e-6) {
+      return A.eflErrRel - B.eflErrRel;
     }
-    return ka.score < kb.score;
+
+    if (A.stage === 1) {
+      if (Math.abs(A.icNeedMm - B.icNeedMm) > 0.02) return A.icNeedMm - B.icNeedMm;
+      if (Math.abs(A.icMeasured - B.icMeasured) > 0.02) return B.icMeasured - A.icMeasured;
+    }
+
+    if (A.stage === 2 && Math.abs(A.tErrAbs - B.tErrAbs) > 1e-4) {
+      return A.tErrAbs - B.tErrAbs;
+    }
+
+    if (A.stage === 3 && Math.abs(A.sharpness - B.sharpness) > 1e-5) {
+      return A.sharpness - B.sharpness;
+    }
+
+    if (Math.abs(A.eflErrRel - B.eflErrRel) > 1e-6) return A.eflErrRel - B.eflErrRel;
+    return A.score - B.score;
+  }
+
+  function isEvalBetterByPlan(a, b, targets) {
+    return compareEvalByPlan(a, b, targets) < 0;
+  }
+
+  function fmtFlOpt(evalRes, targetEfl) {
+    const p = buildOptPriority(evalRes, { targetEfl, targetIC: 0, targetT: 0 });
+    const eflTxt = Number.isFinite(p.efl) ? p.efl.toFixed(2) : "—";
+    const errTxt = Number.isFinite(p.eflErrRel) ? (p.eflErrRel * 100).toFixed(2) : "—";
+    return `FL ${eflTxt}mm (target ${targetEfl.toFixed(2)} • err ${errTxt}%${p.flInBand ? " ✅" : ""})`;
   }
 
   function fmtIcOpt(evalRes, targetIC) {
     if (!(Number.isFinite(targetIC) && targetIC > 0)) return "IC target off";
-    const ic = Number(evalRes?.softIcMm || 0);
-    const sf = Math.max(0, Number(targetIC) - ic);
-    return `IC ${Number.isFinite(ic) ? ic.toFixed(2) : "—"}mm (target ${targetIC.toFixed(2)} • short ${sf.toFixed(2)})`;
+    const p = buildOptPriority(evalRes, { targetEfl: 1, targetIC, targetT: 0 });
+    return `IC ${p.icMeasured.toFixed(2)}mm (goal >= ${p.icGoalMm.toFixed(2)} • short ${p.icNeedMm.toFixed(2)})`;
+  }
+
+  function fmtTOpt(evalRes, targetT) {
+    if (!(Number.isFinite(targetT) && targetT > 0)) return "T target off";
+    const p = buildOptPriority(evalRes, { targetEfl: 1, targetIC: 0, targetT });
+    const tTxt = Number.isFinite(p.T) ? p.T.toFixed(2) : "—";
+    const eTxt = Number.isFinite(p.tErrAbs) ? p.tErrAbs.toFixed(2) : "—";
+    return `T ${tTxt} (target ${targetT.toFixed(2)} • err ${eTxt}${p.tGood ? " ✅" : ""})`;
   }
 
   async function runOptimizer(){
@@ -3570,6 +3659,7 @@
     const targetEfl = num(ui.optTargetFL?.value, 75);
     const targetT = num(ui.optTargetT?.value, 2.0);
     const targetIC = Math.max(0, num(ui.optTargetIC?.value, 0));
+    const targets = { targetEfl, targetIC, targetT };
     const iters = Math.max(10, (num(ui.optIters?.value, 2000) | 0));
     const mode = (ui.optPop?.value || "safe");
 
@@ -3585,6 +3675,7 @@
     let cur = startLens;
     let curEval = evalLensMerit(cur, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
+    let flLocked = buildOptPriority(curEval, targets).flInBand;
 
     // annealing-ish
     let temp0 = mode === "wild" ? 3.5 : 1.8;
@@ -3603,34 +3694,42 @@
       const cand = mutateLens(cur, mode, topo);
       const candEval = evalLensMerit(cand, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
 
-      const d = candEval.score - curEval.score;
-      const scoreAccept = (d <= 0) || (Math.random() < Math.exp(-d / Math.max(1e-9, temp)));
-      let accept = scoreAccept;
-      if (targetIC > 0) {
-        const sCur = Math.max(0, Number(curEval.icShortfallMm || 0));
-        const sCand = Math.max(0, Number(candEval.icShortfallMm || 0));
-        if (sCand < sCur - 0.02) {
-          accept = true;
-        } else if (sCand > sCur + 0.02 && d > -0.25) {
-          accept = false;
+      const curPri = buildOptPriority(curEval, targets);
+      const candPri = buildOptPriority(candEval, targets);
+
+      let accept = false;
+      // Once we have entered FL band, never accept candidates outside the 5% band.
+      if (flLocked && !candPri.flInBand) {
+        accept = false;
+      } else if (isEvalBetterByPlan(candEval, curEval, targets)) {
+        accept = true;
+      } else {
+        // Mild exploration only within the same stage and never violating FL lock.
+        const sameStage = candPri.stage === curPri.stage;
+        const d = candEval.score - curEval.score;
+        if (!flLocked && sameStage) {
+          accept = (d <= 0) || (Math.random() < Math.exp(-Math.max(0, d) / Math.max(1e-9, temp)));
         }
       }
       if (accept){
         cur = cand;
         curEval = candEval;
+        flLocked = flLocked || candPri.flInBand;
       }
 
-      if (isEvalBetterForTarget(candEval, best.eval, targetIC)){
+      if (isEvalBetterByPlan(candEval, best.eval, targets)){
         best = { lens: clone(cand), eval: candEval, iter: i };
+        const bp = buildOptPriority(best.eval, targets);
 
         // UI update (rare)
         if (ui.optLog){
           setOptLog(
             `best @${i}/${iters}\n` +
             `score ${best.eval.score.toFixed(2)}\n` +
-            `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
-            `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
+            `stage ${bp.stage + 1}/4: ${bp.stageName}\n` +
+            `${fmtFlOpt(best.eval, targetEfl)}\n` +
             `${fmtIcOpt(best.eval, targetIC)}\n` +
+            `${fmtTOpt(best.eval, targetT)}\n` +
             `Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}%\n` +
             `INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
             `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
@@ -3642,12 +3741,17 @@
         const tNow = performance.now();
         const dt = (tNow - tStart) / 1000;
         const ips = i / Math.max(1e-6, dt);
+        const cp = buildOptPriority(curEval, targets);
+        const bp = buildOptPriority(best.eval, targets);
         if (ui.optLog){
           setOptLog(
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
             `current ${curEval.score.toFixed(2)} • best ${best.eval.score.toFixed(2)} @${best.iter}\n` +
+            `phase current: ${cp.stageName} • best: ${bp.stageName}${flLocked ? " • FL lock ON" : ""}\n` +
+            `current ${fmtFlOpt(curEval, targetEfl)}\n` +
             `current ${fmtIcOpt(curEval, targetIC)}\n` +
-            `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}% • INTR ${best.eval.intrusion.toFixed(2)}mm\n`
+            `current ${fmtTOpt(curEval, targetT)}\n` +
+            `best: ${fmtFlOpt(best.eval, targetEfl)} • ${fmtIcOpt(best.eval, targetIC)} • ${fmtTOpt(best.eval, targetT)}\n`
           );
         }
         // yield to UI
@@ -3660,13 +3764,15 @@
 
     const tEnd = performance.now();
     const sec = (tEnd - tStart) / 1000;
+    const bp = buildOptPriority(best.eval, targets);
     if (ui.optLog){
       setOptLog(
         `done ${best.iter}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
         `BEST score ${best.eval.score.toFixed(2)}\n` +
-        `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
-        `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
+        `BEST stage ${bp.stage + 1}/4: ${bp.stageName}\n` +
+        `${fmtFlOpt(best.eval, targetEfl)}\n` +
         `${fmtIcOpt(best.eval, targetIC)}\n` +
+        `${fmtTOpt(best.eval, targetT)}\n` +
         `Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}%\n` +
         `INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
         `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
@@ -3676,7 +3782,7 @@
 
     toast(
       optBest
-        ? `Optimize done. Best score ${optBest.eval.score.toFixed(2)}${targetIC > 0 ? ` • IC ${Number(optBest.eval.softIcMm || 0).toFixed(1)}mm` : ""}`
+        ? `Optimize done. Score ${optBest.eval.score.toFixed(2)} • FL ${Number.isFinite(optBest.eval.efl) ? Number(optBest.eval.efl).toFixed(1) : "—"}mm${targetIC > 0 ? ` • IC ${Number(optBest.eval.softIcMm || 0).toFixed(1)}mm` : ""}`
         : "Optimize stopped"
     );
   }
