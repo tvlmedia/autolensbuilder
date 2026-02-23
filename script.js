@@ -19,18 +19,6 @@
     return Number.isFinite(x) ? x : fallback;
   }
 
-  function fmtMmDown1(v) {
-    if (!Number.isFinite(v)) return "—";
-    const p = 10;
-    return (Math.floor((v + 1e-9) * p) / p).toFixed(1);
-  }
-
-  function fmtMmUp1(v) {
-    if (!Number.isFinite(v)) return "—";
-    const p = 10;
-    return (Math.ceil((v - 1e-9) * p) / p).toFixed(1);
-  }
-
   // -------------------- canvas (RAYS) --------------------
   const canvas = $("#canvas");
   const ctx = canvas?.getContext("2d");
@@ -46,8 +34,6 @@
     vig: $("#badgeVig"),
     dist: $("#badgeDist"),
     fov: $("#badgeFov"),
-    cov: $("#badgeCov"),
-    ic: $("#badgeIc"),
     merit: $("#badgeMerit"),
 
     footerWarn: $("#footerWarn"),
@@ -57,8 +43,6 @@
     bflTop: $("#badgeBflTop"),
     tstopTop: $("#badgeTTop"),
     fovTop: $("#badgeFovTop"),
-    covTop: $("#badgeCovTop"),
-    icTop: $("#badgeIcTop"),
     distTop: $("#badgeDistTop"),
     meritTop: $("#badgeMeritTop"),
 
@@ -1078,203 +1062,6 @@
     return { pts, vignetted, tir, endRay: ray };
   }
 
-  // -------------------- 3D coverage tracing --------------------
-  function normalize3(v) {
-    const m = Math.hypot(v.x, v.y, v.z);
-    if (m < 1e-12) return { x: 0, y: 0, z: 0 };
-    return { x: v.x / m, y: v.y / m, z: v.z / m };
-  }
-  function dot3(a, b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-  function add3(a, b) { return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }; }
-  function mul3(a, s) { return { x: a.x * s, y: a.y * s, z: a.z * s }; }
-
-  function refract3(I, N, n1, n2) {
-    I = normalize3(I);
-    N = normalize3(N);
-    if (dot3(I, N) > 0) N = mul3(N, -1);
-    const cosi = -dot3(N, I);
-    const eta = n1 / n2;
-    const k = 1 - eta * eta * (1 - cosi * cosi);
-    if (k < 0) return null;
-    const T = add3(mul3(I, eta), mul3(N, eta * cosi - Math.sqrt(k)));
-    return normalize3(T);
-  }
-
-  function intersectSurface3D(ray, surf) {
-    const vx = surf.vx;
-    const R = Number(surf.R || 0);
-    const ap = Math.max(0, Number(surf.ap || 0));
-
-    if (Math.abs(R) < 1e-9) {
-      if (Math.abs(ray.d.x) < 1e-12) return null;
-      const t = (vx - ray.p.x) / ray.d.x;
-      if (!Number.isFinite(t) || t <= 1e-9) return null;
-      const hit = add3(ray.p, mul3(ray.d, t));
-      const vignetted = Math.hypot(hit.y, hit.z) > ap + 1e-9;
-      return { hit, t, vignetted, normal: { x: -1, y: 0, z: 0 } };
-    }
-
-    const cx = vx + R;
-    const rad = Math.abs(R);
-
-    const px = ray.p.x - cx;
-    const py = ray.p.y;
-    const pz = ray.p.z;
-    const dx = ray.d.x;
-    const dy = ray.d.y;
-    const dz = ray.d.z;
-
-    const A = dx * dx + dy * dy + dz * dz;
-    const B = 2 * (px * dx + py * dy + pz * dz);
-    const C = px * px + py * py + pz * pz - rad * rad;
-
-    const disc = B * B - 4 * A * C;
-    if (disc < 0) return null;
-
-    const sdisc = Math.sqrt(disc);
-    const t1 = (-B - sdisc) / (2 * A);
-    const t2 = (-B + sdisc) / (2 * A);
-
-    let t = null;
-    if (t1 > 1e-9 && t2 > 1e-9) t = Math.min(t1, t2);
-    else if (t1 > 1e-9) t = t1;
-    else if (t2 > 1e-9) t = t2;
-    else return null;
-
-    const hit = add3(ray.p, mul3(ray.d, t));
-    const vignetted = Math.hypot(hit.y, hit.z) > ap + 1e-9;
-    const normal = normalize3({ x: hit.x - cx, y: hit.y, z: hit.z });
-    return { hit, t, vignetted, normal };
-  }
-
-  function rayHitAtX3D(endRay, x) {
-    if (!endRay?.d || Math.abs(endRay.d.x) < 1e-9) return null;
-    const t = (x - endRay.p.x) / endRay.d.x;
-    if (!Number.isFinite(t)) return null;
-    const y = endRay.p.y + t * endRay.d.y;
-    const z = endRay.p.z + t * endRay.d.z;
-    if (!Number.isFinite(y) || !Number.isFinite(z)) return null;
-    return { y, z, r: Math.hypot(y, z) };
-  }
-
-  function traceRayForward3D(ray, surfaces, wavePreset, opts = {}) {
-    const skipIMS = !!opts.skipIMS;
-    let pts = [];
-    let vignetted = false;
-    let tir = false;
-    pts.push({ x: ray.p.x, y: ray.p.y, z: ray.p.z });
-
-    let nBefore = 1.0;
-    for (let i = 0; i < surfaces.length; i++) {
-      const s = surfaces[i];
-      const type = String(s?.type || "").toUpperCase();
-      const isIMS = type === "IMS";
-      const isMECH = type === "MECH" || type === "BAFFLE" || type === "HOUSING";
-
-      if (skipIMS && isIMS) continue;
-
-      const hitInfo = intersectSurface3D(ray, s);
-      const mountHit = (!skipIMS && nBefore <= 1.000001)
-        ? mountClipHitAlongRay(ray, hitInfo?.t ?? Infinity)
-        : null;
-      if (mountHit) { pts.push(mountHit.hit); vignetted = true; break; }
-
-      if (!hitInfo) { vignetted = true; break; }
-      pts.push(hitInfo.hit);
-
-      if (!isIMS && hitInfo.vignetted) { vignetted = true; break; }
-
-      if (isIMS || isMECH) {
-        ray = { p: hitInfo.hit, d: ray.d };
-        continue;
-      }
-
-      const nAfter = glassN(String(s.glass || "AIR"), wavePreset);
-      if (Math.abs(nAfter - nBefore) < 1e-9) {
-        ray = { p: hitInfo.hit, d: ray.d };
-        nBefore = nAfter;
-        continue;
-      }
-
-      const newDir = refract3(ray.d, hitInfo.normal, nBefore, nAfter);
-      if (!newDir) { tir = true; break; }
-
-      ray = { p: hitInfo.hit, d: newDir };
-      nBefore = nAfter;
-    }
-
-    return { pts, vignetted, tir, endRay: ray };
-  }
-
-  function samplePupilDiskPoints(n, radius) {
-    const count = Math.max(9, Math.min(401, n | 0));
-    const r = Math.max(1e-6, Number(radius) || 1e-6);
-    const pts = [{ y: 0, z: 0 }];
-    const g = Math.PI * (3 - Math.sqrt(5));
-    for (let k = 1; k < count; k++) {
-      const u = (k - 0.5) / (count - 1);
-      const rr = r * Math.sqrt(Math.max(0, u));
-      const a = k * g;
-      pts.push({ y: rr * Math.cos(a), z: rr * Math.sin(a) });
-    }
-    return pts;
-  }
-
-  function buildRaysCoverage3D(surfaces, fieldAngleDeg, count) {
-    const n = Math.max(9, Math.min(401, count | 0));
-    const theta = (fieldAngleDeg * Math.PI) / 180;
-    const dir = normalize3({ x: Math.cos(theta), y: Math.sin(theta), z: 0 });
-
-    const xStart = (surfaces[0]?.vx ?? 0) - 80;
-    const { xRef, apRef } = getRayReferencePlane(surfaces);
-    const tanT = Math.abs(dir.x) < 1e-9 ? 0 : dir.y / dir.x;
-    const pupilPts = samplePupilDiskPoints(n, apRef);
-
-    return pupilPts.map((p) => {
-      const y0 = p.y - tanT * (xRef - xStart);
-      return { p: { x: xStart, y: y0, z: p.z }, d: dir };
-    });
-  }
-
-  function traceBundleAtFieldCoverage(surfaces, fieldDeg, rayCount, wavePreset, sensorX, sensorHalfMm = null) {
-    const rays = buildRaysCoverage3D(surfaces, fieldDeg, rayCount);
-    const traces = rays.map((r) => traceRayForward3D(clone(r), surfaces, wavePreset));
-    const vCount = traces.filter((t) => t.vignetted).length;
-    const vigFrac = traces.length ? (vCount / traces.length) : 1;
-
-    const ys = [];
-    let validCount = 0;
-    let insideCount = 0;
-    const lim = Number(sensorHalfMm);
-    const tol = Number(IMAGE_CIRCLE_CFG.sensorClipTolMm || 0);
-
-    for (const tr of traces) {
-      if (!tr || tr.vignetted || tr.tir) continue;
-      const hit = rayHitAtX3D(tr.endRay, sensorX);
-      if (!hit) continue;
-      validCount++;
-      ys.push(hit.y);
-      if (Number.isFinite(lim) && hit.r <= lim + tol) insideCount++;
-    }
-
-    const rms = ys.length >= 5
-      ? (() => {
-          const mean = ys.reduce((a, b) => a + b, 0) / ys.length;
-          return Math.sqrt(ys.reduce((acc, y) => acc + (y - mean) ** 2, 0) / ys.length);
-        })()
-      : null;
-
-    return {
-      traces,
-      rms,
-      n: validCount,
-      vigFrac,
-      vCount,
-      insideFrac: Number.isFinite(lim) ? (insideCount / Math.max(1, traces.length)) : null,
-      insideCount,
-    };
-  }
-
   // -------------------- ray bundles --------------------
   const RAY_BUNDLE_CFG = {
     apFill: 0.999, // sample almost full clear aperture (avoid optimistic vignette estimates)
@@ -1333,165 +1120,6 @@
     const t = (x - endRay.p.x) / endRay.d.x;
     if (!Number.isFinite(t)) return null;
     return endRay.p.y + t * endRay.d.y;
-  }
-
-  function chiefHitAtField3D(surfaces, wavePreset, sensorX, fieldDeg) {
-    const chiefF = buildChiefRay(surfaces, fieldDeg);
-    const rayF = {
-      p: { x: chiefF.p.x, y: chiefF.p.y, z: 0 },
-      d: { x: chiefF.d.x, y: chiefF.d.y, z: 0 },
-    };
-    const trF = traceRayForward3D(clone(rayF), surfaces, wavePreset);
-    if (!trF || trF.vignetted || trF.tir) return null;
-    return rayHitAtX3D(trF.endRay, sensorX);
-  }
-
-  function chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, fieldDeg) {
-    const hitF = chiefHitAtField3D(surfaces, wavePreset, sensorX, fieldDeg);
-    if (!hitF) return null;
-
-    const hit0 = chiefHitAtField3D(surfaces, wavePreset, sensorX, 0);
-    if (!hit0) return Number.isFinite(hitF.r) ? hitF.r : null;
-    return Math.hypot(hitF.y - hit0.y, hitF.z - hit0.z);
-  }
-
-  // Inverse chief mapping: which field angle lands chief ray at this sensor half-size.
-  function requiredFieldForSensorHalfMm(surfaces, wavePreset, sensorX, targetHalfMm, maxDeg = 80) {
-    const tgt = Math.max(0, Number(targetHalfMm) || 0);
-    if (tgt <= 1e-9) return 0;
-    const fallbackReq = (() => {
-      const para = estimateEflBflParaxial(surfaces, wavePreset);
-      const efl = para?.efl;
-      if (!Number.isFinite(efl) || efl <= 0) return null;
-      return rad2deg(Math.atan(tgt / efl));
-    })();
-    const safeFallbackReq = Number.isFinite(fallbackReq) ? clamp(fallbackReq, 0, maxDeg) : maxDeg;
-
-    let lo = 0;
-    let yLo = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, lo);
-    if (!Number.isFinite(yLo)) yLo = 0;
-    if (yLo >= tgt) return 0;
-
-    let hi = 0.75;
-    let yHi = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, hi);
-    while (Number.isFinite(yHi) && yHi < tgt && hi < maxDeg) {
-      lo = hi;
-      yLo = yHi;
-      hi = Math.min(maxDeg, hi * 1.45 + 0.4);
-      yHi = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, hi);
-    }
-
-    if (!Number.isFinite(yHi) || yHi < tgt) return safeFallbackReq;
-
-    for (let i = 0; i < 28; i++) {
-      const mid = 0.5 * (lo + hi);
-      const yMid = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, mid);
-      if (!Number.isFinite(yMid)) { hi = mid; continue; }
-      if (yMid >= tgt) hi = mid;
-      else lo = mid;
-    }
-    return Number.isFinite(hi) ? hi : safeFallbackReq;
-  }
-
-  function coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, halfH, rayCount = 31) {
-    const covRays = Math.max(
-      COVERAGE_CFG.covRayCountMin,
-      Math.min(COVERAGE_CFG.covRayCountMax, Math.max(3, Math.min(101, rayCount | 0)))
-    );
-    const halfHEff = Math.max(0.1, Math.max(0, halfH));
-
-    let lo = 0, hi = 60, best = 0;
-    for (let iter = 0; iter < COVERAGE_CFG.maxFieldIters; iter++) {
-      const mid = (lo + hi) * 0.5;
-
-      const chief2 = buildChiefRay(surfaces, mid);
-      const chief = {
-        p: { x: chief2.p.x, y: chief2.p.y, z: 0 },
-        d: { x: chief2.d.x, y: chief2.d.y, z: 0 },
-      };
-      const chiefTr = traceRayForward3D(clone(chief), surfaces, wavePreset);
-      if (!chiefTr || chiefTr.vignetted || chiefTr.tir) { hi = mid; continue; }
-
-      const chiefHit = rayHitAtX3D(chiefTr.endRay, sensorX);
-      if (!chiefHit || !Number.isFinite(chiefHit.r) || chiefHit.r > halfHEff) { hi = mid; continue; }
-
-      const pack = traceBundleAtFieldCoverage(surfaces, mid, covRays, wavePreset, sensorX, halfHEff);
-      const validFrac = (pack.n || 0) / Math.max(1, covRays);
-      const passVig = Number.isFinite(pack.vigFrac) && pack.vigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac;
-      const passValid = Number.isFinite(validFrac) && validFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
-      const passInside = Number.isFinite(pack.insideFrac) && pack.insideFrac >= IMAGE_CIRCLE_CFG.minReqInsideFrac;
-
-      if (passVig && passValid && passInside) { best = mid; lo = mid; }
-      else hi = mid;
-    }
-    return best;
-  }
-
-  function evaluateCoverageAtHalfMm(surfaces, wavePreset, sensorX, halfMm, rayCount = 101) {
-    const half = Math.max(0.05, Number(halfMm) || 0);
-    const halfEval = Math.max(0.05, half + Math.max(0, IMAGE_CIRCLE_CFG.edgeGuardMm || 0));
-    const req = requiredFieldForSensorHalfMm(surfaces, wavePreset, sensorX, halfEval);
-    if (!Number.isFinite(req)) {
-      return {
-        ok: false, req: null, halfEvalMm: halfEval,
-        vigFrac: null, validFrac: null, insideFrac: null,
-        reqVigPct: null, reqValidPct: null, reqInsidePct: null,
-      };
-    }
-
-    const chiefR = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, req);
-    const chiefOk = Number.isFinite(chiefR) && chiefR <= halfEval + (IMAGE_CIRCLE_CFG.sensorClipTolMm || 0);
-
-    const pack = traceBundleAtFieldCoverage(surfaces, req, rayCount, wavePreset, sensorX, halfEval);
-    const vigFrac = Number.isFinite(pack?.vigFrac) ? pack.vigFrac : null;
-    const validFrac = pack ? ((pack.n || 0) / Math.max(1, rayCount)) : null;
-    const insideFrac = Number.isFinite(pack?.insideFrac) ? pack.insideFrac : null;
-
-    const pack0 = traceBundleAtFieldCoverage(surfaces, 0, rayCount, wavePreset, sensorX, halfEval);
-    const baseVig = Number.isFinite(pack0?.vigFrac) ? pack0.vigFrac : 1;
-    const baseValid = pack0 ? ((pack0.n || 0) / Math.max(1, rayCount)) : 0;
-
-    const reqVigOkAbs = Number.isFinite(vigFrac) && vigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac;
-    const reqVigOkRel = Number.isFinite(vigFrac) && (vigFrac - baseVig) <= IMAGE_CIRCLE_CFG.maxExtraReqVigFrac;
-    const reqValidOkAbs = Number.isFinite(validFrac) && validFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
-    const reqValidOkRel = Number.isFinite(validFrac) && validFrac >= (baseValid - IMAGE_CIRCLE_CFG.maxReqValidDrop);
-    const reqInsideOk = Number.isFinite(insideFrac) && insideFrac >= IMAGE_CIRCLE_CFG.minReqInsideFrac;
-
-    return {
-      ok: !!chiefOk && reqVigOkAbs && reqVigOkRel && reqValidOkAbs && reqValidOkRel && reqInsideOk,
-      req,
-      halfEvalMm: halfEval,
-      vigFrac,
-      validFrac,
-      insideFrac,
-      reqVigPct: Number.isFinite(vigFrac) ? Math.round(vigFrac * 100) : null,
-      reqValidPct: Number.isFinite(validFrac) ? Math.round(validFrac * 100) : null,
-      reqInsidePct: Number.isFinite(insideFrac) ? Math.round(insideFrac * 100) : null,
-    };
-  }
-
-  function solveImageCircleHalfMm(surfaces, wavePreset, sensorX, rayCount = 101, maxHalfMm = 60) {
-    const maxHalf = Math.max(0.5, Number(maxHalfMm) || 60);
-    let lo = 0;
-    let hi = maxHalf;
-    let best = { ok: true, req: 0, vigFrac: 0, validFrac: 1, insideFrac: 1, reqVigPct: 0, reqValidPct: 100, reqInsidePct: 100 };
-
-    const hiEval = evaluateCoverageAtHalfMm(surfaces, wavePreset, sensorX, hi, rayCount);
-    if (hiEval.ok) {
-      return { halfMm: hi, diagMm: 2 * hi, maxField: hiEval.req, evalAtHalf: hiEval };
-    }
-
-    for (let i = 0; i < 20; i++) {
-      const mid = 0.5 * (lo + hi);
-      const ev = evaluateCoverageAtHalfMm(surfaces, wavePreset, sensorX, mid, rayCount);
-      if (ev.ok) {
-        lo = mid;
-        best = ev;
-      } else {
-        hi = mid;
-      }
-    }
-    return { halfMm: lo, diagMm: 2 * lo, maxField: best.req, evalAtHalf: best };
   }
 
   // -------------------- EFL/BFL (paraxial-ish) --------------------
@@ -1579,49 +1207,7 @@
     return { hfov: rad2deg(hfov), vfov: rad2deg(vfov), dfov: rad2deg(dfov) };
   }
 
-  const COVERAGE_CFG = {
-    mode: "d",              // evaluate in diagonal plane
-    marginDeg: 0.15,
-    minSensorW: 36.0,       // always at least full-frame
-    minSensorH: 24.0,
-    maxFieldIters: 16,      // binary-search depth for usable-field estimate
-    covRayCountMin: 9,
-    covRayCountMax: 101,
-    displayRayCount: 101,   // strict coverage/IC verification for UI readout
-    icProbeHalfMm: 60.0,    // probe larger image circles (diag up to 120mm) for reporting
-  };
-  const IMAGE_CIRCLE_CFG = {
-    minDiagMm: 45.0,        // full-frame coverage floor with small margin
-    maxReqVigFrac: 0.16,    // absolute ceiling: too much clipping is always a fail
-    minReqValidFrac: 0.82,  // absolute floor
-    minReqInsideFrac: 0.90, // absolute floor for sensor-edge containment
-    maxExtraReqVigFrac: 0.05, // edge clipping over on-axis baseline
-    maxReqValidDrop: 0.10,    // max allowed valid-ray drop vs on-axis baseline
-    sensorClipTolMm: 0.02,  // tiny tolerance for floating-point/rounding at the edge
-    edgeGuardMm: 0.90,      // conservative margin: reported IC must also survive this extra radius
-  };
-
-  function halfFieldFromDiagDeg(efl, diagMm) {
-    if (!Number.isFinite(efl) || efl <= 0 || !Number.isFinite(diagMm) || diagMm <= 0) return null;
-    return rad2deg(Math.atan((diagMm * 0.5) / efl));
-  }
-
-  function imageCircleDiagFromHalfFieldMm(efl, halfFieldDeg) {
-    if (!Number.isFinite(efl) || efl <= 0 || !Number.isFinite(halfFieldDeg) || halfFieldDeg < 0) return null;
-    return 2 * Math.abs(efl * Math.tan(deg2rad(halfFieldDeg)));
-  }
-
-  function imageCircleDiagFromTracedFieldMm(surfaces, wavePreset, sensorX, halfFieldDeg) {
-    if (!Number.isFinite(halfFieldDeg) || halfFieldDeg < 0) return null;
-    const y = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, halfFieldDeg);
-    if (!Number.isFinite(y)) return null;
-    return 2 * Math.abs(y);
-  }
-
-  function targetImageCircleDiagMm(sensorW, sensorH) {
-    const sensorDiag = Math.hypot(sensorW, sensorH);
-    return Math.max(sensorDiag, IMAGE_CIRCLE_CFG.minDiagMm);
-  }
+  const SENSOR_CLIP_TOL_MM = 0.02;
 
   function requiredHalfFieldDeg(efl, sensorW, sensorH, mode = "d") {
     const fov = computeFovDeg(efl, sensorW, sensorH);
@@ -1631,40 +1217,11 @@
     return fov.dfov * 0.5;
   }
 
-  function coverageRequirementDeg(efl, sensorW, sensorH, mode = "d") {
-    if (mode === "d") {
-      return halfFieldFromDiagDeg(efl, targetImageCircleDiagMm(sensorW, sensorH));
-    }
-    const reqCur = requiredHalfFieldDeg(efl, sensorW, sensorH, mode);
-    const reqMin = requiredHalfFieldDeg(efl, COVERAGE_CFG.minSensorW, COVERAGE_CFG.minSensorH, mode);
-    if (!Number.isFinite(reqCur) && !Number.isFinite(reqMin)) return null;
-    if (!Number.isFinite(reqCur)) return reqMin;
-    if (!Number.isFinite(reqMin)) return reqCur;
-    return Math.max(reqCur, reqMin);
-  }
-
   function coverageHalfSizeMm(sensorW, sensorH, mode = "d") {
     if (mode === "h") return Math.max(0.1, sensorW * 0.5);
     if (mode === "v") return Math.max(0.1, sensorH * 0.5);
     const d = Math.hypot(sensorW, sensorH);
     return Math.max(0.1, d * 0.5);
-  }
-
-  function coverageHalfSizeWithFloorMm(sensorW, sensorH, mode = "d") {
-    const cur = coverageHalfSizeMm(sensorW, sensorH, mode);
-    if (mode === "d") return Math.max(cur, 0.5 * IMAGE_CIRCLE_CFG.minDiagMm);
-    const min = coverageHalfSizeMm(COVERAGE_CFG.minSensorW, COVERAGE_CFG.minSensorH, mode);
-    return Math.max(cur, min);
-  }
-
-  function coversSensorYesNo({ fov, maxField, mode = "diag", marginDeg = 0.5 }) {
-    if (!fov || !Number.isFinite(maxField)) return { ok: false, req: null };
-    let req = null;
-    if (mode === "h") req = fov.hfov * 0.5;
-    else if (mode === "v") req = fov.vfov * 0.5;
-    else req = fov.dfov * 0.5;
-    const ok = maxField + marginDeg >= req;
-    return { ok, req };
   }
 
   function estimateDistortionPct(surfaces, wavePreset, sensorX, sensorW, sensorH, efl, mode = "d") {
@@ -1769,7 +1326,7 @@
       const y = rayHitYAtX(tr.endRay, sensorX);
       if (y == null) continue;
       ys.push(y);
-      if (Number.isFinite(sensorHalfMm) && Math.abs(y) <= sensorHalfMm + IMAGE_CIRCLE_CFG.sensorClipTolMm) {
+      if (Number.isFinite(sensorHalfMm) && Math.abs(y) <= sensorHalfMm + SENSOR_CLIP_TOL_MM) {
         insideCount++;
       }
     }
@@ -1861,7 +1418,6 @@
     vigWeight: 16.0,
     centerVigWeight: 180.0,
     midVigWeight: 60.0,
-    covPenalty: 180.0,
     intrusionWeight: 16.0,
     fieldWeights: [1.0, 1.5, 2.0],
 
@@ -1872,11 +1428,6 @@
     bflWeight: 6.0,
     lowValidPenalty: 450.0,
     hardInvalidPenalty: 1_000_000.0,
-    covShortfallWeight: 180.0,
-    imageCircleShortfallWeight: 180.0,
-    imageCircleReqVigWeight: 1400.0,
-    imageCircleReqValidWeight: 900.0,
-    imageCircleReqInsideWeight: 1400.0,
   };
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX, sensorHalfMm = null){
@@ -1902,10 +1453,7 @@
     wavePreset,
     sensorX,
     rayCount,
-    fov, maxField, covers, req,
-    maxFieldIc = null,
-    icTargetDiag = null,
-    reqHalfMm = null,
+    fov,
     intrusion,
     efl, T, bfl,
     targetEfl = null,
@@ -1913,7 +1461,7 @@
     physPenalty = 0,
     hardInvalid = false,
   }){
-    const edge = Number.isFinite(req) ? Math.min(maxField, req) : maxField;
+    const edge = Number.isFinite(fov?.dfov) ? clamp(fov.dfov * 0.5, 4, 60) : 15;
     const f0 = 0;
     const f1 = edge * 0.65;
     const f2 = edge * 0.95;
@@ -1948,53 +1496,6 @@
     merit += MERIT_CFG.vigWeight * (vigAvg * vigAvg);
     merit += MERIT_CFG.centerVigWeight * (vigCenter * vigCenter);
     merit += MERIT_CFG.midVigWeight * (vigMid * vigMid);
-    if (!covers) merit += MERIT_CFG.covPenalty;
-    if (Number.isFinite(req) && Number.isFinite(maxField) && maxField < req) {
-      const d = req - maxField;
-      merit += MERIT_CFG.covShortfallWeight * (d * d);
-    }
-
-    const icField = Number.isFinite(maxFieldIc) ? maxFieldIc : maxField;
-    const imageCircleDiagFromTrace = imageCircleDiagFromTracedFieldMm(
-      surfaces, wavePreset, sensorX, icField
-    );
-    const imageCircleDiag = Number.isFinite(imageCircleDiagFromTrace)
-      ? imageCircleDiagFromTrace
-      : imageCircleDiagFromHalfFieldMm(efl, icField);
-    const imageCircleTarget = Number.isFinite(icTargetDiag)
-      ? icTargetDiag
-      : imageCircleDiagFromHalfFieldMm(efl, req);
-    const imageCircleShortfall = (Number.isFinite(imageCircleDiag) && Number.isFinite(imageCircleTarget))
-      ? Math.max(0, imageCircleTarget - imageCircleDiag)
-      : null;
-    if (Number.isFinite(imageCircleShortfall) && imageCircleShortfall > 0) {
-      merit += MERIT_CFG.imageCircleShortfallWeight * (imageCircleShortfall * imageCircleShortfall);
-    }
-
-    let reqVigFrac = null;
-    let reqValidFrac = null;
-    let reqInsideFrac = null;
-    if (Number.isFinite(req) && req > 0) {
-      const reqHalfEff = Number.isFinite(reqHalfMm)
-        ? Math.max(0.1, reqHalfMm + Math.max(0, IMAGE_CIRCLE_CFG.edgeGuardMm || 0))
-        : null;
-      const packReq = traceBundleAtField(surfaces, req, rayCount, wavePreset, sensorX, reqHalfEff);
-      reqVigFrac = packReq.vigFrac;
-      reqValidFrac = (packReq.n || 0) / Math.max(1, rayCount);
-      reqInsideFrac = packReq.insideFrac;
-      if (Number.isFinite(reqVigFrac) && reqVigFrac > IMAGE_CIRCLE_CFG.maxReqVigFrac) {
-        const d = reqVigFrac - IMAGE_CIRCLE_CFG.maxReqVigFrac;
-        merit += MERIT_CFG.imageCircleReqVigWeight * (d * d);
-      }
-      if (Number.isFinite(reqValidFrac) && reqValidFrac < IMAGE_CIRCLE_CFG.minReqValidFrac) {
-        const d = IMAGE_CIRCLE_CFG.minReqValidFrac - reqValidFrac;
-        merit += MERIT_CFG.imageCircleReqValidWeight * (d * d);
-      }
-      if (Number.isFinite(reqInsideFrac) && reqInsideFrac < IMAGE_CIRCLE_CFG.minReqInsideFrac) {
-        const d = IMAGE_CIRCLE_CFG.minReqInsideFrac - reqInsideFrac;
-        merit += MERIT_CFG.imageCircleReqInsideWeight * (d * d);
-      }
-    }
 
     if (Number.isFinite(intrusion) && intrusion > 0){
       const x = intrusion / 1.0;
@@ -2026,30 +1527,13 @@
     if (Number.isFinite(physPenalty) && physPenalty > 0) merit += physPenalty;
     if (hardInvalid) merit += MERIT_CFG.hardInvalidPenalty;
 
-    const imageCircleOk =
-      Number.isFinite(imageCircleDiag) &&
-      Number.isFinite(imageCircleTarget) &&
-      imageCircleDiag + 0.05 >= imageCircleTarget;
-    const reqVigOk = !Number.isFinite(reqVigFrac) || reqVigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac;
-    const reqValidOk = !Number.isFinite(reqValidFrac) || reqValidFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
-    const reqInsideOk = !Number.isFinite(reqInsideFrac) || reqInsideFrac >= IMAGE_CIRCLE_CFG.minReqInsideFrac;
-    const coversStrict = !!covers && imageCircleOk && reqVigOk && reqValidOk && reqInsideOk;
-
     const breakdown = {
       rmsCenter, rmsEdge,
       vigPct: Math.round(vigAvg * 100),
-      covers,
-      coversStrict,
       intrusion: Number.isFinite(intrusion) ? intrusion : null,
       fields: fields.map(v => Number.isFinite(v) ? v : 0),
       vigCenterPct: Math.round(vigCenter * 100),
       vigMidPct: Math.round(vigMid * 100),
-      imageCircleDiag: Number.isFinite(imageCircleDiag) ? imageCircleDiag : null,
-      imageCircleTarget: Number.isFinite(imageCircleTarget) ? imageCircleTarget : null,
-      imageCircleOk,
-      reqVigPct: Number.isFinite(reqVigFrac) ? Math.round(reqVigFrac * 100) : null,
-      reqValidPct: Number.isFinite(reqValidFrac) ? Math.round(reqValidFrac * 100) : null,
-      reqInsidePct: Number.isFinite(reqInsideFrac) ? Math.round(reqInsideFrac * 100) : null,
       physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
       hardInvalid: !!hardInvalid,
     };
@@ -2550,42 +2034,7 @@
       ? "FOV: —"
       : `FOV: H ${fov.hfov.toFixed(1)}° • V ${fov.vfov.toFixed(1)}° • D ${fov.dfov.toFixed(1)}°`;
 
-    const covMode = COVERAGE_CFG.mode;
-    const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
-    const icProbeHalfMm = Math.max(covHalfMm, COVERAGE_CFG.icProbeHalfMm);
-    const strictRayCount = Math.max(rayCount, COVERAGE_CFG.displayRayCount);
-    const icTargetDiag = (covMode === "d") ? (2 * covHalfMm) : null;
-    const targetEval = evaluateCoverageAtHalfMm(lens.surfaces, wavePreset, sensorX, covHalfMm, strictRayCount);
-    const req = targetEval.req;
-    const covers = !!targetEval.ok;
-    const icSolve = solveImageCircleHalfMm(lens.surfaces, wavePreset, sensorX, strictRayCount, icProbeHalfMm);
-    const maxField = Number.isFinite(icSolve.maxField) ? icSolve.maxField : 0;
-    const maxFieldIc = maxField;
-
-    let covTxt = !fov
-      ? "COV(D): —"
-      : `COV(D): ±${maxField.toFixed(1)}° • REQ(D): ${Number.isFinite(req) ? req.toFixed(1) : "—"}° • ${covers ? "COVERS ✅" : "NO ❌"}`;
-    const distPct = estimateDistortionPct(lens.surfaces, wavePreset, sensorX, sensorW, sensorH, efl, covMode);
-
-    const reqVigFracStrict = targetEval.vigFrac;
-    const reqValidFracStrict = targetEval.validFrac;
-    const reqInsideFracStrict = targetEval.insideFrac;
-    const reqVigPctStrict = Number.isFinite(reqVigFracStrict) ? Math.round(reqVigFracStrict * 100) : null;
-    const reqValidPctStrict = Number.isFinite(reqValidFracStrict) ? Math.round(reqValidFracStrict * 100) : null;
-    const reqInsidePctStrict = Number.isFinite(reqInsideFracStrict) ? Math.round(reqInsideFracStrict * 100) : null;
-
-    const imageCircleDiag = Number.isFinite(icSolve.diagMm) ? icSolve.diagMm : null;
-    const imageCircleTarget = Number.isFinite(icTargetDiag)
-      ? icTargetDiag
-      : imageCircleDiagFromHalfFieldMm(efl, req);
-    const imageCircleOk =
-      Number.isFinite(imageCircleDiag) &&
-      Number.isFinite(imageCircleTarget) &&
-      imageCircleDiag >= imageCircleTarget;
-    const reqVigOk = !Number.isFinite(reqVigFracStrict) || reqVigFracStrict <= IMAGE_CIRCLE_CFG.maxReqVigFrac;
-    const reqValidOk = !Number.isFinite(reqValidFracStrict) || reqValidFracStrict >= IMAGE_CIRCLE_CFG.minReqValidFrac;
-    const reqInsideOk = !Number.isFinite(reqInsideFracStrict) || reqInsideFracStrict >= IMAGE_CIRCLE_CFG.minReqInsideFrac;
-    const coversStrict = !!covers && imageCircleOk && reqVigOk && reqValidOk && reqInsideOk;
+    const distPct = estimateDistortionPct(lens.surfaces, wavePreset, sensorX, sensorW, sensorH, efl, "d");
 
     const rearVx = lastPhysicalVertexX(lens.surfaces);
     const intrusion = rearVx - plX;
@@ -2596,10 +2045,7 @@
       wavePreset,
       sensorX,
       rayCount,
-      fov, maxField, covers, req,
-      maxFieldIc,
-      icTargetDiag,
-      reqHalfMm: covHalfMm,
+      fov,
       intrusion,
       efl, T, bfl,
       targetEfl: num(ui.optTargetFL?.value, NaN),
@@ -2610,21 +2056,12 @@
 
     const m = meritRes.merit;
     const bd = meritRes.breakdown;
-    const icDiagTxt = Number.isFinite(imageCircleDiag) ? `${fmtMmDown1(imageCircleDiag)}mm` : "—";
-    const icTargetTxt = Number.isFinite(imageCircleTarget) ? `${fmtMmUp1(imageCircleTarget)}mm` : "—";
-    covTxt = !fov
-      ? "COV(D): —"
-      : `COV(D): ±${maxField.toFixed(1)}° • REQ(D): ${Number.isFinite(req) ? req.toFixed(1) : "—"}° • IC ${icDiagTxt}/${icTargetTxt} • ${coversStrict ? "COVERS ✅" : "NO ❌"}`;
 
     const meritTxt =
       `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} ` +
       `(RMS0 ${bd.rmsCenter?.toFixed?.(3) ?? "—"}mm • RMSedge ${bd.rmsEdge?.toFixed?.(3) ?? "—"}mm • Vig ${bd.vigPct}%` +
       `${Number.isFinite(bd.vigCenterPct) ? ` • V0 ${bd.vigCenterPct}%` : ""}` +
       `${Number.isFinite(bd.vigMidPct) ? ` • Vmid ${bd.vigMidPct}%` : ""}` +
-      `${Number.isFinite(reqVigPctStrict) ? ` • Vreq ${reqVigPctStrict}%` : ""}` +
-      `${Number.isFinite(reqValidPctStrict) ? ` • Nreq ${reqValidPctStrict}%` : ""}` +
-      `${Number.isFinite(reqInsidePctStrict) ? ` • Ireq ${reqInsidePctStrict}%` : ""}` +
-      `${Number.isFinite(imageCircleDiag) ? ` • IC ${fmtMmDown1(imageCircleDiag)}mm` : ""}` +
       `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""}` +
       `${bd.physPenalty > 0 ? ` • PHYS +${bd.physPenalty.toFixed(1)}` : ""}` +
       `${bd.hardInvalid ? " • INVALID ❌" : ""})`;
@@ -2649,32 +2086,16 @@
     if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
     if (ui.dist) ui.dist.textContent = `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
     if (ui.fov) ui.fov.textContent = fovTxt;
-    if (ui.cov) ui.cov.textContent = coversStrict ? "COV: YES" : `COV: NO (IC ${icDiagTxt})`;
-    if (ui.ic) ui.ic.textContent = `IC: ${icDiagTxt} / ${icTargetTxt}`;
 
     if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
     if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
-    if (ui.covTop) ui.covTop.textContent = ui.cov?.textContent || (coversStrict ? "COV: YES" : "COV: NO");
-    if (ui.icTop) ui.icTop.textContent = ui.ic?.textContent || `IC: ${icDiagTxt} / ${icTargetTxt}`;
     if (ui.distTop) ui.distTop.textContent = ui.dist?.textContent || `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
 
     if (phys.hardFail && ui.footerWarn) {
       ui.footerWarn.textContent =
         `INVALID geometry: overlap/clearance issue (overlap ${phys.worstOverlap.toFixed(2)}mm, pinch ${phys.worstPinch.toFixed(2)}mm).`;
-    } else if (!imageCircleOk && ui.footerWarn) {
-      ui.footerWarn.textContent =
-        `Image circle too small: ${icDiagTxt}. Required: ${icTargetTxt} (target >= ${IMAGE_CIRCLE_CFG.minDiagMm.toFixed(0)}mm for full frame).`;
-    } else if (Number.isFinite(reqInsidePctStrict) && reqInsidePctStrict < Math.round(IMAGE_CIRCLE_CFG.minReqInsideFrac * 100) && ui.footerWarn) {
-      ui.footerWarn.textContent =
-        `Edge spill: only ${reqInsidePctStrict}% of rays stay inside required sensor edge (need >= ${Math.round(IMAGE_CIRCLE_CFG.minReqInsideFrac * 100)}%).`;
-    } else if (Number.isFinite(reqVigPctStrict) && reqVigPctStrict > Math.round(IMAGE_CIRCLE_CFG.maxReqVigFrac * 100) && ui.footerWarn) {
-      ui.footerWarn.textContent =
-        `Hard vignette at required edge: ${reqVigPctStrict}% clipped rays (must be ${Math.round(IMAGE_CIRCLE_CFG.maxReqVigFrac * 100)}%).`;
-    } else if (Number.isFinite(reqValidPctStrict) && reqValidPctStrict < Math.round(IMAGE_CIRCLE_CFG.minReqValidFrac * 100) && ui.footerWarn) {
-      ui.footerWarn.textContent =
-        `Too many invalid rays at required edge: ${reqValidPctStrict}% valid (need >= ${Math.round(IMAGE_CIRCLE_CFG.minReqValidFrac * 100)}%).`;
     } else if (phys.airGapCount < PHYS_CFG.minAirGapsPreferred && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Few air gaps (${phys.airGapCount}); aim for >= ${PHYS_CFG.minAirGapsPreferred} for practical designs.`;
@@ -2684,7 +2105,7 @@
 
     if (ui.status) {
       ui.status.textContent =
-        `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${covTxt} • ${meritTxt}`;
+        `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${meritTxt}`;
     }
     if (ui.metaInfo) ui.metaInfo.textContent = `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm`;
 
@@ -2714,7 +2135,6 @@
       `BFL ${bfl == null ? "—" : bfl.toFixed(2) + "mm"}`,
       tTxt,
       fovTxt,
-      covTxt,
       rearTxt,
       lenTxt,
       focusTxt,
@@ -3234,7 +2654,6 @@
         efl: null,
         T: null,
         bfl: null,
-        covers: false,
         intrusion: 0,
         vigFrac: 1,
         lensShift,
@@ -3244,7 +2663,6 @@
           rmsCenter: null,
           rmsEdge: null,
           vigPct: 100,
-          covers: false,
           intrusion: null,
           fields: [0, 0, 0],
           physPenalty: Number(phys.penalty || 0),
@@ -3263,16 +2681,6 @@
     const T = estimateTStopApprox(efl, surfaces);
 
     const fov = computeFovDeg(efl, sensorW, sensorH);
-    const covMode = COVERAGE_CFG.mode;
-    const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
-    const icProbeHalfMm = Math.max(covHalfMm, COVERAGE_CFG.icProbeHalfMm);
-    const covHalfEvalMm = covHalfMm + Math.max(0, IMAGE_CIRCLE_CFG.edgeGuardMm || 0);
-    const icProbeHalfEvalMm = icProbeHalfMm + Math.max(0, IMAGE_CIRCLE_CFG.edgeGuardMm || 0);
-    const icTargetDiag = (covMode === "d") ? (2 * covHalfMm) : null;
-    const maxField = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, covHalfEvalMm, rayCount);
-    const maxFieldIc = coverageTestMaxFieldDeg(surfaces, wavePreset, sensorX, icProbeHalfEvalMm, rayCount);
-    const req = requiredFieldForSensorHalfMm(surfaces, wavePreset, sensorX, covHalfEvalMm);
-    const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
 
     const rearVx = lastPhysicalVertexX(surfaces);
     const intrusion = rearVx - (-PL_FFD);
@@ -3282,10 +2690,7 @@
       wavePreset,
       sensorX,
       rayCount,
-      fov, maxField, covers, req,
-      maxFieldIc,
-      icTargetDiag,
-      reqHalfMm: covHalfMm,
+      fov,
       intrusion,
       efl, T, bfl,
       targetEfl,
@@ -3302,7 +2707,6 @@
       efl,
       T,
       bfl,
-      covers: !!meritRes.breakdown?.coversStrict,
       intrusion,
       vigFrac,
       lensShift,
@@ -3333,13 +2737,6 @@
     let cur = startLens;
     let curEval = evalLensMerit(cur, {targetEfl, targetT, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
-    const icText = (ev) => {
-      const ic = ev?.breakdown?.imageCircleDiag;
-      const tgt = ev?.breakdown?.imageCircleTarget;
-      const icStr = Number.isFinite(ic) ? `${ic.toFixed(1)}mm` : "—";
-      const tgtStr = Number.isFinite(tgt) ? `${tgt.toFixed(1)}mm` : "—";
-      return `IC ${icStr}/${tgtStr}`;
-    };
 
     // annealing-ish
     let temp0 = mode === "wild" ? 3.5 : 1.8;
@@ -3375,7 +2772,7 @@
             `score ${best.eval.score.toFixed(2)}\n` +
             `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
             `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
-            `COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
+            `INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
             `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
           );
         }
@@ -3389,7 +2786,7 @@
           setOptLog(
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
             `current ${curEval.score.toFixed(2)} • best ${best.eval.score.toFixed(2)} @${best.iter}\n` +
-            `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • INTR ${best.eval.intrusion.toFixed(2)}mm\n`
+            `best: EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm • T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} • INTR ${best.eval.intrusion.toFixed(2)}mm\n`
           );
         }
         // yield to UI
@@ -3408,7 +2805,7 @@
         `BEST score ${best.eval.score.toFixed(2)}\n` +
         `EFL ${Number.isFinite(best.eval.efl)?best.eval.efl.toFixed(2):"—"}mm (target ${targetEfl})\n` +
         `T ${Number.isFinite(best.eval.T)?best.eval.T.toFixed(2):"—"} (target ${targetT})\n` +
-        `COV ${best.eval.covers?"YES":"NO"} • ${icText(best.eval)} • INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
+        `INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
         `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
         `Click “Apply best” to load.`
       );
