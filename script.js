@@ -72,6 +72,7 @@
     btnScaleToFocal: $("#btnScaleToFocal"),
     btnSetTStop: $("#btnSetTStop"),
     btnAutoDesign: $("#btnAutoDesign"),
+    btnAutoDesignRefine: $("#btnAutoDesignRefine"),
     btnAutoDesignPreview: $("#btnAutoDesignPreview"),
     btnAutoDesignStop: $("#btnAutoDesignStop"),
     btnAdLogExpand: $("#btnAdLogExpand"),
@@ -1239,7 +1240,13 @@
     return best;
   }
 
-  function coverageTestBundleMaxFieldDeg(surfaces, wavePreset, sensorX, rayCount) {
+  function coverageTestBundleMaxFieldDeg(surfaces, wavePreset, sensorX, rayCount, limits = null) {
+    const maxReqVigFrac = Number.isFinite(Number(limits?.maxReqVigFrac))
+      ? clamp(Number(limits.maxReqVigFrac), 0, 0.999)
+      : IMAGE_CIRCLE_CFG.maxReqVigFrac;
+    const minReqValidFrac = Number.isFinite(Number(limits?.minReqValidFrac))
+      ? clamp(Number(limits.minReqValidFrac), 0.02, 1.0)
+      : IMAGE_CIRCLE_CFG.minReqValidFrac;
     let lo = 0, hi = 60, best = 0;
     for (let iter = 0; iter < 18; iter++) {
       const mid = (lo + hi) * 0.5;
@@ -1248,9 +1255,9 @@
       const validFrac = Number(pack?.n || 0) / Math.max(1, rayCount);
       const ok =
         Number.isFinite(vigFrac) &&
-        vigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac &&
+        vigFrac <= maxReqVigFrac &&
         Number.isFinite(validFrac) &&
-        validFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
+        validFrac >= minReqValidFrac;
       if (ok) {
         best = mid;
         lo = mid;
@@ -1394,6 +1401,8 @@
     maxReqVigFrac: 0.06,    // max vignette fraction at required edge field
     minReqValidFrac: 0.72,  // minimum valid traced ray fraction at required edge field
     maxCenterVigFrac: 0.01, // center field should be essentially clean
+    softMaxReqVigFrac: 0.92, // relaxed illum metric for progress/readout
+    softMinReqValidFrac: 0.18,
   };
 
   function halfFieldFromDiagDeg(efl, diagMm) {
@@ -1670,13 +1679,21 @@
     wavePreset,
     sensorX,
     rayCount,
-    fov, maxField, maxFieldGeom, covers, req,
+    fov, maxFieldStrict, maxFieldIllum, maxFieldGeom, covers, req,
     intrusion,
     efl, T, bfl,
     physPenalty = 0,
     hardInvalid = false,
   }){
-    const edge = Number.isFinite(req) ? Math.min(maxField, req) : maxField;
+    const mfStrictRaw = Number(maxFieldStrict);
+    const mfIllumRaw = Number(maxFieldIllum);
+    const hasStrict = Number.isFinite(mfStrictRaw);
+    const hasIllum = Number.isFinite(mfIllumRaw);
+    const mfStrict = hasStrict ? mfStrictRaw : 0;
+    const mfIllum = hasIllum
+      ? mfIllumRaw
+      : (hasStrict ? mfStrictRaw : 0);
+    const edge = Number.isFinite(req) ? Math.min(mfIllum, req) : mfIllum;
     const f0 = 0;
     const f1 = edge * 0.65;
     const f2 = edge * 0.95;
@@ -1712,18 +1729,22 @@
     merit += MERIT_CFG.centerVigWeight * (vigCenter * vigCenter);
     merit += MERIT_CFG.midVigWeight * (vigMid * vigMid);
     if (!covers) merit += MERIT_CFG.covPenalty;
-    if (!Number.isFinite(maxField) || !Number.isFinite(req)) merit += MERIT_CFG.invalidCoveragePenalty;
-    if (Number.isFinite(req) && Number.isFinite(maxField) && maxField < req) {
-      const d = req - maxField;
+    if (!hasStrict || !Number.isFinite(req)) merit += MERIT_CFG.invalidCoveragePenalty;
+    if (Number.isFinite(req) && hasStrict && mfStrict < req) {
+      const d = req - mfStrict;
       merit += MERIT_CFG.covShortfallWeight * (d * d);
+    }
+    if (Number.isFinite(req) && hasIllum && mfIllum < req) {
+      const d = req - mfIllum;
+      merit += MERIT_CFG.covShortfallWeight * 0.55 * (d * d);
     }
 
     const canEvalImageCircle = Number.isFinite(efl) && efl > 0 && Number.isFinite(req) && req >= 0;
     const imageCircleDiagMeasured = canEvalImageCircle
-      ? imageCircleDiagFromChiefAtField(surfaces, wavePreset, sensorX, maxField)
+      ? imageCircleDiagFromChiefAtField(surfaces, wavePreset, sensorX, mfIllum)
       : null;
     const imageCircleDiagFallback = canEvalImageCircle
-      ? imageCircleDiagFromHalfFieldMm(efl, maxField)
+      ? imageCircleDiagFromHalfFieldMm(efl, mfIllum)
       : null;
     const imageCircleDiag = Number.isFinite(imageCircleDiagMeasured) ? imageCircleDiagMeasured : imageCircleDiagFallback;
     const imageCircleDiagGeomMeasured = canEvalImageCircle && Number.isFinite(maxFieldGeom)
@@ -2307,16 +2328,24 @@
     const covMode = COVERAGE_CFG.mode;
     const covHalfMm = coverageHalfSizeWithFloorMm(sensorW, sensorH, covMode);
     const maxFieldGeom = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, covHalfMm);
-    const maxFieldBundle = coverageTestBundleMaxFieldDeg(lens.surfaces, wavePreset, sensorX, rayCount);
-    const maxField = Math.min(maxFieldGeom, maxFieldBundle);
+    const maxFieldBundleStrict = coverageTestBundleMaxFieldDeg(lens.surfaces, wavePreset, sensorX, rayCount);
+    const maxFieldBundleSoft = coverageTestBundleMaxFieldDeg(
+      lens.surfaces,
+      wavePreset,
+      sensorX,
+      rayCount,
+      { maxReqVigFrac: IMAGE_CIRCLE_CFG.softMaxReqVigFrac, minReqValidFrac: IMAGE_CIRCLE_CFG.softMinReqValidFrac },
+    );
+    const maxFieldStrict = Math.min(maxFieldGeom, maxFieldBundleStrict);
+    const maxFieldIllum = Math.min(maxFieldGeom, maxFieldBundleSoft);
     const reqFloor = coverageRequirementDeg(efl, sensorW, sensorH, covMode);
-    const reqFromFov = coversSensorYesNo({ fov, maxField, mode: covMode, marginDeg: COVERAGE_CFG.marginDeg }).req;
+    const reqFromFov = coversSensorYesNo({ fov, maxField: maxFieldStrict, mode: covMode, marginDeg: COVERAGE_CFG.marginDeg }).req;
     const req = Number.isFinite(reqFloor) ? reqFloor : reqFromFov;
-    const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
+    const covers = Number.isFinite(req) ? (maxFieldStrict + COVERAGE_CFG.marginDeg >= req) : false;
 
     let covTxt = !fov
       ? "COV(D): —"
-      : `COV(D): ±${maxField.toFixed(1)}° • REQ(D): ${(req ?? 0).toFixed(1)}° • ${covers ? "COVERS ✅" : "NO ❌"}`;
+      : `COV(D): ±${maxFieldStrict.toFixed(1)}° • REQ(D): ${(req ?? 0).toFixed(1)}° • ${covers ? "COVERS ✅" : "NO ❌"}`;
     const distPct = estimateDistortionPct(lens.surfaces, wavePreset, sensorX, sensorW, sensorH, efl, covMode);
 
     const rearVx = lastPhysicalVertexX(lens.surfaces);
@@ -2328,7 +2357,12 @@
       wavePreset,
       sensorX,
       rayCount,
-      fov, maxField, maxFieldGeom, covers, req,
+      fov,
+      maxFieldStrict,
+      maxFieldIllum,
+      maxFieldGeom,
+      covers,
+      req,
       intrusion,
       efl, T, bfl,
       physPenalty: phys.penalty,
@@ -2352,7 +2386,7 @@
       : `${icDiagTxt} / ${icTargetTxt}`;
     covTxt = !fov
       ? "COV(D): —"
-      : `COV(D): ±${maxField.toFixed(1)}° (geom ${maxFieldGeom.toFixed(1)}° • illum ${maxFieldBundle.toFixed(1)}°) • REQ(D): ${(req ?? 0).toFixed(1)}° • IC ${icCompactTxt} / ${icTargetTxt} • ${coversStrict ? "COVERS ✅" : "NO ❌"}`;
+      : `COV(D): ±${maxFieldStrict.toFixed(1)}° (geom ${maxFieldGeom.toFixed(1)}° • illum ${maxFieldIllum.toFixed(1)}°) • REQ(D): ${(req ?? 0).toFixed(1)}° • IC ${icCompactTxt} / ${icTargetTxt} • ${coversStrict ? "COVERS ✅" : "NO ❌"}`;
 
     const meritTxt =
       `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} ` +
@@ -2834,7 +2868,7 @@
     guardFailPenalty: 900000.0,
     maxSurfaceCount: 32,
   };
-  const AD_BUILD_TAG = "v2-rescue-r14";
+  const AD_BUILD_TAG = "v2-rescue-r17";
 
   const AD_GLASS_CLASSES = {
     CROWN: ["N-BK7HT", "N-BAK4", "N-BAK2", "N-K5", "N-PSK3", "N-SK14"],
@@ -2867,6 +2901,7 @@
 
   function adSetRunningUI(isRunning) {
     if (ui.btnAutoDesign) ui.btnAutoDesign.disabled = !!isRunning;
+    if (ui.btnAutoDesignRefine) ui.btnAutoDesignRefine.disabled = !!isRunning;
     if (ui.btnAutoDesignStop) ui.btnAutoDesignStop.disabled = !isRunning;
     if (ui.btnAutoDesignPreview) ui.btnAutoDesignPreview.disabled = !!isRunning || !adBest?.lens;
   }
@@ -3620,7 +3655,7 @@
     }
   }
 
-  function adNudgeCoverage(surfaces, sensorW, sensorH, wavePreset, rayCount) {
+  function adNudgeCoverage(surfaces, sensorW, sensorH, wavePreset, rayCount, opts = {}) {
     if (!Array.isArray(surfaces) || !surfaces.length) return;
     computeVertices(surfaces, 0, 0);
     const { efl } = estimateEflBflParaxial(surfaces, wavePreset);
@@ -3632,7 +3667,11 @@
     const maxFieldGeom = coverageTestMaxFieldDeg(surfaces, wavePreset, 0, covHalfMm);
     const maxFieldBundle = coverageTestBundleMaxFieldDeg(surfaces, wavePreset, 0, rayCount);
     const maxField = Math.min(maxFieldGeom, maxFieldBundle);
-    if (maxField + COVERAGE_CFG.marginDeg >= req) return;
+    const baseDeficit = Math.max(0, req - (maxField + COVERAGE_CFG.marginDeg));
+    const force = clamp(Number(opts.force || 0), 0, 2.0);
+    if (baseDeficit <= 0.03 && force <= 0.05) return;
+    const deficitNorm = clamp(baseDeficit / Math.max(4, req), 0, 1.0);
+    const push = clamp(deficitNorm + force * 0.8, 0.08, 1.8);
 
     const stopIdx = findStopSurfaceIndex(surfaces);
     for (let i = 0; i < surfaces.length; i++) {
@@ -3640,17 +3679,35 @@
       const t = String(s?.type || "").toUpperCase();
       if (t === "OBJ" || t === "IMS") continue;
       const nearStop = stopIdx >= 0 && Math.abs(i - stopIdx) <= 2;
-      const gain = nearStop ? 1.16 : 1.07;
-      s.ap = clamp(Number(s.ap || 0) * gain, PHYS_CFG.minAperture, maxApForSurface(s));
+      const inFront = stopIdx >= 0 && i < stopIdx;
+      const gain = 1 + (
+        nearStop
+          ? (0.08 + 0.22 * push)
+          : (inFront ? (0.06 + 0.18 * push) : (0.04 + 0.12 * push))
+      );
+      let ap = clamp(Number(s.ap || 0) * gain, PHYS_CFG.minAperture, maxApForSurface(s));
+      // If a surface is aperture-limited by steep curvature, relax curvature a bit so ap can grow.
+      if (Math.abs(Number(s.R || 0)) > 1e-9 && ap >= maxApForSurface(s) * 0.94) {
+        const relax = 1 + (0.04 + 0.10 * push);
+        s.R = clampSignedRadius(Number(s.R || 0) * relax);
+        ap = clamp(ap, PHYS_CFG.minAperture, maxApForSurface(s));
+      }
+      s.ap = ap;
     }
     if (stopIdx >= 0) {
+      const sStop = surfaces[stopIdx];
+      sStop.ap = clamp(
+        Number(sStop.ap || 0) * (1 + (0.10 + 0.28 * push)),
+        PHYS_CFG.minAperture,
+        maxApForSurface(sStop),
+      );
       if (stopIdx > 0) {
         const sPrev = surfaces[stopIdx - 1];
-        sPrev.t = adClampThicknessForSurface(sPrev, Number(sPrev.t || 0) * 1.10, PHYS_CFG.minStopSideAirGap);
+        sPrev.t = adClampThicknessForSurface(sPrev, Number(sPrev.t || 0) * (1.08 + 0.12 * push), PHYS_CFG.minStopSideAirGap);
       }
-      const sStop = surfaces[stopIdx];
-      sStop.t = adClampThicknessForSurface(sStop, Number(sStop.t || 0) * 1.10, PHYS_CFG.minStopSideAirGap);
+      sStop.t = adClampThicknessForSurface(sStop, Number(sStop.t || 0) * (1.08 + 0.12 * push), PHYS_CFG.minStopSideAirGap);
     }
+    expandMiddleApertures(surfaces, { nearStopHeadroom: 1.16 + 0.14 * push });
     clampAllApertures(surfaces);
   }
 
@@ -3876,10 +3933,19 @@
     const reqFieldDeg = Number.isFinite(req) ? req : 12.0;
     const covHalfMm = coverageHalfSizeWithFloorMm(cfg.sensorW, cfg.sensorH, COVERAGE_CFG.mode);
     const maxFieldGeom = coverageTestMaxFieldDeg(surfaces, cfg.wavePreset, 0, covHalfMm);
-    const maxFieldBundle = coverageTestBundleMaxFieldDeg(surfaces, cfg.wavePreset, 0, rayCount);
-    const maxField = Math.min(maxFieldGeom, maxFieldBundle);
-    const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
-    const icDiag = imageCircleDiagFromChiefAtField(surfaces, cfg.wavePreset, 0, maxField) ?? imageCircleDiagFromHalfFieldMm(efl, maxField);
+    const maxFieldBundleStrict = coverageTestBundleMaxFieldDeg(surfaces, cfg.wavePreset, 0, rayCount);
+    const maxFieldBundleSoft = coverageTestBundleMaxFieldDeg(
+      surfaces,
+      cfg.wavePreset,
+      0,
+      rayCount,
+      { maxReqVigFrac: IMAGE_CIRCLE_CFG.softMaxReqVigFrac, minReqValidFrac: IMAGE_CIRCLE_CFG.softMinReqValidFrac },
+    );
+    const maxFieldStrict = Math.min(maxFieldGeom, maxFieldBundleStrict);
+    const maxFieldIllum = Math.min(maxFieldGeom, maxFieldBundleSoft);
+    const covers = Number.isFinite(req) ? (maxFieldStrict + COVERAGE_CFG.marginDeg >= req) : false;
+    const icDiagStrict = imageCircleDiagFromChiefAtField(surfaces, cfg.wavePreset, 0, maxFieldStrict) ?? imageCircleDiagFromHalfFieldMm(efl, maxFieldStrict);
+    const icDiag = imageCircleDiagFromChiefAtField(surfaces, cfg.wavePreset, 0, maxFieldIllum) ?? imageCircleDiagFromHalfFieldMm(efl, maxFieldIllum);
     const icTarget = targetImageCircleDiagMm(cfg.sensorW, cfg.sensorH);
     const icOk = Number.isFinite(icDiag) && icDiag + 0.25 >= icTarget;
     const maxPosShift = adRearSafeMaxPositiveShift(surfaces, 0);
@@ -4016,8 +4082,9 @@
     if (Number.isFinite(intrusion) && intrusion > 0) score += cfg.bflWeight * intrusion * intrusion;
     if (Number.isFinite(intrusionInfShift) && intrusionInfShift > 0) score += cfg.bflWeight * intrusionInfShift * intrusionInfShift;
     if (Number.isFinite(intrusionNearShift) && intrusionNearShift > 0) score += cfg.bflWeight * intrusionNearShift * intrusionNearShift;
-    if (Number.isFinite(req) && Number.isFinite(maxField) && maxField < req) score += cfg.covWeight * (req - maxField) ** 2;
-    if (!icOk) score += cfg.covWeight * Math.max(1, (icTarget - Number(icDiag || 0)) ** 2);
+    if (Number.isFinite(req) && Number.isFinite(maxFieldStrict) && maxFieldStrict < req) score += cfg.covWeight * (req - maxFieldStrict) ** 2;
+    if (Number.isFinite(req) && Number.isFinite(maxFieldIllum) && maxFieldIllum < req) score += cfg.covWeight * 0.55 * (req - maxFieldIllum) ** 2;
+    if (!icOk) score += cfg.covWeight * 1.35 * Math.max(1, (icTarget - Number(icDiag || 0)) ** 2);
     if (focusTarget === "both" && focusInf.ok && focusNear.ok) {
       score += cfg.focusTravelWeight * (focusNear.shift - focusInf.shift) ** 2;
     }
@@ -4034,8 +4101,11 @@
       bfl,
       reqFieldDeg,
       req,
-      maxField,
+      maxField: maxFieldStrict,
+      maxFieldStrict,
+      maxFieldIllum,
       icDiag,
+      icDiagStrict,
       icTarget,
       distPct,
       intrusion,
@@ -4251,11 +4321,22 @@
 
     const edgeBad = Number.isFinite(state.edgeRmsInf) && Number.isFinite(state.centerRmsInf) && state.edgeRmsInf > state.centerRmsInf * 2.4;
     const nearFail = state.focusNearOk === false;
+    const covFail = !!state.covFail;
+    const icFail = !!state.icFail;
     if (edgeBad) {
       for (const op of ops) if (op.id === "split" || op.id === "field") op.w *= 1.9;
     }
     if (nearFail) {
       for (const op of ops) if (op.id === "airgap" || op.id === "split") op.w *= 1.6;
+    }
+    if (covFail || icFail) {
+      for (const op of ops) {
+        if (op.id === "stop") op.w *= 2.2;
+        else if (op.id === "airgap") op.w *= 1.9;
+        else if (op.id === "field" || op.id === "split") op.w *= 1.8;
+        else if (op.id === "bend") op.w *= 1.35;
+        else if (op.id === "glass") op.w *= 0.8;
+      }
     }
 
     let chosen = null;
@@ -4271,7 +4352,10 @@
       adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset);
       adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset);
       adNudgeBflForPL(s, cfg);
-      if (Math.random() < 0.70) adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount);
+      const coverageForce = (covFail || icFail) ? 1.0 : 0.0;
+      if (coverageForce > 0 || Math.random() < 0.70) {
+        adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount, { force: coverageForce });
+      }
       adQuickSanity(s, {
         targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
         minRearGap: cfg.minRearGapMm,
@@ -4514,6 +4598,8 @@
         edgeRmsInf: curEval.focusInf?.rmsEdge,
         centerRmsInf: curEval.focusInf?.rmsCenter,
         focusNearOk: curEval.focusNear?.ok,
+        covFail: Array.isArray(curEval?.reasons) && curEval.reasons.includes("COV"),
+        icFail: Array.isArray(curEval?.reasons) && curEval.reasons.includes("IC"),
       });
 
       let cand = m.lens;
@@ -4603,7 +4689,8 @@
         adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset);
         adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset);
         adNudgeBflForPL(s, cfg);
-        adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount);
+        const covPush = Array.isArray(curEval?.reasons) && (curEval.reasons.includes("COV") || curEval.reasons.includes("IC")) ? 1.0 : 0.0;
+        adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount, { force: covPush });
         adQuickSanity(s, {
           targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
           minRearGap: cfg.minRearGapMm,
@@ -4615,6 +4702,8 @@
           edgeRmsInf: curEval.focusInf?.rmsEdge,
           centerRmsInf: curEval.focusInf?.rmsCenter,
           focusNearOk: curEval.focusNear?.ok,
+          covFail: Array.isArray(curEval?.reasons) && curEval.reasons.includes("COV"),
+          icFail: Array.isArray(curEval?.reasons) && curEval.reasons.includes("IC"),
         });
         candEval = adEvaluateCandidate(m.lens, cfg, { quick: (iter % 5) !== 0 });
       }
@@ -4704,8 +4793,10 @@
     return { shift, refined: !!res.ok };
   }
 
-  async function runAutodesignPrime() {
+  async function runAutodesignPrime(opts = {}) {
     if (adRunning) return;
+    const mode = String(opts?.mode || "prime").toLowerCase();
+    const refineOnly = mode === "refine";
 
     const targetEfl = num(ui.adTargetEFL?.value, 50);
     const targetT = num(ui.adTargetT?.value, 2.0);
@@ -4733,8 +4824,8 @@
     };
 
     const prevBest = adBest ? clone(adBest) : null;
+    const currentLensSnapshot = sanitizeLens(clone(lens));
     adRunning = true;
-    adBest = null;
     adSetRunningUI(true);
 
     try {
@@ -4743,35 +4834,13 @@
         `Autodesigner ${AD_BUILD_TAG} start\n` +
         `Target EFL ${targetEfl.toFixed(2)}mm • Target T ${targetT.toFixed(2)}\n` +
         `Focus target: ${focusTarget === "near" ? "2000mm" : focusTarget === "inf" ? "infinity" : "infinity + 2000mm"}\n` +
+        `Mode: ${refineOnly ? "Refine only (from current/best lens JSON)" : "Synthesis + refine"}\n` +
         `Effort: ${attempts}x (seeds ${cfg.seedCount}, iters ${cfg.optimizeIters}, topK ${cfg.topK})\n` +
         `Sensor ${cfg.sensorW.toFixed(2)}x${cfg.sensorH.toFixed(2)}mm • PL BFL>=${cfg.bflMinMm.toFixed(1)}\n` +
         `Rear gap guard: >=${cfg.minRearGapMm.toFixed(1)}mm\n` +
         `Focus near distance: ${cfg.focusNearMm.toFixed(0)}mm\n`
       );
 
-      appendADLog("Stage A: template synthesis + quick guards...");
-      const seeds = await adGenerateSeeds(cfg);
-      if (!adRunning) return;
-
-      const seedPool = seeds.valid.length ? seeds.valid : seeds.near;
-      if (!seedPool.length) {
-        appendADLog("No candidates generated.");
-        toast("Autodesign: geen candidates");
-        return;
-      }
-
-      let warmStartItem = null;
-      if (adIsWarmStartCompatible(prevBest, cfg)) {
-        const warmLens = adBuildWarmStartSeed(prevBest, cfg);
-        if (warmLens) {
-          const warmEval = adEvaluateCandidate(warmLens, cfg, { quick: false });
-          warmStartItem = { family: "warm-prev", lens: clone(warmEval.lens), eval: warmEval };
-          seedPool.push(warmStartItem);
-          appendADLog(`Warm start loaded: ${adFormatEval(warmEval)}`);
-        }
-      }
-
-      const hasTrueValid = seedPool.some((x) => !!x?.eval?.valid);
       const isUsableNear = (ev) => {
         if (!ev) return false;
         const targetE = Math.max(1, Number(cfg.targetEfl || 50));
@@ -4787,43 +4856,103 @@
         if (Number.isFinite(vf) && vf < 0.08) return false;
         return true;
       };
-      seedPool.sort((a, b) => {
-        if (hasTrueValid) return a.eval.score - b.eval.score;
-        return adNearRank(a.eval, cfg) - adNearRank(b.eval, cfg);
-      });
+
       const topSeeds = [];
-      if (warmStartItem && (warmStartItem.eval.valid || isUsableNear(warmStartItem.eval))) {
-        topSeeds.push(warmStartItem);
-      }
-      const forcedFamilies = ["plbase", "distagon", "retrofocus"];
-      for (const fam of forcedFamilies) {
-        if (topSeeds.length >= cfg.topK) break;
-        const sForced = adBuildRescueSeed(cfg, fam);
-        const eForced = adEvaluateCandidate(sForced, cfg, { quick: false });
-        if (eForced.valid || isUsableNear(eForced)) {
-          topSeeds.push({ family: `${fam}:forced`, lens: clone(eForced.lens), eval: eForced });
+      if (refineOnly) {
+        appendADLog("Stage A skipped: refine-only mode.");
+        const hasCurrentLens = Array.isArray(currentLensSnapshot?.surfaces) && currentLensSnapshot.surfaces.length >= 4;
+        const srcLens = hasCurrentLens
+          ? clone(currentLensSnapshot)
+          : (prevBest?.lens ? clone(prevBest.lens) : clone(currentLensSnapshot));
+        const srcLabel = hasCurrentLens ? "current lens/json" : (prevBest?.lens ? "previous best" : "current lens");
+        const warmInput = { lens: srcLens, eval: { lens: srcLens } };
+        const baseLens = adBuildWarmStartSeed(warmInput, cfg) || adConditionSeedLens(srcLens, cfg);
+        const baseEval = adEvaluateCandidate(baseLens, cfg, { quick: false });
+        const baseItem = { family: `refine-base:${srcLabel}`, lens: clone(baseEval.lens), eval: baseEval };
+        topSeeds.push(baseItem);
+        appendADLog(`Refine baseline loaded: ${adFormatEval(baseEval)}`);
+
+        const topoBase = adCaptureTopology(baseItem.lens);
+        const extraVariants = Math.min(Math.max(1, cfg.topK - 1), 3);
+        for (let i = 0; i < extraVariants; i++) {
+          const m = adMutateLens(baseItem.lens, cfg, topoBase, {
+            edgeRmsInf: baseEval.focusInf?.rmsEdge,
+            centerRmsInf: baseEval.focusInf?.rmsCenter,
+            focusNearOk: baseEval.focusNear?.ok,
+          });
+          const tuned = adConditionSeedLens(m.lens, cfg);
+          const ev = adEvaluateCandidate(tuned, cfg, { quick: false });
+          if (ev.valid || isUsableNear(ev)) {
+            topSeeds.push({ family: `refine-variant-${i + 1}`, lens: clone(ev.lens), eval: ev });
+          }
         }
-      }
-      for (const item of seedPool) {
-        if (topSeeds.length >= cfg.topK) break;
-        if (topSeeds.includes(item)) continue;
-        if (!item?.eval?.valid && !isUsableNear(item.eval)) continue;
-        topSeeds.push(item);
-      }
-      if (!topSeeds.length && seedPool.length) {
-        topSeeds.push(seedPool[0]);
-      }
-      const minTop = Math.min(3, seedPool.length, cfg.topK);
-      if (topSeeds.length < minTop) {
+      } else {
+        appendADLog("Stage A: template synthesis + quick guards...");
+        const seeds = await adGenerateSeeds(cfg);
+        if (!adRunning) return;
+
+        const seedPool = seeds.valid.length ? seeds.valid : seeds.near;
+        if (!seedPool.length) {
+          appendADLog("No candidates generated.");
+          toast("Autodesign: geen candidates");
+          return;
+        }
+
+        let warmStartItem = null;
+        if (adIsWarmStartCompatible(prevBest, cfg)) {
+          const warmLens = adBuildWarmStartSeed(prevBest, cfg);
+          if (warmLens) {
+            const warmEval = adEvaluateCandidate(warmLens, cfg, { quick: false });
+            warmStartItem = { family: "warm-prev", lens: clone(warmEval.lens), eval: warmEval };
+            seedPool.push(warmStartItem);
+            appendADLog(`Warm start loaded: ${adFormatEval(warmEval)}`);
+          }
+        }
+
+        const hasTrueValid = seedPool.some((x) => !!x?.eval?.valid);
+        seedPool.sort((a, b) => {
+          if (hasTrueValid) return a.eval.score - b.eval.score;
+          return adNearRank(a.eval, cfg) - adNearRank(b.eval, cfg);
+        });
+        if (warmStartItem && (warmStartItem.eval.valid || isUsableNear(warmStartItem.eval))) {
+          topSeeds.push(warmStartItem);
+        }
+        const forcedFamilies = ["plbase", "distagon", "retrofocus"];
+        for (const fam of forcedFamilies) {
+          if (topSeeds.length >= cfg.topK) break;
+          const sForced = adBuildRescueSeed(cfg, fam);
+          const eForced = adEvaluateCandidate(sForced, cfg, { quick: false });
+          if (eForced.valid || isUsableNear(eForced)) {
+            topSeeds.push({ family: `${fam}:forced`, lens: clone(eForced.lens), eval: eForced });
+          }
+        }
         for (const item of seedPool) {
-          if (topSeeds.length >= minTop) break;
+          if (topSeeds.length >= cfg.topK) break;
           if (topSeeds.includes(item)) continue;
+          if (!item?.eval?.valid && !isUsableNear(item.eval)) continue;
           topSeeds.push(item);
         }
+        if (!topSeeds.length && seedPool.length) {
+          topSeeds.push(seedPool[0]);
+        }
+        const minTop = Math.min(3, seedPool.length, cfg.topK);
+        if (topSeeds.length < minTop) {
+          for (const item of seedPool) {
+            if (topSeeds.length >= minTop) break;
+            if (topSeeds.includes(item)) continue;
+            topSeeds.push(item);
+          }
+        }
+        const trueValidCount = seeds.valid.filter((x) => !!x?.eval?.valid).length;
+        appendADLog(`Stage A done: ${trueValidCount} valid seeds (${seedPool.length} usable).`);
+        if (trueValidCount === 0) appendADLog("Stage A note: using near-ranked fallback candidates (no strictly valid seed yet).");
       }
-      const trueValidCount = seeds.valid.filter((x) => !!x?.eval?.valid).length;
-      appendADLog(`Stage A done: ${trueValidCount} valid seeds (${seedPool.length} usable).`);
-      if (trueValidCount === 0) appendADLog("Stage A note: using near-ranked fallback candidates (no strictly valid seed yet).");
+
+      if (!topSeeds.length) {
+        appendADLog("No refine candidates available.");
+        toast("Autodesign: geen geschikte refine candidates");
+        return;
+      }
       appendADLog(`Stage B: optimize top ${topSeeds.length} seeds...`);
 
       let bestValid = null;
@@ -5044,6 +5173,12 @@
       runAutodesignPrime().catch((err) => {
         console.error(err);
         toast("Autodesign failed");
+      });
+    });
+    ui.btnAutoDesignRefine?.addEventListener("click", () => {
+      runAutodesignPrime({ mode: "refine" }).catch((err) => {
+        console.error(err);
+        toast("Refine failed");
       });
     });
     ui.btnAutoDesignPreview?.addEventListener("click", previewAutodesignBest);
