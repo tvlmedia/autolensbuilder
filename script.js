@@ -1241,6 +1241,8 @@
     subtleVignetteFrac: 0.12,
     minValidFrac: 0.55,
     illumExponent: 1.0, // >1 makes edge stricter (good/total)^exp
+    centerRadiusTolMm: 0.5,
+    centerGoodMin: 0.30,
   };
 
   function defaultTargetImageCircleMm(sensorW, sensorH) {
@@ -1359,7 +1361,7 @@
     return hiDeg;
   }
 
-  function illuminationAtRadius(surfaces, rTargetMm, rayCount, wavePreset, sensorX, opts = {}) {
+  function illuminationAtRadius(surfaces, rTargetMm, rayCount, wavePreset, sensorX, centerGoodFrac, opts = {}) {
     const thetaDeg = findFieldDegForRadius(surfaces, rTargetMm, wavePreset, sensorX, opts);
     if (!Number.isFinite(thetaDeg)) {
       return {
@@ -1377,15 +1379,18 @@
     const mountMax = Number.isFinite(opts.mountMaxFrac) ? opts.mountMaxFrac : IMG_CIRCLE_CFG.mountMaxFrac;
     const hardVig = Number.isFinite(opts.hardVigFrac) ? opts.hardVigFrac : IMG_CIRCLE_CFG.hardVigFrac;
     const minValid = Number.isFinite(opts.minValidFrac) ? opts.minValidFrac : IMG_CIRCLE_CFG.minValidFrac;
-    const softVig = Number.isFinite(opts.subtleVignetteFrac) ? opts.subtleVignetteFrac : IMG_CIRCLE_CFG.subtleVignetteFrac;
+    const centerTol = Number.isFinite(opts.centerRadiusTolMm) ? opts.centerRadiusTolMm : IMG_CIRCLE_CFG.centerRadiusTolMm;
     const exp = Math.max(1, Number(opts.illumExponent || IMG_CIRCLE_CFG.illumExponent || 1));
 
-    let relIllum = Math.pow(pack.goodFrac, exp);
+    const centerRef = Math.max(1e-6, Number(centerGoodFrac || 0));
+    let relIllum = Math.pow(pack.goodFrac / centerRef, exp);
+    relIllum = clamp(relIllum, 0, 1);
     if (pack.mountFrac > mountMax) relIllum = 0;
     if (pack.vigFrac > hardVig) relIllum = 0;
 
     const threshold = Number.isFinite(opts.illumThreshold) ? opts.illumThreshold : IMG_CIRCLE_CFG.illumThreshold;
-    const pass = relIllum >= threshold && pack.mountFrac <= mountMax && pack.validFrac >= minValid && pack.vigFrac <= softVig;
+    const isNearCenter = Math.abs(rTargetMm) <= centerTol;
+    const pass = relIllum >= threshold && pack.mountFrac <= mountMax && (isNearCenter || pack.validFrac >= minValid);
 
     return {
       rTargetMm,
@@ -1402,6 +1407,8 @@
     const diagHalf = 0.5 * Math.hypot(sensorW, sensorH);
     const sampleCount = Math.max(3, Number(opts.sampleCount || IMG_CIRCLE_CFG.sampleCount) | 0);
     const threshold = Number.isFinite(opts.illumThreshold) ? opts.illumThreshold : IMG_CIRCLE_CFG.illumThreshold;
+    const centerPack = traceIcBundleAtField(surfaces, 0, rayCount, wavePreset, sensorX, opts);
+    const centerGoodFrac = Math.max(1e-6, Number(centerPack.goodFrac || 0));
 
     let lastPass = null;
     let firstFailAfterPass = null;
@@ -1410,7 +1417,7 @@
     for (let i = 0; i < sampleCount; i++) {
       const t = sampleCount === 1 ? 0 : (i / (sampleCount - 1));
       const r = diagHalf * t;
-      const s = illuminationAtRadius(surfaces, r, rayCount, wavePreset, sensorX, opts);
+      const s = illuminationAtRadius(surfaces, r, rayCount, wavePreset, sensorX, centerGoodFrac, opts);
       samples.push(s);
 
       if (s.pass) {
@@ -1439,6 +1446,10 @@
       halfSizeMm: edgeR,
       sensorDiagHalfMm: diagHalf,
       relIllumAtEdge: lastPass ? lastPass.relIllum : 0,
+      centerGoodFrac,
+      centerValidFrac: centerPack.validFrac,
+      centerVigFrac: centerPack.vigFrac,
+      centerMountFrac: centerPack.mountFrac,
       samples,
     };
   }
@@ -1646,6 +1657,7 @@
     eflWeight: 0.35,          // penalty per mm error (squared)
     tWeight: 10.0,            // penalty per T error (squared)
     imgCircleWeight: 10.0,    // penalty for missing target image circle (mm shortfall squared)
+    centerIllumWeight: 900.0, // heavy penalty when center throughput is already too low
     bflMin: 52.0,             // for PL: discourage too-short backfocus
     bflWeight: 6.0,
     lowValidPenalty: 450.0,
@@ -1682,6 +1694,7 @@
     targetT = null,
     imageCircleMm = null,
     targetImageCircleMm = null,
+    centerGoodFrac = null,
     physPenalty = 0,
     hardInvalid = false,
   }){
@@ -1745,6 +1758,13 @@
       const shortfall = Math.max(0, targetImageCircleMm - imageCircleMm);
       merit += MERIT_CFG.imgCircleWeight * (shortfall * shortfall);
     }
+    if (Number.isFinite(centerGoodFrac)) {
+      const minCenter = Number(IMG_CIRCLE_CFG.centerGoodMin || 0.30);
+      if (centerGoodFrac < minCenter) {
+        const d = (minCenter - centerGoodFrac);
+        merit += MERIT_CFG.centerIllumWeight * (d * d);
+      }
+    }
 
     const minValidTarget = Math.max(7, Math.floor(rayCount * 0.45));
     if (validMin < minValidTarget) {
@@ -1764,6 +1784,7 @@
       vigMidPct: Math.round(vigMid * 100),
       imageCircleMm: Number.isFinite(imageCircleMm) ? imageCircleMm : null,
       targetImageCircleMm: Number.isFinite(targetImageCircleMm) ? targetImageCircleMm : null,
+      centerGoodFrac: Number.isFinite(centerGoodFrac) ? centerGoodFrac : null,
       physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
       hardInvalid: !!hardInvalid,
     };
@@ -2268,6 +2289,7 @@
     const imageCircle = estimateImageCircleIllumMm(lens.surfaces, wavePreset, sensorX, rayCount, sensorW, sensorH);
     const imageCircleMm = imageCircle?.diameterMm ?? null;
     const imageCircleDelta = Number.isFinite(imageCircleMm) ? (imageCircleMm - targetImageCircle) : null;
+    const centerGoodFrac = Number(imageCircle?.centerGoodFrac);
 
     const distPct = estimateDistortionPct(lens.surfaces, wavePreset, sensorX, sensorW, sensorH, efl, "d");
 
@@ -2287,6 +2309,7 @@
       targetT: num(ui.optTargetT?.value, NaN),
       imageCircleMm,
       targetImageCircleMm: targetImageCircle,
+      centerGoodFrac,
       physPenalty: phys.penalty,
       hardInvalid: phys.hardFail,
     });
@@ -2344,6 +2367,9 @@
         `Few air gaps (${phys.airGapCount}); aim for >= ${PHYS_CFG.minAirGapsPreferred} for practical designs.`;
     } else if (tirCount > 0 && ui.footerWarn) {
       ui.footerWarn.textContent = `TIR on ${tirCount} rays (check glass / curvature).`;
+    } else if (Number.isFinite(centerGoodFrac) && centerGoodFrac < IMG_CIRCLE_CFG.centerGoodMin && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `Low center throughput (${(centerGoodFrac * 100).toFixed(0)}%); strong central clipping likely.`;
     } else if (Number.isFinite(imageCircleDelta) && imageCircleDelta < -0.05 && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Image circle too small by ${Math.abs(imageCircleDelta).toFixed(2)}mm (target ${targetImageCircle.toFixed(2)}mm).`;
@@ -2898,6 +2924,7 @@
     const phys = evaluatePhysicalConstraints(surfaces);
     const imageCircle = estimateImageCircleIllumMm(surfaces, wavePreset, sensorX, rayCount, sensorW, sensorH);
     const imageCircleMm = imageCircle?.diameterMm ?? null;
+    const centerGoodFrac = Number(imageCircle?.centerGoodFrac);
 
     if (phys.hardFail) {
       const score = MERIT_CFG.hardInvalidPenalty + Math.max(0, Number(phys.penalty || 0));
@@ -2920,6 +2947,7 @@
           fields: [0, 0, 0],
           imageCircleMm,
           targetImageCircleMm: Number.isFinite(targetImageCircleMm) ? targetImageCircleMm : null,
+          centerGoodFrac: Number.isFinite(centerGoodFrac) ? centerGoodFrac : null,
           physPenalty: Number(phys.penalty || 0),
           hardInvalid: true,
         },
@@ -2952,6 +2980,7 @@
       targetT,
       imageCircleMm,
       targetImageCircleMm,
+      centerGoodFrac,
       physPenalty: phys.penalty,
       hardInvalid: phys.hardFail,
     });
