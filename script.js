@@ -2808,7 +2808,7 @@
     guardFailPenalty: 900000.0,
     maxSurfaceCount: 32,
   };
-  const AD_BUILD_TAG = "v2-rescue-r3";
+  const AD_BUILD_TAG = "v2-rescue-r4";
 
   const AD_GLASS_CLASSES = {
     CROWN: ["N-BK7HT", "N-BAK4", "N-BAK2", "N-K5", "N-PSK3", "N-SK14"],
@@ -3173,6 +3173,31 @@
     return b.finish();
   }
 
+  function adTemplatePlBase(cfg) {
+    const L = sanitizeLens(clone(omit50ConceptV1()));
+    L.name = "AD Seed • PL Base (OMIT50)";
+    const s = L.surfaces;
+    const stopApTarget = adStopApFromTarget(cfg.targetEfl, cfg.targetT);
+
+    for (let i = 0; i < 5; i++) {
+      adQuickSanity(s, {
+        targetStopAp: stopApTarget,
+        minRearGap: Math.max(AD_CFG.minRearGapMm, AD_CFG.bflMinMm + 0.25),
+        targetEfl: cfg.targetEfl,
+      });
+      adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset || "d");
+      adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset || "d");
+      adNudgeBflForPL(s, cfg);
+      adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset || "d", cfg.quickRayCount || AD_CFG.quickRayCount);
+    }
+    adQuickSanity(s, {
+      targetStopAp: stopApTarget,
+      minRearGap: Math.max(AD_CFG.minRearGapMm, AD_CFG.bflMinMm + 0.25),
+      targetEfl: cfg.targetEfl,
+    });
+    return sanitizeLens(L);
+  }
+
   function adFamilyPool(targetEfl, targetT, bflMinMm = AD_CFG.bflMinMm) {
     const f = Number(targetEfl || 50);
     const t = Number(targetT || 2.0);
@@ -3181,6 +3206,7 @@
     if (retroPressure >= 1.12) {
       if (f <= 50) {
         return [
+          { id: "plbase", w: 8 },
           { id: "distagon", w: 9 },
           { id: "retrofocus", w: 9 },
           { id: "gauss", w: 1 },
@@ -3188,6 +3214,7 @@
         ];
       }
       return [
+        { id: "plbase", w: 6 },
         { id: "distagon", w: 7 },
         { id: "retrofocus", w: 7 },
         { id: "gauss", w: 2 },
@@ -3204,6 +3231,7 @@
     }
     if (f <= 36) {
       return [
+        { id: "plbase", w: 5 },
         { id: "distagon", w: 4 },
         { id: "retrofocus", w: 4 },
         { id: "gauss", w: 3 },
@@ -3213,6 +3241,7 @@
     }
     if (f <= 65) {
       return [
+        { id: "plbase", w: 8 },
         { id: "gauss", w: 6 },
         { id: "biotar", w: 5 },
         { id: "sonnar", w: 3 },
@@ -3230,6 +3259,7 @@
     }
     const speedBias = t <= 2.0 ? 1.0 : 0.7;
     return [
+      { id: "plbase", w: 4 + speedBias },
       { id: "sonnar", w: 4 + speedBias },
       { id: "gauss", w: 4 + speedBias },
       { id: "telephoto", w: 3 + speedBias },
@@ -3238,6 +3268,7 @@
   }
 
   function adBuildTemplateByFamily(family, cfg) {
+    if (family === "plbase") return adTemplatePlBase(cfg);
     if (family === "gauss") return adTemplateGauss(cfg);
     if (family === "biotar") return adTemplateBiotar(cfg);
     if (family === "sonnar") return adTemplateSonnar(cfg);
@@ -3741,6 +3772,8 @@
     const eflErrFrac = (Number.isFinite(efl) && cfg.targetEfl > 0)
       ? Math.abs(efl - cfg.targetEfl) / cfg.targetEfl
       : Infinity;
+    const eflSignOk = Number.isFinite(efl) && efl > 1;
+    const tModelOk = Number.isFinite(T) && T > 0.2 && T < 20;
     const eflOk = Number.isFinite(efl) && eflErrFrac <= eflTol;
     const tOk = Number.isFinite(T) && T <= cfg.targetT * (1 + tSlack);
     const bflOk = Number.isFinite(bfl) && bfl >= cfg.bflMinMm;
@@ -3777,6 +3810,8 @@
     if (!focusOk) reasons.push("FOCUS");
     if (!eflOk) reasons.push("EFL");
     if (!tOk) reasons.push("T");
+    if (!eflSignOk) reasons.push("EFL_SIGN");
+    if (!tModelOk) reasons.push("T_MODEL");
 
     let score = 0;
     if (focusTarget === "both") {
@@ -3800,6 +3835,7 @@
 
     if (Number.isFinite(eflErrFrac)) score += cfg.eflWeight * eflErrFrac * eflErrFrac;
     else score += cfg.eflWeight;
+    if (!eflSignOk) score += cfg.guardFailPenalty * 4;
 
     if (Number.isFinite(T)) {
       if (T > cfg.targetT) score += cfg.tSlowWeight * (T - cfg.targetT) ** 2;
@@ -3807,6 +3843,7 @@
     } else {
       score += cfg.tSlowWeight;
     }
+    if (!tModelOk) score += cfg.guardFailPenalty * 3;
 
     if (Number.isFinite(bfl) && bfl < cfg.bflMinMm) score += cfg.bflWeight * (cfg.bflMinMm - bfl) ** 2;
     if (Number.isFinite(intrusion) && intrusion > 0) score += cfg.bflWeight * intrusion * intrusion;
@@ -4107,6 +4144,28 @@
     };
   }
 
+  function adNearRank(ev, cfg) {
+    let r = Number(ev?.score || 1e12);
+    const efl = Number(ev?.efl);
+    const t = Number(ev?.T);
+    const bfl = Number(ev?.bfl);
+    if (!Number.isFinite(efl) || efl <= 1) r += 600_000_000;
+    if (!Number.isFinite(t) || t <= 0.2 || t > 20) r += 450_000_000;
+    if (!Number.isFinite(bfl) || bfl < Number(cfg?.bflMinMm || AD_CFG.bflMinMm || 52)) {
+      const miss = Number.isFinite(bfl)
+        ? Math.max(0, Number(cfg?.bflMinMm || AD_CFG.bflMinMm || 52) - bfl)
+        : 52;
+      r += 40_000_000 + miss * miss * 900_000;
+    }
+    const reasons = Array.isArray(ev?.reasons) ? ev.reasons : [];
+    if (reasons.includes("FOCUS")) r += 220_000_000;
+    if (reasons.includes("COV") || reasons.includes("IC")) r += 120_000_000;
+    if (reasons.includes("VIG")) r += 80_000_000;
+    if (reasons.includes("EFL")) r += 120_000_000;
+    if (reasons.includes("T")) r += 120_000_000;
+    return r;
+  }
+
   function adBuildRescueSeed(cfg, family = "distagon") {
     let seed = adBuildTemplateByFamily(family, cfg);
     const tmp = sanitizeLens(clone(seed));
@@ -4134,13 +4193,15 @@
       { id: "distagon", w: 1 },
       { id: "retrofocus", w: 1 },
     ];
+    const mandatoryFamilies = ["plbase", "plbase", "distagon", "retrofocus"];
 
     for (let i = 0; i < cfg.seedCount; i++) {
       if (!adRunning) break;
+      const forceFamily = i < mandatoryFamilies.length ? mandatoryFamilies[i] : null;
       const inRescueBand = i >= Math.floor(cfg.seedCount * 0.25);
-      const family = (forceRetro && inRescueBand && valid.length === 0)
+      const family = forceFamily || ((forceRetro && inRescueBand && valid.length === 0)
         ? (pickWeighted(forcedPool) || "distagon")
-        : (pickWeighted(pool) || "gauss");
+        : (pickWeighted(pool) || "gauss"));
       let seed = adBuildTemplateByFamily(family, cfg);
       seed = adConditionSeedLens(seed, cfg);
 
@@ -4188,7 +4249,7 @@
     }
 
     valid.sort((a, b) => a.eval.score - b.eval.score);
-    near.sort((a, b) => a.eval.score - b.eval.score);
+    near.sort((a, b) => adNearRank(a.eval, cfg) - adNearRank(b.eval, cfg));
 
     if (!valid.length && near.length) {
       const take = Math.min(Math.max(1, cfg.minValidSeeds), near.length);
