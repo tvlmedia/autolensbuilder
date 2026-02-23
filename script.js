@@ -1506,7 +1506,12 @@ return {
   function estimateSoftImageCircleStandalone(surfaces, sensorW, sensorH, wavePreset, rayCount) {
     const cfg = SOFT_IC_CFG;
     const sensorX = 0.0;
-const maxR = Math.max(10, Number(cfg.maxRadiusMm || 80));
+// Probe radius: meet buiten sensor (lens-dependent) met overscan.
+// maxRadiusMm blijft hard-cap fallback / safety.
+const OV = 1.6; // zelfde orde als je render-engine overscan
+const diag = Math.hypot(sensorW, sensorH);
+const probeR = 0.5 * diag * OV; // radius waar je tot wilt kunnen meten
+const maxR = Math.max(10, Math.min(probeR, Number(cfg.maxRadiusMm || 80)));
      const work = clone(surfaces);
 
     const af = bestLensShiftForDesign(work, 0, rayCount, wavePreset);
@@ -1593,7 +1598,7 @@ fieldSamples.push({
   mountFrac: pack.mountFrac,
 });
 
-     if (Number.isFinite(rMm) && rMm > maxR) break;
+    if (Number.isFinite(rMm) && rMm > (maxR + 0.25)) break;
     }
 
     const ordered = fieldSamples
@@ -1717,12 +1722,13 @@ const softICmm = uc.valid ? clamp(Number(uc.diameterMm || 0), 0, 2 * maxR) : 0;
       sensorW: Number(sensorW).toFixed(3),
       sensorH: Number(sensorH).toFixed(3),
       softCfg: {
-        thresholdRel: Number(SOFT_IC_CFG.thresholdRel).toFixed(4),
-        localBandMm: Number(SOFT_IC_CFG.localBandMm).toFixed(3),
-        thetaStepDeg: Number(SOFT_IC_CFG.thetaStepDeg).toFixed(4),
-        maxFieldDeg: Number(SOFT_IC_CFG.maxFieldDeg).toFixed(3),
-        smoothingHalfWindow: Number(SOFT_IC_CFG.smoothingHalfWindow).toFixed(0),
-      },
+  thresholdRel: Number(SOFT_IC_CFG.thresholdRel).toFixed(4),
+  localBandMm: Number(SOFT_IC_CFG.localBandMm).toFixed(3),
+  thetaStepDeg: Number(SOFT_IC_CFG.thetaStepDeg).toFixed(4),
+  maxFieldDeg: Number(SOFT_IC_CFG.maxFieldDeg).toFixed(3),
+  maxRadiusMm: Number(SOFT_IC_CFG.maxRadiusMm).toFixed(3),
+  smoothingHalfWindow: Number(SOFT_IC_CFG.smoothingHalfWindow).toFixed(0),
+},
       surfaces: (surfaces || []).map((s) => ({
         type: String(s.type || ""),
         R: Number(s.R || 0).toFixed(6),
