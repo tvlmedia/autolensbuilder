@@ -1258,20 +1258,21 @@
 
   const SOFT_IC_CFG = {
     raysPerBundle: 41,
-    relMin: 0.22,
-    mountMaxFrac: 0.015,
+    thresholdRel: 0.35, // usable circle @ 35% of center illumination
     thetaStepDeg: 0.5,
     maxFieldDeg: 60,
     diagMarginMm: 0.75,
-    zeroRelThreshold: 0.02,
-    zeroRelStopRun: 3,
+    maxConsecutiveMapFails: 8,
+    minSamplesForBreak: 10,
+    minSamplesForCurve: 8,
+    smoothingHalfWindow: 3,
     drasticSlopePerMm: 0.10,
     eps: 1e-6,
   };
 
   function softIcLabel(cfg = SOFT_IC_CFG) {
-    const pct = Math.round(Number(cfg?.relMin ?? 0) * 100);
-    return `SoftIC${pct}`;
+    const pct = Math.round(Number(cfg?.thresholdRel ?? 0) * 100);
+    return `IC${pct}%`;
   }
 
   let _softIcCacheKey = "";
@@ -1330,6 +1331,142 @@
     };
   }
 
+  function computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg = SOFT_IC_CFG) {
+    const minN = Math.max(3, Number(cfg.minSamplesForCurve || 8) | 0);
+    const n = Math.min(radialMm?.length || 0, gainCurve?.length || 0);
+    if (n < minN) {
+      return {
+        valid: false,
+        radiusMm: 0,
+        diameterMm: 0,
+        thresholdRel: Number(cfg.thresholdRel || 0.35),
+        relAtCutoff: 0,
+        radialMm: [],
+        relCurve: [],
+        smoothedCurve: [],
+      };
+    }
+
+    const pairs = [];
+    for (let i = 0; i < n; i++) {
+      const ri = Number(radialMm[i]);
+      const gi = Number(gainCurve[i]);
+      if (!Number.isFinite(ri) || !Number.isFinite(gi) || ri < 0) continue;
+      pairs.push({ r: ri, g: Math.max(0, gi) });
+    }
+    if (pairs.length < minN) {
+      return {
+        valid: false,
+        radiusMm: 0,
+        diameterMm: 0,
+        thresholdRel: Number(cfg.thresholdRel || 0.35),
+        relAtCutoff: 0,
+        radialMm: [],
+        relCurve: [],
+        smoothedCurve: [],
+      };
+    }
+
+    pairs.sort((a, b) => a.r - b.r);
+    const r = [];
+    const g = [];
+    for (const p of pairs) {
+      if (r.length && p.r <= r[r.length - 1] + 1e-6) {
+        // Conservative merge for near-duplicate radius samples.
+        g[g.length - 1] = Math.min(g[g.length - 1], p.g);
+        continue;
+      }
+      r.push(p.r);
+      g.push(p.g);
+    }
+    if (r.length < minN) {
+      return {
+        valid: false,
+        radiusMm: 0,
+        diameterMm: 0,
+        thresholdRel: Number(cfg.thresholdRel || 0.35),
+        relAtCutoff: 0,
+        radialMm: [],
+        relCurve: [],
+        smoothedCurve: [],
+      };
+    }
+
+    const m = r.length;
+    const halfWin = Math.max(0, Number(cfg.smoothingHalfWindow || 3) | 0);
+    const smoothed = new Float64Array(m);
+    for (let i = 0; i < m; i++) {
+      let sum = 0;
+      let cnt = 0;
+      for (let k = -halfWin; k <= halfWin; k++) {
+        const j = i + k;
+        if (j < 0 || j >= m) continue;
+        sum += g[j];
+        cnt++;
+      }
+      smoothed[i] = cnt ? (sum / cnt) : g[i];
+    }
+
+    const refN = Math.max(6, Math.min(m, Math.floor(m * 0.06)));
+    let ref = 0;
+    for (let i = 0; i < refN; i++) ref += smoothed[i];
+    ref /= Math.max(1, refN);
+    if (!(ref > Number(cfg.eps || 1e-6))) {
+      return {
+        valid: false,
+        radiusMm: 0,
+        diameterMm: 0,
+        thresholdRel: Number(cfg.thresholdRel || 0.35),
+        relAtCutoff: 0,
+        radialMm: r,
+        relCurve: Array.from({ length: m }, () => 0),
+        smoothedCurve: Array.from(smoothed),
+      };
+    }
+
+    const rel = new Float64Array(m);
+    rel[0] = smoothed[0] / ref;
+    for (let i = 1; i < m; i++) {
+      const v = smoothed[i] / ref;
+      // Match render-engine behavior: force monotone non-increasing falloff.
+      rel[i] = Math.min(v, rel[i - 1]);
+    }
+
+    const thr = clamp(Number(cfg.thresholdRel || 0.35), Number(cfg.eps || 1e-6), 1);
+    let cutR = r[m - 1];
+    let relAtCut = rel[m - 1];
+
+    if (rel[0] <= thr) {
+      cutR = 0;
+      relAtCut = rel[0];
+    } else {
+      for (let i = 1; i < m; i++) {
+        if (rel[i] > thr) continue;
+        const g0 = rel[i - 1];
+        const g1 = rel[i];
+        const r0 = r[i - 1];
+        const r1 = r[i];
+        const denom = (g1 - g0);
+        const t = Math.abs(denom) > 1e-9 ? clamp((thr - g0) / denom, 0, 1) : 0;
+        cutR = r0 + (r1 - r0) * t;
+        relAtCut = g0 + (g1 - g0) * t;
+        break;
+      }
+    }
+
+    const valid = cutR > 0.1;
+    return {
+      valid,
+      radiusMm: valid ? cutR : 0,
+      diameterMm: valid ? (cutR * 2) : 0,
+      thresholdRel: thr,
+      relAtCutoff: valid ? relAtCut : 0,
+      radialMm: r,
+      relCurve: Array.from(rel),
+      smoothedCurve: Array.from(smoothed),
+    };
+  }
+
   function estimateSoftImageCircleStandalone(surfaces, sensorW, sensorH, wavePreset, rayCount) {
     const cfg = SOFT_IC_CFG;
     const sensorX = 0.0;
@@ -1341,7 +1478,11 @@
       return {
         softICmm: 0,
         rEdge: 0,
-        relMin: cfg.relMin,
+        relMin: Number(cfg.thresholdRel || 0.35),
+        thresholdRel: Number(cfg.thresholdRel || 0.35),
+        usableCircleDiameterMm: 0,
+        usableCircleRadiusMm: 0,
+        relAtCutoff: 0,
         centerGoodFrac: 0,
         samples: [],
         focusLensShift: 0,
@@ -1359,7 +1500,11 @@
       return {
         softICmm: 0,
         rEdge: 0,
-        relMin: cfg.relMin,
+        relMin: Number(cfg.thresholdRel || 0.35),
+        thresholdRel: Number(cfg.thresholdRel || 0.35),
+        usableCircleDiameterMm: 0,
+        usableCircleRadiusMm: 0,
+        relAtCutoff: 0,
         centerGoodFrac,
         samples: [],
         focusLensShift: lensShift,
@@ -1368,53 +1513,116 @@
       };
     }
 
-    const samples = [];
-    let zeroRelRun = 0;
+    const fieldSamples = [];
+    let mapFailRun = 0;
     let beyondDiagRun = 0;
 
     const stepDeg = Math.max(0.1, Number(cfg.thetaStepDeg || 0.5));
     const maxFieldDeg = Math.max(stepDeg, Number(cfg.maxFieldDeg || 60));
+    const minSamplesForBreak = Math.max(3, Number(cfg.minSamplesForBreak || 10) | 0);
+    const maxConsecutiveMapFails = Math.max(2, Number(cfg.maxConsecutiveMapFails || 8) | 0);
 
     for (let thetaDeg = 0; thetaDeg <= maxFieldDeg + 1e-9; thetaDeg += stepDeg) {
       const pack = thetaDeg <= 1e-9
         ? centerPack
         : traceBundleAtFieldForSoftIc(work, thetaDeg, wavePreset, sensorX, cfg.raysPerBundle);
       if (!pack.valid) continue;
-      const relIllum = clamp(pack.goodFrac / centerGoodFrac, 0, 1);
-      const stopsDown = relIllum > cfg.eps ? -Math.log2(relIllum) : Infinity;
       const rMm = Number.isFinite(pack.rMm) ? pack.rMm : null;
-      const pass = (Number.isFinite(rMm) && relIllum >= cfg.relMin && pack.mountFrac <= cfg.mountMaxFrac);
+      if (!Number.isFinite(rMm)) {
+        mapFailRun++;
+        if (fieldSamples.length >= minSamplesForBreak && mapFailRun >= maxConsecutiveMapFails) break;
+        continue;
+      }
+      mapFailRun = 0;
 
-      const s = { rMm, thetaDeg, goodFrac: pack.goodFrac, relIllum, stopsDown, mountFrac: pack.mountFrac, pass };
-      samples.push(s);
+      const goodFrac = clamp(pack.goodFrac, 0, 1);
+      fieldSamples.push({
+        rMm,
+        thetaDeg,
+        goodFrac,
+        rawRel: clamp(goodFrac / centerGoodFrac, 0, 1),
+        mountFrac: pack.mountFrac,
+      });
 
       if (Number.isFinite(rMm) && rMm > halfDiag + Math.max(0.1, Number(cfg.diagMarginMm || 0))) {
         beyondDiagRun++;
       } else {
         beyondDiagRun = 0;
       }
-
-      if (relIllum <= Math.max(cfg.eps, Number(cfg.zeroRelThreshold || 0))) {
-        zeroRelRun++;
-      } else {
-        zeroRelRun = 0;
-      }
-
-      if (beyondDiagRun >= 2) break;
-      if (zeroRelRun >= Math.max(2, Number(cfg.zeroRelStopRun || 3))) {
-        const rNow = Number.isFinite(rMm) ? rMm : 0;
-        if (rNow >= halfDiag * 0.4) break;
-      }
+      if (fieldSamples.length >= minSamplesForBreak && beyondDiagRun >= 2) break;
     }
 
-    const ordered = samples
+    const ordered = fieldSamples
       .filter((s) => Number.isFinite(s.rMm))
       .sort((a, b) => a.rMm - b.rMm);
+    if (!ordered.length) {
+      return {
+        softICmm: 0,
+        rEdge: 0,
+        relMin: Number(cfg.thresholdRel || 0.35),
+        thresholdRel: Number(cfg.thresholdRel || 0.35),
+        usableCircleDiameterMm: 0,
+        usableCircleRadiusMm: 0,
+        relAtCutoff: 0,
+        centerGoodFrac,
+        samples: [],
+        focusLensShift: lensShift,
+        focusFailed: false,
+        drasticDropRadiusMm: null,
+      };
+    }
+
+    const merged = [];
+    for (const s of ordered) {
+      const prev = merged[merged.length - 1];
+      if (prev && s.rMm <= prev.rMm + 1e-6) {
+        prev.goodFrac = Math.min(prev.goodFrac, s.goodFrac);
+        prev.rawRel = Math.min(prev.rawRel, s.rawRel);
+        prev.mountFrac = Math.max(prev.mountFrac, s.mountFrac);
+        prev.thetaDeg = Math.max(prev.thetaDeg, s.thetaDeg);
+        continue;
+      }
+      merged.push({ ...s });
+    }
+
+    if (!merged.length || merged[0].rMm > 1e-6) {
+      merged.unshift({
+        rMm: 0,
+        thetaDeg: 0,
+        goodFrac: centerGoodFrac,
+        rawRel: 1,
+        mountFrac: centerPack.mountFrac,
+      });
+    } else {
+      merged[0].rMm = 0;
+      merged[0].goodFrac = Math.max(merged[0].goodFrac, centerGoodFrac);
+      merged[0].rawRel = 1;
+    }
+
+    const radialMm = merged.map((s) => s.rMm);
+    const gainCurve = merged.map((s) => s.goodFrac);
+    const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg);
+
+    const relCurve = (uc.relCurve?.length === merged.length) ? uc.relCurve : merged.map((s) => s.rawRel);
+    const thr = Number(uc.thresholdRel || cfg.thresholdRel || 0.35);
+    const samples = merged.map((s, i) => {
+      const relIllum = clamp(Number(relCurve[i] ?? s.rawRel), 0, 1);
+      return {
+        rMm: s.rMm,
+        thetaDeg: s.thetaDeg,
+        goodFrac: s.goodFrac,
+        relRaw: s.rawRel,
+        relIllum,
+        stopsDown: relIllum > cfg.eps ? -Math.log2(relIllum) : Infinity,
+        mountFrac: s.mountFrac,
+        pass: relIllum >= thr,
+      };
+    });
 
     let drasticDropRadiusMm = null;
-    for (let i = 1; i < ordered.length; i++) {
-      const a = ordered[i - 1];
-      const b = ordered[i];
+    for (let i = 1; i < samples.length; i++) {
+      const a = samples[i - 1];
+      const b = samples[i];
       const dr = b.rMm - a.rMm;
       if (dr <= 1e-9) continue;
       const slope = (a.relIllum - b.relIllum) / dr;
@@ -1424,34 +1632,18 @@
       }
     }
 
-    let lastPass = null;
-    let firstFail = null;
-    for (const s of ordered) {
-      const pass = (s.relIllum >= cfg.relMin) && (s.mountFrac <= cfg.mountMaxFrac);
-      if (pass) {
-        lastPass = s;
-        continue;
-      }
-      if (lastPass) {
-        firstFail = s;
-        break;
-      }
-    }
-
-    let rEdge = lastPass ? lastPass.rMm : 0;
-    if (lastPass && firstFail) {
-      const dRel = firstFail.relIllum - lastPass.relIllum;
-      if (firstFail.relIllum < cfg.relMin && Math.abs(dRel) > 1e-9) {
-        const t = clamp((cfg.relMin - lastPass.relIllum) / dRel, 0, 1);
-        rEdge = lastPass.rMm + (firstFail.rMm - lastPass.rMm) * t;
-      }
-    }
+    let rEdge = uc.valid ? Number(uc.radiusMm || 0) : 0;
     rEdge = clamp(rEdge, 0, halfDiag);
+    const softICmm = uc.valid ? clamp(Number(uc.diameterMm || 0), 0, 2 * halfDiag) : 0;
 
     return {
-      softICmm: 2 * rEdge,
+      softICmm,
       rEdge,
-      relMin: cfg.relMin,
+      relMin: thr, // alias for backward compatibility
+      thresholdRel: thr,
+      usableCircleDiameterMm: softICmm,
+      usableCircleRadiusMm: rEdge,
+      relAtCutoff: Number(uc.relAtCutoff || 0),
       centerGoodFrac,
       samples,
       focusLensShift: lensShift,
@@ -1467,10 +1659,10 @@
       sensorW: Number(sensorW).toFixed(3),
       sensorH: Number(sensorH).toFixed(3),
       softCfg: {
-        relMin: Number(SOFT_IC_CFG.relMin).toFixed(4),
-        mountMaxFrac: Number(SOFT_IC_CFG.mountMaxFrac).toFixed(4),
+        thresholdRel: Number(SOFT_IC_CFG.thresholdRel).toFixed(4),
         thetaStepDeg: Number(SOFT_IC_CFG.thetaStepDeg).toFixed(4),
         maxFieldDeg: Number(SOFT_IC_CFG.maxFieldDeg).toFixed(3),
+        smoothingHalfWindow: Number(SOFT_IC_CFG.smoothingHalfWindow).toFixed(0),
       },
       surfaces: (surfaces || []).map((s) => ({
         type: String(s.type || ""),
