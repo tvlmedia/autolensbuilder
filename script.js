@@ -1331,9 +1331,9 @@
     };
   }
 
-  function computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg = SOFT_IC_CFG) {
+  function computeUsableCircleFromRadialCurve(radialMm, relCurveIn, cfg = SOFT_IC_CFG) {
     const minN = Math.max(3, Number(cfg.minSamplesForCurve || 8) | 0);
-    const n = Math.min(radialMm?.length || 0, gainCurve?.length || 0);
+    const n = Math.min(radialMm?.length || 0, relCurveIn?.length || 0);
     if (n < minN) {
       return {
         valid: false,
@@ -1350,9 +1350,9 @@
     const pairs = [];
     for (let i = 0; i < n; i++) {
       const ri = Number(radialMm[i]);
-      const gi = Number(gainCurve[i]);
-      if (!Number.isFinite(ri) || !Number.isFinite(gi) || ri < 0) continue;
-      pairs.push({ r: ri, g: Math.max(0, gi) });
+      const reli = Number(relCurveIn[i]);
+      if (!Number.isFinite(ri) || !Number.isFinite(reli) || ri < 0) continue;
+      pairs.push({ r: ri, rel: clamp(reli, 0, 1) });
     }
     if (pairs.length < minN) {
       return {
@@ -1369,15 +1369,15 @@
 
     pairs.sort((a, b) => a.r - b.r);
     const r = [];
-    const g = [];
+    const relSrc = [];
     for (const p of pairs) {
       if (r.length && p.r <= r[r.length - 1] + 1e-6) {
         // Conservative merge for near-duplicate radius samples.
-        g[g.length - 1] = Math.min(g[g.length - 1], p.g);
+        relSrc[relSrc.length - 1] = Math.min(relSrc[relSrc.length - 1], p.rel);
         continue;
       }
       r.push(p.r);
-      g.push(p.g);
+      relSrc.push(p.rel);
     }
     if (r.length < minN) {
       return {
@@ -1401,33 +1401,16 @@
       for (let k = -halfWin; k <= halfWin; k++) {
         const j = i + k;
         if (j < 0 || j >= m) continue;
-        sum += g[j];
+        sum += relSrc[j];
         cnt++;
       }
-      smoothed[i] = cnt ? (sum / cnt) : g[i];
-    }
-
-    const refN = Math.max(6, Math.min(m, Math.floor(m * 0.06)));
-    let ref = 0;
-    for (let i = 0; i < refN; i++) ref += smoothed[i];
-    ref /= Math.max(1, refN);
-    if (!(ref > Number(cfg.eps || 1e-6))) {
-      return {
-        valid: false,
-        radiusMm: 0,
-        diameterMm: 0,
-        thresholdRel: Number(cfg.thresholdRel || 0.35),
-        relAtCutoff: 0,
-        radialMm: r,
-        relCurve: Array.from({ length: m }, () => 0),
-        smoothedCurve: Array.from(smoothed),
-      };
+      smoothed[i] = clamp(cnt ? (sum / cnt) : relSrc[i], 0, 1);
     }
 
     const rel = new Float64Array(m);
-    rel[0] = smoothed[0] / ref;
+    rel[0] = smoothed[0];
     for (let i = 1; i < m; i++) {
-      const v = smoothed[i] / ref;
+      const v = smoothed[i];
       // Match render-engine behavior: force monotone non-increasing falloff.
       rel[i] = Math.min(v, rel[i - 1]);
     }
@@ -1600,10 +1583,10 @@
     }
 
     const radialMm = merged.map((s) => s.rMm);
-    const gainCurve = merged.map((s) => s.goodFrac);
-    const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg);
+    const relCurveRaw = merged.map((s) => clamp(s.rawRel, 0, 1));
+    const uc = computeUsableCircleFromRadialCurve(radialMm, relCurveRaw, cfg);
 
-    const relCurve = (uc.relCurve?.length === merged.length) ? uc.relCurve : merged.map((s) => s.rawRel);
+    const relCurve = (uc.relCurve?.length === merged.length) ? uc.relCurve : relCurveRaw;
     const thr = Number(uc.thresholdRel || cfg.thresholdRel || 0.35);
     const samples = merged.map((s, i) => {
       const relIllum = clamp(Number(relCurve[i] ?? s.rawRel), 0, 1);
