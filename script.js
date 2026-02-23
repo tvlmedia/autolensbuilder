@@ -1258,8 +1258,9 @@
 
   const SOFT_IC_CFG = {
     thresholdRel: 0.35, // usable circle @ 35% of center illumination
-    bgLutSamples: 220,   // IC-only LUT samples across sensor diagonal
-    bgPupilSqrt: 10,     // sqrt(samples) over stop disk
+    bgOverscan: 1.6,     // match Render Engine OV mapping
+    bgLutSamples: 900,   // match Render Engine LUT density
+    bgPupilSqrt: 14,     // match Render Engine "normal" pupil sampling
     bgObjDistMm: 2000,   // object plane distance for reverse ray hit test
     bgStartEpsMm: 0.05,  // avoid exact sensor plane degeneracy
     minSamplesForCurve: 8,
@@ -1422,6 +1423,7 @@
     const cfg = SOFT_IC_CFG;
     const sensorX = 0.0;
     const halfDiag = 0.5 * Math.hypot(sensorW, sensorH);
+    const ov = Math.max(1.0, Number(cfg.bgOverscan || 1.6));
     const work = clone(surfaces);
 
     const af = bestLensShiftForDesign(work, 0, Math.max(21, rayCount | 0), wavePreset);
@@ -1464,18 +1466,21 @@
       };
     }
 
-    const lutN = Math.max(96, Math.min(900, Number(cfg.bgLutSamples || 220) | 0));
-    const pupilSqrt = Math.max(4, Math.min(24, Number(cfg.bgPupilSqrt || 10) | 0));
+    const lutN = Math.max(96, Math.min(1200, Number(cfg.bgLutSamples || 900) | 0));
+    const pupilSqrt = Math.max(4, Math.min(28, Number(cfg.bgPupilSqrt || 14) | 0));
     const startX = sensorX + Number(cfg.bgStartEpsMm || 0.05);
     const xObjPlane = (work[0]?.vx ?? 0) - Math.max(100, Number(cfg.bgObjDistMm || 2000));
+    const sensorWv = Number(sensorW) * ov;
+    const sensorHv = Number(sensorH) * ov;
+    const rMaxSensor = Math.hypot(sensorWv * 0.5, sensorHv * 0.5);
 
     const radialMm = new Float64Array(lutN);
     const gainCurve = new Float64Array(lutN);
 
     for (let k = 0; k < lutN; k++) {
       const a = lutN > 1 ? (k / (lutN - 1)) : 0;
-      const rS = a * halfDiag;
-      radialMm[k] = rS;
+      const rS = a * rMaxSensor;
+      radialMm[k] = rS / ov;
 
       const pS = { x: startX, y: rS, z: 0 };
       const natural = naturalCos4AtSensorRadius(work, sensorX, rS);
@@ -1930,6 +1935,7 @@
       sensorH: Number(sensorH).toFixed(3),
       softCfg: {
         thresholdRel: Number(SOFT_IC_CFG.thresholdRel).toFixed(4),
+        bgOverscan: Number(SOFT_IC_CFG.bgOverscan).toFixed(3),
         bgLutSamples: Number(SOFT_IC_CFG.bgLutSamples).toFixed(0),
         bgPupilSqrt: Number(SOFT_IC_CFG.bgPupilSqrt).toFixed(0),
         bgObjDistMm: Number(SOFT_IC_CFG.bgObjDistMm).toFixed(2),
