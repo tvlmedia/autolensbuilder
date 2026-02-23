@@ -1507,7 +1507,13 @@
 
    // --- center reference: use throughput, not "local band" ---
 const centerPack = traceBundleAtFieldForSoftIc(work, 0, wavePreset, sensorX, cfg.raysPerBundle);
+
+// we houden centerLocalFrac nog even voor debug/compat (mag later weg)
+const centerLocalFrac = Math.max(cfg.eps, Number(centerPack.localFrac || 0));
+
+// maar: center reference voor IC moet throughput zijn, niet “local band”
 const centerGoodFrac = Math.max(cfg.eps, Number(centerPack.goodFrac || 0));
+
 if (centerGoodFrac <= cfg.eps * 1.01) {
   return {
     softICmm: 0,
@@ -1518,6 +1524,7 @@ if (centerGoodFrac <= cfg.eps * 1.01) {
     usableCircleRadiusMm: 0,
     relAtCutoff: 0,
     centerGoodFrac,
+    centerLocalFrac,
     samples: [],
     focusLensShift: lensShift,
     focusFailed: false,
@@ -1525,7 +1532,7 @@ if (centerGoodFrac <= cfg.eps * 1.01) {
   };
 }
 
-// helper
+// cos^4 falloff helper (brightness proxy)
 const cos4 = (deg) => {
   const th = (deg * Math.PI) / 180;
   const c = Math.max(0, Math.cos(th));
@@ -1536,19 +1543,21 @@ const cos4 = (deg) => {
 
 // inside for-loop where you push fieldSamples:
 const goodFrac = clamp(pack.goodFrac, 0, 1);
-const g = goodFrac * cos4(thetaDeg); // <-- KEY CHANGE
+const localFrac = clamp(Number(pack.localFrac || 0), 0, 1);
+
+// brightness/throughput proxy:
+const gain = clamp(goodFrac * cos4(thetaDeg), 0, 1);
+const gain0 = clamp(centerGoodFrac * cos4(0), cfg.eps, 1);
 
 fieldSamples.push({
   rMm,
   thetaDeg,
   goodFrac,
-  localFrac: clamp(Number(pack.localFrac || 0), 0, 1), // keep for debugging if you want
-  rawRel: clamp(g / (centerGoodFrac * cos4(0)), 0, 1),
-  gain: g,
+  localFrac,                 // houden voor debug
+  gain,                      // <-- nieuw
+  rawRel: clamp(gain / gain0, 0, 1),
   mountFrac: pack.mountFrac,
 });
-
-...
 
 // when building curve inputs:
 const radialMm  = merged.map((s) => s.rMm);
