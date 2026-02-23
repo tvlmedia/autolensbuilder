@@ -1228,8 +1228,8 @@
   }
 
   const IMG_CIRCLE_CFG = {
-    subtleVignetteFrac: 0.08, // allow a little edge shading, reject obvious hard circular cutoff
-    minValidFrac: 0.90,       // keep most rays alive at the claimed edge
+    subtleVignetteFrac: 0.12, // allow a little edge shading, reject obvious hard circular cutoff
+    minValidFrac: 0.80,       // keep most rays alive at the claimed edge
     maxFieldDeg: 60,
     coarseStepDeg: 1.5,
     refineIters: 10,
@@ -1256,14 +1256,11 @@
     if (pack.vigFrac > maxVig) return null;
     if (validFrac < minValid) return null;
 
-    const chief = buildChiefRay(surfaces, fieldDeg);
-    const chiefTr = traceRayForward(clone(chief), surfaces, wavePreset);
-    if (!chiefTr || chiefTr.vignetted || chiefTr.tir || !chiefTr.endRay) return null;
-    const y = rayHitYAtX(chiefTr.endRay, sensorX);
-    if (!Number.isFinite(y)) return null;
+    const halfByEnvelope = Number(pack.maxAbsY);
+    if (!Number.isFinite(halfByEnvelope)) return null;
 
     return {
-      halfSizeMm: Math.abs(y),
+      halfSizeMm: Math.abs(halfByEnvelope),
       vigFrac: pack.vigFrac,
       validFrac,
       fieldDeg,
@@ -1277,7 +1274,23 @@
     let loField = 0;
     let hiField = step;
     let best = imageCircleEdgeSample(surfaces, 0, rayCount, wavePreset, sensorX, opts);
-    if (!best) return null;
+    if (!best) {
+      // relaxed fallback to avoid false "no image circle" when strict thresholds reject too early
+      best = imageCircleEdgeSample(surfaces, 0, rayCount, wavePreset, sensorX, {
+        ...opts,
+        subtleVignetteFrac: 0.60,
+        minValidFrac: 0.20,
+      });
+    }
+    if (!best) {
+      return {
+        diameterMm: 0,
+        halfSizeMm: 0,
+        edgeFieldDeg: 0,
+        vigFrac: 1,
+        validFrac: 0,
+      };
+    }
 
     for (let f = step; f <= hiMax + 1e-9; f += step) {
       const sample = imageCircleEdgeSample(surfaces, f, rayCount, wavePreset, sensorX, opts);
