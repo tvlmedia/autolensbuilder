@@ -1670,7 +1670,7 @@
     wavePreset,
     sensorX,
     rayCount,
-    fov, maxField, covers, req,
+    fov, maxField, maxFieldGeom, covers, req,
     intrusion,
     efl, T, bfl,
     physPenalty = 0,
@@ -1726,6 +1726,15 @@
       ? imageCircleDiagFromHalfFieldMm(efl, maxField)
       : null;
     const imageCircleDiag = Number.isFinite(imageCircleDiagMeasured) ? imageCircleDiagMeasured : imageCircleDiagFallback;
+    const imageCircleDiagGeomMeasured = canEvalImageCircle && Number.isFinite(maxFieldGeom)
+      ? imageCircleDiagFromChiefAtField(surfaces, wavePreset, sensorX, maxFieldGeom)
+      : null;
+    const imageCircleDiagGeomFallback = canEvalImageCircle && Number.isFinite(maxFieldGeom)
+      ? imageCircleDiagFromHalfFieldMm(efl, maxFieldGeom)
+      : null;
+    const imageCircleDiagGeom = Number.isFinite(imageCircleDiagGeomMeasured)
+      ? imageCircleDiagGeomMeasured
+      : imageCircleDiagGeomFallback;
     const imageCircleTarget = imageCircleDiagFromHalfFieldMm(efl, req);
     const imageCircleShortfall = (Number.isFinite(imageCircleDiag) && Number.isFinite(imageCircleTarget))
       ? Math.max(0, imageCircleTarget - imageCircleDiag)
@@ -1789,6 +1798,7 @@
       vigCenterPct: Math.round(vigCenter * 100),
       vigMidPct: Math.round(vigMid * 100),
       imageCircleDiag: Number.isFinite(imageCircleDiag) ? imageCircleDiag : null,
+      imageCircleDiagGeom: Number.isFinite(imageCircleDiagGeom) ? imageCircleDiagGeom : null,
       imageCircleTarget: Number.isFinite(imageCircleTarget) ? imageCircleTarget : null,
       imageCircleOk,
       reqVigPct: Number.isFinite(reqVigFrac) ? Math.round(reqVigFrac * 100) : null,
@@ -2318,7 +2328,7 @@
       wavePreset,
       sensorX,
       rayCount,
-      fov, maxField, covers, req,
+      fov, maxField, maxFieldGeom, covers, req,
       intrusion,
       efl, T, bfl,
       physPenalty: phys.penalty,
@@ -2329,10 +2339,20 @@
     const bd = meritRes.breakdown;
     const coversStrict = !!bd.coversStrict;
     const icDiagTxt = Number.isFinite(bd.imageCircleDiag) ? `${bd.imageCircleDiag.toFixed(1)}mm` : "—";
+    const icGeomTxt = Number.isFinite(bd.imageCircleDiagGeom) ? `${bd.imageCircleDiagGeom.toFixed(1)}mm` : "—";
     const icTargetTxt = Number.isFinite(bd.imageCircleTarget) ? `${bd.imageCircleTarget.toFixed(1)}mm` : "—";
+    const icSplit = Number.isFinite(bd.imageCircleDiag) && Number.isFinite(bd.imageCircleDiagGeom)
+      ? Math.abs(bd.imageCircleDiagGeom - bd.imageCircleDiag) >= 0.35
+      : false;
+    const icCompactTxt = icSplit
+      ? `${icDiagTxt} illum / ${icGeomTxt} geom`
+      : icDiagTxt;
+    const icFullTxt = icSplit
+      ? `${icDiagTxt} illum / ${icGeomTxt} geom / ${icTargetTxt}`
+      : `${icDiagTxt} / ${icTargetTxt}`;
     covTxt = !fov
       ? "COV(D): —"
-      : `COV(D): ±${maxField.toFixed(1)}° (geom ${maxFieldGeom.toFixed(1)}° • illum ${maxFieldBundle.toFixed(1)}°) • REQ(D): ${(req ?? 0).toFixed(1)}° • IC ${icDiagTxt}/${icTargetTxt} • ${coversStrict ? "COVERS ✅" : "NO ❌"}`;
+      : `COV(D): ±${maxField.toFixed(1)}° (geom ${maxFieldGeom.toFixed(1)}° • illum ${maxFieldBundle.toFixed(1)}°) • REQ(D): ${(req ?? 0).toFixed(1)}° • IC ${icCompactTxt} / ${icTargetTxt} • ${coversStrict ? "COVERS ✅" : "NO ❌"}`;
 
     const meritTxt =
       `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} ` +
@@ -2365,15 +2385,15 @@
     if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
     if (ui.dist) ui.dist.textContent = `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
     if (ui.fov) ui.fov.textContent = fovTxt;
-    if (ui.cov) ui.cov.textContent = coversStrict ? "COV: YES" : `COV: NO (IC ${icDiagTxt})`;
-    if (ui.ic) ui.ic.textContent = `IC: ${icDiagTxt} / ${icTargetTxt}`;
+    if (ui.cov) ui.cov.textContent = coversStrict ? "COV: YES" : `COV: NO (IC ${icCompactTxt})`;
+    if (ui.ic) ui.ic.textContent = `IC: ${icFullTxt}`;
 
     if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
     if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.covTop) ui.covTop.textContent = ui.cov?.textContent || (coversStrict ? "COV: YES" : "COV: NO");
-    if (ui.icTop) ui.icTop.textContent = ui.ic?.textContent || `IC: ${icDiagTxt} / ${icTargetTxt}`;
+    if (ui.icTop) ui.icTop.textContent = ui.ic?.textContent || `IC: ${icFullTxt}`;
     if (ui.distTop) ui.distTop.textContent = ui.dist?.textContent || `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
 
     if (phys.hardFail && ui.footerWarn) {
@@ -2390,7 +2410,7 @@
         `Center vignette too high (${bd.vigCenterPct ?? "—"}%). Increase middle/stop apertures.`;
     } else if (!bd.imageCircleOk && ui.footerWarn) {
       ui.footerWarn.textContent =
-        `Image circle too small: ${icDiagTxt}. Required: ${icTargetTxt} (target >= ${IMAGE_CIRCLE_CFG.minDiagMm.toFixed(0)}mm for full frame).`;
+        `Image circle too small (illum): ${icDiagTxt}${icSplit ? ` (geom ${icGeomTxt})` : ""}. Required: ${icTargetTxt} (target >= ${IMAGE_CIRCLE_CFG.minDiagMm.toFixed(0)}mm for full frame).`;
     } else if (phys.airGapCount < PHYS_CFG.minAirGapsPreferred && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Few air gaps (${phys.airGapCount}); aim for >= ${PHYS_CFG.minAirGapsPreferred} for practical designs.`;
@@ -2814,7 +2834,7 @@
     guardFailPenalty: 900000.0,
     maxSurfaceCount: 32,
   };
-  const AD_BUILD_TAG = "v2-rescue-r9";
+  const AD_BUILD_TAG = "v2-rescue-r11";
 
   const AD_GLASS_CLASSES = {
     CROWN: ["N-BK7HT", "N-BAK4", "N-BAK2", "N-K5", "N-PSK3", "N-SK14"],
