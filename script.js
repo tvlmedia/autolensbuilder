@@ -2808,7 +2808,7 @@
     guardFailPenalty: 900000.0,
     maxSurfaceCount: 32,
   };
-  const AD_BUILD_TAG = "v2-rescue-r4";
+  const AD_BUILD_TAG = "v2-rescue-r6";
 
   const AD_GLASS_CLASSES = {
     CROWN: ["N-BK7HT", "N-BAK4", "N-BAK2", "N-K5", "N-PSK3", "N-SK14"],
@@ -3003,23 +3003,68 @@
       const t = String(s?.type || "").toUpperCase();
       if (t === "STOP") continue;
       const dist = stopIdx >= 0 ? Math.abs(i - stopIdx) : 99;
-      let mul = 1.85;
+      let capMul = 1.85;
+      let floorMul = 1.08;
       if (stopIdx >= 0) {
         if (i < stopIdx) {
-          if (dist <= 1) mul = 1.9;
-          else if (dist <= 3) mul = wide ? 2.30 : 2.10;
-          else mul = wide ? 2.50 : 2.20;
+          if (dist <= 1) {
+            capMul = 1.9;
+            floorMul = 1.20;
+          } else if (dist <= 3) {
+            capMul = wide ? 2.30 : 2.10;
+            floorMul = wide ? 1.36 : 1.28;
+          } else {
+            capMul = wide ? 2.50 : 2.20;
+            floorMul = wide ? 1.48 : 1.34;
+          }
         } else if (i > stopIdx) {
-          if (dist <= 1) mul = 1.75;
-          else if (dist <= 3) mul = 1.62;
-          else mul = 1.50;
+          if (dist <= 1) {
+            capMul = 1.75;
+            floorMul = 1.15;
+          } else if (dist <= 3) {
+            capMul = 1.62;
+            floorMul = 1.08;
+          } else {
+            capMul = 1.50;
+            floorMul = 1.03;
+          }
         }
       }
 
-      let cap = Math.min(apCapGlobal, stopAp * mul, maxApForSurface(s));
+      if (Math.abs(Number(s.R || 0)) >= 1e-9) {
+        const desiredFloor = Math.min(apCapGlobal, stopAp * floorMul);
+        const needR = desiredFloor / Math.max(1e-9, AP_SAFETY) * 1.02;
+        if (Math.abs(Number(s.R || 0)) < needR) {
+          const sign = Number(s.R || 0) >= 0 ? 1 : -1;
+          s.R = sign * clamp(needR, AD_CFG.minRadiusAbs, AD_CFG.maxRadiusAbs);
+        }
+      }
+
+      let cap = Math.min(apCapGlobal, stopAp * capMul, maxApForSurface(s));
       if (i === lastPhys) cap = Math.min(cap, apCapRear);
-      s.ap = clamp(Number(s.ap || 0), PHYS_CFG.minAperture, cap);
+      const floor = Math.min(
+        cap,
+        Math.max(PHYS_CFG.minAperture, stopAp * floorMul),
+      );
+      s.ap = clamp(Number(s.ap || 0), floor, cap);
     }
+  }
+
+  function adZoneFloorMul(i, stopIdx, targetEfl = 50) {
+    if (stopIdx < 0) return 1.08;
+    const wide = Number(targetEfl || 50) <= 28.5;
+    const dist = Math.abs(i - stopIdx);
+    if (i < stopIdx) {
+      if (dist <= 1) return 1.20;
+      if (dist <= 3) return wide ? 1.36 : 1.28;
+      return wide ? 1.48 : 1.34;
+    }
+    if (i > stopIdx) {
+      if (dist <= 1) return 1.15;
+      if (dist <= 3) return 1.08;
+      return 1.03;
+    }
+    return 1.12;
   }
 
   function adForceFixedSensorPreset() {
@@ -3345,14 +3390,82 @@
       sStop.t = adClampThicknessForSurface(sStop, Number(sStop.t || 0), PHYS_CFG.minStopSideAirGap);
     }
 
+    adRepairGeometryGaps(surfaces, targetStopAp, targetEfl);
     adEnforceRearGap(surfaces, minRearGap);
     adClampElementAperturesByZone(surfaces, { targetStopAp, targetEfl });
 
     clampAllApertures(surfaces);
     clampGlassPairClearApertures(surfaces, PHYS_CFG.minGlassCT, 0.985);
     expandMiddleApertures(surfaces, { targetStopAp: targetStopAp || undefined, nearStopHeadroom: 1.14 });
+    adRepairGeometryGaps(surfaces, targetStopAp, targetEfl);
     clampGlassPairClearApertures(surfaces, PHYS_CFG.minGlassCT, 0.975);
     clampAllApertures(surfaces);
+  }
+
+  function adRepairGeometryGaps(surfaces, targetStopAp = null, targetEfl = 50) {
+    if (!Array.isArray(surfaces) || surfaces.length < 3) return;
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    for (let pass = 0; pass < 6; pass++) {
+      let changed = false;
+      computeVertices(surfaces, 0, 0);
+      for (let i = 0; i < surfaces.length - 1; i++) {
+        const a = surfaces[i];
+        const b = surfaces[i + 1];
+        const ta = String(a?.type || "").toUpperCase();
+        const tb = String(b?.type || "").toUpperCase();
+        if (ta === "OBJ" || ta === "IMS" || tb === "OBJ" || tb === "IMS") continue;
+
+        const medium = String(resolveGlassName(a?.glass || "AIR")).toUpperCase();
+        const req = medium === "AIR" ? PHYS_CFG.minAirGap : PHYS_CFG.minGlassCT;
+        const floorMul = adZoneFloorMul(i, stopIdx, targetEfl);
+        const pairFloor = Number.isFinite(targetStopAp)
+          ? Math.max(PHYS_CFG.minAperture, Number(targetStopAp) * floorMul)
+          : PHYS_CFG.minAperture;
+
+        for (const s of [a, b]) {
+          if (Math.abs(Number(s.R || 0)) < 1e-9) continue;
+          const needR = pairFloor / Math.max(1e-9, AP_SAFETY) * 1.03;
+          if (Math.abs(Number(s.R || 0)) < needR) {
+            const sign = Number(s.R || 0) >= 0 ? 1 : -1;
+            s.R = sign * clamp(needR, AD_CFG.minRadiusAbs, AD_CFG.maxRadiusAbs);
+            changed = true;
+          }
+          if (Number(s.ap || 0) < pairFloor) {
+            s.ap = pairFloor;
+            changed = true;
+          }
+        }
+
+        let yRef = Math.max(0.2, Math.min(Number(a.ap || 0), Number(b.ap || 0)));
+        if (Number.isFinite(targetStopAp)) {
+          yRef = Math.max(yRef, pairFloor);
+          yRef = Math.min(yRef, Math.max(1.0, Number(targetStopAp) * 1.85));
+        }
+
+        const xa = surfaceXatY(a, yRef);
+        const xb = surfaceXatY(b, yRef);
+        if (!Number.isFinite(xa) || !Number.isFinite(xb)) {
+          for (const s of [a, b]) {
+            if (Math.abs(Number(s.R || 0)) < 1e-9) continue;
+            const needR = yRef * 1.08;
+            if (Math.abs(Number(s.R || 0)) < needR) {
+              const sign = Number(s.R || 0) >= 0 ? 1 : -1;
+              s.R = sign * clamp(needR, AD_CFG.minRadiusAbs, AD_CFG.maxRadiusAbs);
+              changed = true;
+            }
+          }
+        }
+
+        const gap = minGapBetweenSurfaces(a, b, yRef, 11);
+        if (!Number.isFinite(gap) || gap < req) {
+          const deficit = (!Number.isFinite(gap) ? (req + Math.max(0.6, yRef * 0.08)) : (req - gap)) + 0.08;
+          const tFloor = ta === "STOP" ? PHYS_CFG.minStopSideAirGap : PHYS_CFG.minThickness;
+          a.t = adClampThicknessForSurface(a, Number(a.t || 0) + deficit, tFloor);
+          changed = true;
+        }
+      }
+      if (!changed) break;
+    }
   }
 
   function adScaleTowardTargetEfl(surfaces, targetEfl, wavePreset) {
@@ -4158,11 +4271,24 @@
       r += 40_000_000 + miss * miss * 900_000;
     }
     const reasons = Array.isArray(ev?.reasons) ? ev.reasons : [];
+    if (reasons.includes("PHYS")) r += 300_000_000;
     if (reasons.includes("FOCUS")) r += 220_000_000;
     if (reasons.includes("COV") || reasons.includes("IC")) r += 120_000_000;
     if (reasons.includes("VIG")) r += 80_000_000;
     if (reasons.includes("EFL")) r += 120_000_000;
     if (reasons.includes("T")) r += 120_000_000;
+    if (reasons.includes("EFL_SIGN")) r += 420_000_000;
+    if (reasons.includes("T_MODEL")) r += 280_000_000;
+    const vfInf = Number(ev?.focusInf?.validFrac);
+    const vfNear = Number(ev?.focusNear?.validFrac);
+    const vigInf = Number(ev?.focusInf?.edgeVigFrac);
+    const vigNear = Number(ev?.focusNear?.edgeVigFrac);
+    if (Number.isFinite(vfInf) && vfInf < 0.22) r += (0.22 - vfInf) * 320_000_000;
+    if (Number.isFinite(vfNear) && vfNear < 0.22) r += (0.22 - vfNear) * 320_000_000;
+    if (Number.isFinite(vigInf) && vigInf > 0.60) r += (vigInf - 0.60) * 260_000_000;
+    if (Number.isFinite(vigNear) && vigNear > 0.60) r += (vigNear - 0.60) * 260_000_000;
+    const icDiag = Number(ev?.icDiag);
+    if (!Number.isFinite(icDiag) || icDiag < 6.0) r += 260_000_000 + (Number.isFinite(icDiag) ? (6 - icDiag) * 25_000_000 : 0);
     return r;
   }
 
@@ -4254,7 +4380,6 @@
     if (!valid.length && near.length) {
       const take = Math.min(Math.max(1, cfg.minValidSeeds), near.length);
       valid.push(...near.slice(0, take));
-      valid.sort((a, b) => a.eval.score - b.eval.score);
     }
 
     return { valid, near };
@@ -4507,9 +4632,42 @@
         return;
       }
 
-      seedPool.sort((a, b) => a.eval.score - b.eval.score);
-      const topSeeds = seedPool.slice(0, Math.min(cfg.topK, seedPool.length));
-      appendADLog(`Stage A done: ${seeds.valid.length} valid seeds (${seedPool.length} usable).`);
+      const hasTrueValid = seedPool.some((x) => !!x?.eval?.valid);
+      const isUsableNear = (ev) => {
+        if (!ev) return false;
+        const e = Number(ev.efl);
+        const ic = Number(ev.icDiag);
+        const vf = Number(ev.focusNear?.validFrac ?? ev.focusInf?.validFrac);
+        if (!Number.isFinite(e) || e <= 1) return false;
+        if (!Number.isFinite(ic) || ic < 4) return false;
+        if (Number.isFinite(vf) && vf < 0.08) return false;
+        return true;
+      };
+      seedPool.sort((a, b) => {
+        if (hasTrueValid) return a.eval.score - b.eval.score;
+        return adNearRank(a.eval, cfg) - adNearRank(b.eval, cfg);
+      });
+      const topSeeds = [];
+      const forcedFamilies = ["plbase", "distagon", "retrofocus"];
+      for (const fam of forcedFamilies) {
+        if (topSeeds.length >= cfg.topK) break;
+        const sForced = adBuildRescueSeed(cfg, fam);
+        const eForced = adEvaluateCandidate(sForced, cfg, { quick: false });
+        if (eForced.valid || isUsableNear(eForced)) {
+          topSeeds.push({ family: `${fam}:forced`, lens: clone(eForced.lens), eval: eForced });
+        }
+      }
+      for (const item of seedPool) {
+        if (topSeeds.length >= cfg.topK) break;
+        if (!item?.eval?.valid && !isUsableNear(item.eval)) continue;
+        topSeeds.push(item);
+      }
+      if (!topSeeds.length && seedPool.length) {
+        topSeeds.push(seedPool[0]);
+      }
+      const trueValidCount = seeds.valid.filter((x) => !!x?.eval?.valid).length;
+      appendADLog(`Stage A done: ${trueValidCount} valid seeds (${seedPool.length} usable).`);
+      if (trueValidCount === 0) appendADLog("Stage A note: using near-ranked fallback candidates (no strictly valid seed yet).");
       appendADLog(`Stage B: optimize top ${topSeeds.length} seeds...`);
 
       let globalBest = null;
