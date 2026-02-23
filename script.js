@@ -1504,7 +1504,7 @@ return {
   function estimateSoftImageCircleStandalone(surfaces, sensorW, sensorH, wavePreset, rayCount) {
     const cfg = SOFT_IC_CFG;
     const sensorX = 0.0;
-    const halfDiag = 0.5 * Math.hypot(sensorW, sensorH);
+   const halfDiag = 0.5 * sensorH; // 2D meridional: y = vertical only (so limit = half sensor height)
     const work = clone(surfaces);
 
     const af = bestLensShiftForDesign(work, 0, rayCount, wavePreset);
