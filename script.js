@@ -1296,13 +1296,14 @@
     };
   }
 
-  function chiefSensorRadiusAtFieldDeg(surfaces, fieldDeg, wavePreset, sensorX) {
-    const chief = buildChiefRay(surfaces, fieldDeg);
-    const tr = traceRayForward(clone(chief), surfaces, wavePreset);
-    if (!tr || !tr.endRay || tr.tir || tr.vignetted) return null;
+  function bundleCenterSensorRadiusAtFieldDeg(surfaces, fieldDeg, wavePreset, sensorX) {
+    const rays = buildRays(surfaces, fieldDeg, 9);
+    if (!rays.length) return null;
+    const mid = rays[(rays.length / 2) | 0];
+    const tr = traceRayForward(clone(mid), surfaces, wavePreset);
+    if (!tr || !tr.endRay || tr.tir || tr.vignetted || tr.clippedByMount) return null;
     const y = rayHitYAtX(tr.endRay, sensorX);
-    if (!Number.isFinite(y)) return null;
-    return Math.abs(y);
+    return Number.isFinite(y) ? Math.abs(y) : null;
   }
 
   function findFieldDegForRadius(surfaces, rTargetMm, wavePreset, sensorX, cfg = SOFT_IC_CFG) {
@@ -1314,25 +1315,24 @@
     if (target <= 1e-9) return 0;
 
     let lo = 0;
-    let yLo = chiefSensorRadiusAtFieldDeg(surfaces, lo, wavePreset, sensorX);
-    if (!Number.isFinite(yLo)) return null;
+    const y0 = bundleCenterSensorRadiusAtFieldDeg(surfaces, lo, wavePreset, sensorX);
+    if (!Number.isFinite(y0)) return null;
 
     let hi = null;
     for (let th = step; th <= maxField + 1e-9; th += step) {
-      const y = chiefSensorRadiusAtFieldDeg(surfaces, th, wavePreset, sensorX);
+      const y = bundleCenterSensorRadiusAtFieldDeg(surfaces, th, wavePreset, sensorX);
       if (!Number.isFinite(y)) continue;
       if (y >= target) {
         hi = th;
         break;
       }
       lo = th;
-      yLo = y;
     }
     if (!Number.isFinite(hi)) return null;
 
     for (let i = 0; i < iters; i++) {
       const mid = 0.5 * (lo + hi);
-      const yMid = chiefSensorRadiusAtFieldDeg(surfaces, mid, wavePreset, sensorX);
+      const yMid = bundleCenterSensorRadiusAtFieldDeg(surfaces, mid, wavePreset, sensorX);
       if (!Number.isFinite(yMid)) {
         hi = mid;
         continue;
@@ -1378,6 +1378,11 @@
 
     const lensShift = af.shift;
     computeVertices(work, lensShift, sensorX);
+    const mapDebug = {
+      y5: bundleCenterSensorRadiusAtFieldDeg(work, 5, wavePreset, sensorX),
+      y10: bundleCenterSensorRadiusAtFieldDeg(work, 10, wavePreset, sensorX),
+      y20: bundleCenterSensorRadiusAtFieldDeg(work, 20, wavePreset, sensorX),
+    };
 
     const centerPack = traceBundleThroughputAtField(work, 0, wavePreset, sensorX, cfg.raysPerBundle);
     const centerGoodFrac = Math.max(cfg.eps, centerPack.goodFrac);
@@ -1391,6 +1396,7 @@
         focusLensShift: lensShift,
         focusFailed: false,
         drasticDropRadiusMm: null,
+        mapDebug,
       };
     }
 
@@ -1442,6 +1448,7 @@
       focusLensShift: lensShift,
       focusFailed: false,
       drasticDropRadiusMm,
+      mapDebug,
     };
   }
 
@@ -2282,6 +2289,10 @@
       : `FOV: H ${fov.hfov.toFixed(1)}° • V ${fov.vfov.toFixed(1)}° • D ${fov.dfov.toFixed(1)}°`;
 
     const softIc = getSoftIcForCurrentLens(lens.surfaces, sensorW, sensorH, wavePreset, rayCount);
+    const dbgY5 = softIc?.mapDebug?.y5;
+    const dbgY10 = softIc?.mapDebug?.y10;
+    const dbgY20 = softIc?.mapDebug?.y20;
+    const mapDbgTxt = `map y@5:${Number.isFinite(dbgY5)?dbgY5.toFixed(1):"—"} y@10:${Number.isFinite(dbgY10)?dbgY10.toFixed(1):"—"} y@20:${Number.isFinite(dbgY20)?dbgY20.toFixed(1):"—"}`;
     const softIcTxt = softIc.focusFailed
       ? "SoftIC20: focus failed"
       : `SoftIC20: ${softIc.softICmm.toFixed(2)}mm • center ${(softIc.centerGoodFrac * 100).toFixed(0)}%`;
@@ -2373,7 +2384,8 @@
     if (ui.metaInfo) {
       ui.metaInfo.textContent =
         `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm • ` +
-        (softIc.focusFailed ? "SoftIC20 focus failed" : `SoftIC20 ${softIc.softICmm.toFixed(2)}mm`);
+        (softIc.focusFailed ? "SoftIC20 focus failed" : `SoftIC20 ${softIc.softICmm.toFixed(2)}mm`) +
+        ` • ${mapDbgTxt}`;
     }
 
     resizeCanvasToCSS();
@@ -2406,6 +2418,7 @@
       tGeomTxt,
       tpTxt,
       softIcTxt,
+      mapDbgTxt,
       fovTxt,
       rearTxt,
       lenTxt,
