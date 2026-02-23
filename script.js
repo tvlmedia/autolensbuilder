@@ -972,7 +972,8 @@
     if (!MOUNT_TRACE_CFG.enabled) return null;
     const dx = ray?.d?.x;
     const dy = ray?.d?.y;
-    if (!Number.isFinite(dx) || !Number.isFinite(dy) || Math.abs(dx) < 1e-12) return null;
+    const dz = Number(ray?.d?.z || 0);
+    if (!Number.isFinite(dx) || !Number.isFinite(dy) || !Number.isFinite(dz) || Math.abs(dx) < 1e-12) return null;
 
     const xFlange = -PL_FFD;
     const xA = xFlange - MOUNT_TRACE_CFG.lensLip;
@@ -986,25 +987,40 @@
     if (Number.isFinite(tMax)) t1 = Math.min(t1, tMax - 1e-9);
     if (!(t1 >= t0)) return null;
 
-    const yAt = (t) => ray.p.y + dy * t;
+    const py = Number(ray?.p?.y || 0);
+    const pz = Number(ray?.p?.z || 0);
+    const yAt = (t) => py + dy * t;
+    const zAt = (t) => pz + dz * t;
+    const r2At = (t) => {
+      const yy = yAt(t);
+      const zz = zAt(t);
+      return yy * yy + zz * zz;
+    };
     const lim = Math.max(0.1, MOUNT_TRACE_CFG.throatR - Math.max(0, MOUNT_TRACE_CFG.clearanceMm || 0));
-    const y0 = yAt(t0);
-    const y1 = yAt(t1);
+    const lim2 = lim * lim;
+    const r20 = r2At(t0);
+    const r21 = r2At(t1);
 
-    if (Math.abs(y0) <= lim && Math.abs(y1) <= lim) return null;
+    if (r20 <= lim2 + 1e-9 && r21 <= lim2 + 1e-9) return null;
 
     let tClip = t0;
-    if (Math.abs(y0) <= lim && Math.abs(dy) > 1e-12) {
-      const roots = [
-        ( lim - ray.p.y) / dy,
-        (-lim - ray.p.y) / dy,
-      ].filter((t) => t >= t0 - 1e-9 && t <= t1 + 1e-9);
-      if (roots.length) tClip = Math.max(t0, Math.min(...roots));
+    const A = dy * dy + dz * dz;
+    if (A > 1e-14) {
+      const B = 2 * (py * dy + pz * dz);
+      const C = py * py + pz * pz - lim2;
+      const disc = B * B - 4 * A * C;
+      if (disc >= 0) {
+        const sd = Math.sqrt(disc);
+        const rt1 = (-B - sd) / (2 * A);
+        const rt2 = (-B + sd) / (2 * A);
+        const roots = [rt1, rt2].filter((t) => t >= t0 - 1e-9 && t <= t1 + 1e-9);
+        if (roots.length) tClip = Math.max(t0, Math.min(...roots));
+      }
     }
 
     return {
       t: tClip,
-      hit: { x: ray.p.x + dx * tClip, y: yAt(tClip) },
+      hit: { x: ray.p.x + dx * tClip, y: yAt(tClip), z: zAt(tClip) },
     };
   }
 
@@ -1060,6 +1076,203 @@
     }
 
     return { pts, vignetted, tir, endRay: ray };
+  }
+
+  // -------------------- 3D coverage tracing --------------------
+  function normalize3(v) {
+    const m = Math.hypot(v.x, v.y, v.z);
+    if (m < 1e-12) return { x: 0, y: 0, z: 0 };
+    return { x: v.x / m, y: v.y / m, z: v.z / m };
+  }
+  function dot3(a, b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+  function add3(a, b) { return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }; }
+  function mul3(a, s) { return { x: a.x * s, y: a.y * s, z: a.z * s }; }
+
+  function refract3(I, N, n1, n2) {
+    I = normalize3(I);
+    N = normalize3(N);
+    if (dot3(I, N) > 0) N = mul3(N, -1);
+    const cosi = -dot3(N, I);
+    const eta = n1 / n2;
+    const k = 1 - eta * eta * (1 - cosi * cosi);
+    if (k < 0) return null;
+    const T = add3(mul3(I, eta), mul3(N, eta * cosi - Math.sqrt(k)));
+    return normalize3(T);
+  }
+
+  function intersectSurface3D(ray, surf) {
+    const vx = surf.vx;
+    const R = Number(surf.R || 0);
+    const ap = Math.max(0, Number(surf.ap || 0));
+
+    if (Math.abs(R) < 1e-9) {
+      if (Math.abs(ray.d.x) < 1e-12) return null;
+      const t = (vx - ray.p.x) / ray.d.x;
+      if (!Number.isFinite(t) || t <= 1e-9) return null;
+      const hit = add3(ray.p, mul3(ray.d, t));
+      const vignetted = Math.hypot(hit.y, hit.z) > ap + 1e-9;
+      return { hit, t, vignetted, normal: { x: -1, y: 0, z: 0 } };
+    }
+
+    const cx = vx + R;
+    const rad = Math.abs(R);
+
+    const px = ray.p.x - cx;
+    const py = ray.p.y;
+    const pz = ray.p.z;
+    const dx = ray.d.x;
+    const dy = ray.d.y;
+    const dz = ray.d.z;
+
+    const A = dx * dx + dy * dy + dz * dz;
+    const B = 2 * (px * dx + py * dy + pz * dz);
+    const C = px * px + py * py + pz * pz - rad * rad;
+
+    const disc = B * B - 4 * A * C;
+    if (disc < 0) return null;
+
+    const sdisc = Math.sqrt(disc);
+    const t1 = (-B - sdisc) / (2 * A);
+    const t2 = (-B + sdisc) / (2 * A);
+
+    let t = null;
+    if (t1 > 1e-9 && t2 > 1e-9) t = Math.min(t1, t2);
+    else if (t1 > 1e-9) t = t1;
+    else if (t2 > 1e-9) t = t2;
+    else return null;
+
+    const hit = add3(ray.p, mul3(ray.d, t));
+    const vignetted = Math.hypot(hit.y, hit.z) > ap + 1e-9;
+    const normal = normalize3({ x: hit.x - cx, y: hit.y, z: hit.z });
+    return { hit, t, vignetted, normal };
+  }
+
+  function rayHitAtX3D(endRay, x) {
+    if (!endRay?.d || Math.abs(endRay.d.x) < 1e-9) return null;
+    const t = (x - endRay.p.x) / endRay.d.x;
+    if (!Number.isFinite(t)) return null;
+    const y = endRay.p.y + t * endRay.d.y;
+    const z = endRay.p.z + t * endRay.d.z;
+    if (!Number.isFinite(y) || !Number.isFinite(z)) return null;
+    return { y, z, r: Math.hypot(y, z) };
+  }
+
+  function traceRayForward3D(ray, surfaces, wavePreset, opts = {}) {
+    const skipIMS = !!opts.skipIMS;
+    let pts = [];
+    let vignetted = false;
+    let tir = false;
+    pts.push({ x: ray.p.x, y: ray.p.y, z: ray.p.z });
+
+    let nBefore = 1.0;
+    for (let i = 0; i < surfaces.length; i++) {
+      const s = surfaces[i];
+      const type = String(s?.type || "").toUpperCase();
+      const isIMS = type === "IMS";
+      const isMECH = type === "MECH" || type === "BAFFLE" || type === "HOUSING";
+
+      if (skipIMS && isIMS) continue;
+
+      const hitInfo = intersectSurface3D(ray, s);
+      const mountHit = (!skipIMS && nBefore <= 1.000001)
+        ? mountClipHitAlongRay(ray, hitInfo?.t ?? Infinity)
+        : null;
+      if (mountHit) { pts.push(mountHit.hit); vignetted = true; break; }
+
+      if (!hitInfo) { vignetted = true; break; }
+      pts.push(hitInfo.hit);
+
+      if (!isIMS && hitInfo.vignetted) { vignetted = true; break; }
+
+      if (isIMS || isMECH) {
+        ray = { p: hitInfo.hit, d: ray.d };
+        continue;
+      }
+
+      const nAfter = glassN(String(s.glass || "AIR"), wavePreset);
+      if (Math.abs(nAfter - nBefore) < 1e-9) {
+        ray = { p: hitInfo.hit, d: ray.d };
+        nBefore = nAfter;
+        continue;
+      }
+
+      const newDir = refract3(ray.d, hitInfo.normal, nBefore, nAfter);
+      if (!newDir) { tir = true; break; }
+
+      ray = { p: hitInfo.hit, d: newDir };
+      nBefore = nAfter;
+    }
+
+    return { pts, vignetted, tir, endRay: ray };
+  }
+
+  function samplePupilDiskPoints(n, radius) {
+    const count = Math.max(9, Math.min(401, n | 0));
+    const r = Math.max(1e-6, Number(radius) || 1e-6);
+    const pts = [{ y: 0, z: 0 }];
+    const g = Math.PI * (3 - Math.sqrt(5));
+    for (let k = 1; k < count; k++) {
+      const u = (k - 0.5) / (count - 1);
+      const rr = r * Math.sqrt(Math.max(0, u));
+      const a = k * g;
+      pts.push({ y: rr * Math.cos(a), z: rr * Math.sin(a) });
+    }
+    return pts;
+  }
+
+  function buildRaysCoverage3D(surfaces, fieldAngleDeg, count) {
+    const n = Math.max(9, Math.min(401, count | 0));
+    const theta = (fieldAngleDeg * Math.PI) / 180;
+    const dir = normalize3({ x: Math.cos(theta), y: Math.sin(theta), z: 0 });
+
+    const xStart = (surfaces[0]?.vx ?? 0) - 80;
+    const { xRef, apRef } = getRayReferencePlane(surfaces);
+    const tanT = Math.abs(dir.x) < 1e-9 ? 0 : dir.y / dir.x;
+    const pupilPts = samplePupilDiskPoints(n, apRef);
+
+    return pupilPts.map((p) => {
+      const y0 = p.y - tanT * (xRef - xStart);
+      return { p: { x: xStart, y: y0, z: p.z }, d: dir };
+    });
+  }
+
+  function traceBundleAtFieldCoverage(surfaces, fieldDeg, rayCount, wavePreset, sensorX, sensorHalfMm = null) {
+    const rays = buildRaysCoverage3D(surfaces, fieldDeg, rayCount);
+    const traces = rays.map((r) => traceRayForward3D(clone(r), surfaces, wavePreset));
+    const vCount = traces.filter((t) => t.vignetted).length;
+    const vigFrac = traces.length ? (vCount / traces.length) : 1;
+
+    const ys = [];
+    let validCount = 0;
+    let insideCount = 0;
+    const lim = Number(sensorHalfMm);
+    const tol = Number(IMAGE_CIRCLE_CFG.sensorClipTolMm || 0);
+
+    for (const tr of traces) {
+      if (!tr || tr.vignetted || tr.tir) continue;
+      const hit = rayHitAtX3D(tr.endRay, sensorX);
+      if (!hit) continue;
+      validCount++;
+      ys.push(hit.y);
+      if (Number.isFinite(lim) && hit.r <= lim + tol) insideCount++;
+    }
+
+    const rms = ys.length >= 5
+      ? (() => {
+          const mean = ys.reduce((a, b) => a + b, 0) / ys.length;
+          return Math.sqrt(ys.reduce((acc, y) => acc + (y - mean) ** 2, 0) / ys.length);
+        })()
+      : null;
+
+    return {
+      traces,
+      rms,
+      n: validCount,
+      vigFrac,
+      vCount,
+      insideFrac: Number.isFinite(lim) ? (insideCount / Math.max(1, traces.length)) : null,
+      insideCount,
+    };
   }
 
   // -------------------- ray bundles --------------------
@@ -1123,11 +1336,15 @@
   }
 
   function chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, fieldDeg) {
-    const chief = buildChiefRay(surfaces, fieldDeg);
-    const tr = traceRayForward(clone(chief), surfaces, wavePreset);
+    const chief2 = buildChiefRay(surfaces, fieldDeg);
+    const chief = {
+      p: { x: chief2.p.x, y: chief2.p.y, z: 0 },
+      d: { x: chief2.d.x, y: chief2.d.y, z: 0 },
+    };
+    const tr = traceRayForward3D(clone(chief), surfaces, wavePreset);
     if (!tr || tr.vignetted || tr.tir) return null;
-    const y = rayHitYAtX(tr.endRay, sensorX);
-    return Number.isFinite(y) ? Math.abs(y) : null;
+    const hit = rayHitAtX3D(tr.endRay, sensorX);
+    return Number.isFinite(hit?.y) ? Math.abs(hit.y) : null;
   }
 
   // Inverse chief mapping: which field angle lands chief ray at this sensor half-size.
@@ -1172,14 +1389,18 @@
     for (let iter = 0; iter < COVERAGE_CFG.maxFieldIters; iter++) {
       const mid = (lo + hi) * 0.5;
 
-      const chief = buildChiefRay(surfaces, mid);
-      const chiefTr = traceRayForward(clone(chief), surfaces, wavePreset);
+      const chief2 = buildChiefRay(surfaces, mid);
+      const chief = {
+        p: { x: chief2.p.x, y: chief2.p.y, z: 0 },
+        d: { x: chief2.d.x, y: chief2.d.y, z: 0 },
+      };
+      const chiefTr = traceRayForward3D(clone(chief), surfaces, wavePreset);
       if (!chiefTr || chiefTr.vignetted || chiefTr.tir) { hi = mid; continue; }
 
-      const chiefY = rayHitYAtX(chiefTr.endRay, sensorX);
-      if (!Number.isFinite(chiefY) || Math.abs(chiefY) > halfHEff) { hi = mid; continue; }
+      const chiefHit = rayHitAtX3D(chiefTr.endRay, sensorX);
+      if (!chiefHit || !Number.isFinite(chiefHit.r) || chiefHit.r > halfHEff) { hi = mid; continue; }
 
-      const pack = traceBundleAtField(surfaces, mid, covRays, wavePreset, sensorX, halfHEff);
+      const pack = traceBundleAtFieldCoverage(surfaces, mid, covRays, wavePreset, sensorX, halfHEff);
       const validFrac = (pack.n || 0) / Math.max(1, covRays);
       const passVig = Number.isFinite(pack.vigFrac) && pack.vigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac;
       const passValid = Number.isFinite(validFrac) && validFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
@@ -1308,10 +1529,7 @@
 
   function imageCircleDiagFromTracedFieldMm(surfaces, wavePreset, sensorX, halfFieldDeg) {
     if (!Number.isFinite(halfFieldDeg) || halfFieldDeg < 0) return null;
-    const chief = buildChiefRay(surfaces, halfFieldDeg);
-    const tr = traceRayForward(clone(chief), surfaces, wavePreset);
-    if (!tr || tr.vignetted || tr.tir) return null;
-    const y = rayHitYAtX(tr.endRay, sensorX);
+    const y = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, halfFieldDeg);
     if (!Number.isFinite(y)) return null;
     return 2 * Math.abs(y);
   }
@@ -2265,7 +2483,7 @@
 
     const reqHalfEff = Math.max(0.1, covHalfMm - Math.max(0, IMAGE_CIRCLE_CFG.edgeGuardMm || 0));
     const packReqStrict = Number.isFinite(req) && req > 0
-      ? traceBundleAtField(lens.surfaces, req, strictRayCount, wavePreset, sensorX, reqHalfEff)
+      ? traceBundleAtFieldCoverage(lens.surfaces, req, strictRayCount, wavePreset, sensorX, reqHalfEff)
       : null;
     const reqVigFracStrict = Number.isFinite(packReqStrict?.vigFrac) ? packReqStrict.vigFrac : null;
     const reqValidFracStrict = packReqStrict ? ((packReqStrict.n || 0) / Math.max(1, strictRayCount)) : null;
