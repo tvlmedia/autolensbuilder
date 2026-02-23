@@ -2835,8 +2835,8 @@
     maxGlassThicknessMm: 22.0,
     maxAirGapMm: 140.0,
     minRearGapMm: 52.5,
-    maxSurfaceApMm: 30.0,
-    maxRearSurfaceApMm: 16.0,
+    maxSurfaceApMm: 34.0,
+    maxRearSurfaceApMm: 22.0,
     seedCount: 56,
     minValidSeeds: 8,
     topK: 5,
@@ -2857,7 +2857,7 @@
     tSlowWeight: 2400.0,
     tFastWeight: 220.0,
     bflWeight: 2400.0,
-    covWeight: 1400.0,
+    covWeight: 2600.0,
     focusTravelWeight: 40.0,
     centerRmsWeight: 3400.0,
     centerRmsMaxInf: 0.16,
@@ -2868,7 +2868,7 @@
     guardFailPenalty: 900000.0,
     maxSurfaceCount: 32,
   };
-  const AD_BUILD_TAG = "v2-rescue-r17";
+  const AD_BUILD_TAG = "v2-rescue-r19";
 
   const AD_GLASS_CLASSES = {
     CROWN: ["N-BK7HT", "N-BAK4", "N-BAK2", "N-K5", "N-PSK3", "N-SK14"],
@@ -3294,7 +3294,10 @@
       adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset || "d");
       adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset || "d");
       adNudgeBflForPL(s, cfg);
-      adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset || "d", cfg.quickRayCount || AD_CFG.quickRayCount);
+      adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset || "d", cfg.quickRayCount || AD_CFG.quickRayCount, {
+        targetEfl: cfg.targetEfl,
+        targetT: cfg.targetT,
+      });
     }
     adQuickSanity(s, {
       targetStopAp: stopApTarget,
@@ -3674,6 +3677,59 @@
     const push = clamp(deficitNorm + force * 0.8, 0.08, 1.8);
 
     const stopIdx = findStopSurfaceIndex(surfaces);
+    const targetEfl = Number.isFinite(Number(opts.targetEfl)) ? Number(opts.targetEfl) : 50;
+    const targetT = Number.isFinite(Number(opts.targetT)) ? Number(opts.targetT) : 2.0;
+    const stopApTarget = adStopApFromTarget(targetEfl, targetT);
+
+    function forceCoverageApertures() {
+      const physIdx = [];
+      for (let i = 0; i < surfaces.length; i++) {
+        const t = String(surfaces[i]?.type || "").toUpperCase();
+        if (t === "OBJ" || t === "IMS") continue;
+        physIdx.push(i);
+      }
+      if (!physIdx.length) return;
+      const lastPhys = physIdx[physIdx.length - 1];
+      for (const i of physIdx) {
+        const s = surfaces[i];
+        const t = String(s?.type || "").toUpperCase();
+        if (t === "STOP") continue;
+        const nearStop = stopIdx >= 0 && Math.abs(i - stopIdx) <= 2;
+        const inFront = stopIdx >= 0 && i < stopIdx;
+        let mul = nearStop ? (1.70 + 0.26 * push) : (inFront ? (1.42 + 0.18 * push) : (1.28 + 0.14 * push));
+        if (i === lastPhys) mul += 0.10;
+        const desiredAp = stopApTarget * mul;
+        const capBase = i === lastPhys
+          ? Math.max(Number(AD_CFG.maxRearSurfaceApMm || 22), stopApTarget * 1.70)
+          : Math.max(Number(AD_CFG.maxSurfaceApMm || 34), stopApTarget * 2.05);
+        if (Math.abs(Number(s.R || 0)) > 1e-9 && maxApForSurface(s) < desiredAp * 0.98) {
+          const relax = clamp(desiredAp / Math.max(0.25, maxApForSurface(s)), 1.02, 1.65);
+          s.R = clampSignedRadius(Number(s.R || 0) * relax);
+        }
+        const cap = Math.min(capBase, maxApForSurface(s));
+        s.ap = clamp(Math.max(Number(s.ap || 0), desiredAp * 0.86), PHYS_CFG.minAperture, cap);
+      }
+      if (stopIdx >= 0) {
+        const sStop = surfaces[stopIdx];
+        sStop.ap = clamp(
+          Math.max(Number(sStop.ap || 0), stopApTarget * (1.08 + 0.22 * push)),
+          PHYS_CFG.minAperture,
+          maxApForSurface(sStop),
+        );
+        if (stopIdx > 0) {
+          const sPrev = surfaces[stopIdx - 1];
+          sPrev.t = adClampThicknessForSurface(sPrev, Number(sPrev.t || 0) * (1.08 + 0.12 * push), PHYS_CFG.minStopSideAirGap);
+        }
+        sStop.t = adClampThicknessForSurface(sStop, Number(sStop.t || 0) * (1.08 + 0.12 * push), PHYS_CFG.minStopSideAirGap);
+        if (stopIdx + 1 < surfaces.length - 1) {
+          const sNext = surfaces[stopIdx + 1];
+          if (airOrGlass(sNext?.glass) === "AIR") {
+            sNext.t = adClampThicknessForSurface(sNext, Number(sNext.t || 0) * (1.06 + 0.10 * push), PHYS_CFG.minThickness);
+          }
+        }
+      }
+    }
+
     for (let i = 0; i < surfaces.length; i++) {
       const s = surfaces[i];
       const t = String(s?.type || "").toUpperCase();
@@ -3694,6 +3750,7 @@
       }
       s.ap = ap;
     }
+    if (push >= 0.65) forceCoverageApertures();
     if (stopIdx >= 0) {
       const sStop = surfaces[stopIdx];
       sStop.ap = clamp(
@@ -3720,7 +3777,10 @@
       adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset);
       adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset);
       adNudgeBflForPL(s, cfg);
-      adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount);
+      adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount, {
+        targetEfl: cfg.targetEfl,
+        targetT: cfg.targetT,
+      });
       adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm, targetEfl: cfg.targetEfl });
 
       computeVertices(s, 0, 0);
@@ -3948,6 +4008,26 @@
     const icDiag = imageCircleDiagFromChiefAtField(surfaces, cfg.wavePreset, 0, maxFieldIllum) ?? imageCircleDiagFromHalfFieldMm(efl, maxFieldIllum);
     const icTarget = targetImageCircleDiagMm(cfg.sensorW, cfg.sensorH);
     const icOk = Number.isFinite(icDiag) && icDiag + 0.25 >= icTarget;
+    const frontVx = firstPhysicalVertexX(surfaces);
+    const lensLengthMm = Number.isFinite(frontVx) ? ((-PL_FFD) - frontVx + PL_LENS_LIP) : null;
+    let maxAirGapMm = 0;
+    for (let i = 0; i < surfaces.length; i++) {
+      const sGap = surfaces[i];
+      const tGap = String(sGap?.type || "").toUpperCase();
+      if (tGap === "OBJ" || tGap === "IMS") continue;
+      if (airOrGlass(sGap?.glass) !== "AIR") continue;
+      const g = Number(sGap?.t || 0);
+      if (Number.isFinite(g)) maxAirGapMm = Math.max(maxAirGapMm, g);
+    }
+    const lenSoftMax = Number(cfg.targetEfl || 50) <= 35
+      ? 170
+      : (Number(cfg.targetEfl || 50) <= 65 ? 145 : (Number(cfg.targetEfl || 50) <= 100 ? 195 : 240));
+    const airGapSoftMax = Number(cfg.targetEfl || 50) <= 35
+      ? 36
+      : (Number(cfg.targetEfl || 50) <= 65 ? 30 : (Number(cfg.targetEfl || 50) <= 100 ? 44 : 60));
+    const archBad =
+      (Number.isFinite(lensLengthMm) && lensLengthMm > lenSoftMax * 1.35) ||
+      (Number.isFinite(maxAirGapMm) && maxAirGapMm > airGapSoftMax * 1.60);
     const maxPosShift = adRearSafeMaxPositiveShift(surfaces, 0);
 
     const focusInf = adEvalDistanceMerit(surfaces, {
@@ -4023,6 +4103,7 @@
     if (!covers) reasons.push("COV");
     if (!icOk) reasons.push("IC");
     if (!noHardVig) reasons.push("VIG");
+    if (archBad) reasons.push("ARCH");
     if (!focusOk) reasons.push("FOCUS");
     if (!centerSpotOk) reasons.push("FOCUS_SPOT");
     if (!midSpotOk) reasons.push("MID_SPOT");
@@ -4085,6 +4166,8 @@
     if (Number.isFinite(req) && Number.isFinite(maxFieldStrict) && maxFieldStrict < req) score += cfg.covWeight * (req - maxFieldStrict) ** 2;
     if (Number.isFinite(req) && Number.isFinite(maxFieldIllum) && maxFieldIllum < req) score += cfg.covWeight * 0.55 * (req - maxFieldIllum) ** 2;
     if (!icOk) score += cfg.covWeight * 1.35 * Math.max(1, (icTarget - Number(icDiag || 0)) ** 2);
+    if (Number.isFinite(lensLengthMm) && lensLengthMm > lenSoftMax) score += 180 * (lensLengthMm - lenSoftMax) ** 2;
+    if (Number.isFinite(maxAirGapMm) && maxAirGapMm > airGapSoftMax) score += 90 * (maxAirGapMm - airGapSoftMax) ** 2;
     if (focusTarget === "both" && focusInf.ok && focusNear.ok) {
       score += cfg.focusTravelWeight * (focusNear.shift - focusInf.shift) ** 2;
     }
@@ -4107,6 +4190,8 @@
       icDiag,
       icDiagStrict,
       icTarget,
+      lensLengthMm,
+      maxAirGapMm,
       distPct,
       intrusion,
       intrusionInfShift: Number.isFinite(intrusionInfShift) ? intrusionInfShift : null,
@@ -4354,7 +4439,11 @@
       adNudgeBflForPL(s, cfg);
       const coverageForce = (covFail || icFail) ? 1.0 : 0.0;
       if (coverageForce > 0 || Math.random() < 0.70) {
-        adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount, { force: coverageForce });
+        adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount, {
+          force: coverageForce,
+          targetEfl: cfg.targetEfl,
+          targetT: cfg.targetT,
+        });
       }
       adQuickSanity(s, {
         targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
@@ -4413,6 +4502,7 @@
     if (reasons.includes("FOCUS")) r += 220_000_000;
     if (reasons.includes("COV") || reasons.includes("IC")) r += 120_000_000;
     if (reasons.includes("VIG")) r += 80_000_000;
+    if (reasons.includes("ARCH")) r += 140_000_000;
     if (reasons.includes("EFL")) r += 120_000_000;
     if (reasons.includes("T")) r += 120_000_000;
     if (reasons.includes("EFL_SIGN")) r += 420_000_000;
@@ -4427,6 +4517,10 @@
     if (Number.isFinite(vigNear) && vigNear > 0.60) r += (vigNear - 0.60) * 260_000_000;
     const icDiag = Number(ev?.icDiag);
     if (!Number.isFinite(icDiag) || icDiag < 6.0) r += 260_000_000 + (Number.isFinite(icDiag) ? (6 - icDiag) * 25_000_000 : 0);
+    const len = Number(ev?.lensLengthMm);
+    if (Number.isFinite(len) && len > 170) r += (len - 170) * (len - 170) * 42000;
+    const maxGap = Number(ev?.maxAirGapMm);
+    if (Number.isFinite(maxGap) && maxGap > 34) r += (maxGap - 34) * (maxGap - 34) * 58000;
     const targetEfl = Math.max(1, Number(cfg?.targetEfl || 50));
     if (Number.isFinite(efl) && efl > 0) {
       const eflErrFrac = Math.abs(efl - targetEfl) / targetEfl;
@@ -4466,7 +4560,10 @@
       adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset);
       adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset);
       adNudgeBflForPL(s, cfg);
-      adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount);
+      adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount, {
+        targetEfl: cfg.targetEfl,
+        targetT: cfg.targetT,
+      });
       adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm, targetEfl: cfg.targetEfl });
     }
     return sanitizeLens(tmp);
@@ -4484,7 +4581,10 @@
       adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset);
       adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset);
       adNudgeBflForPL(s, cfg);
-      adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount);
+      adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount, {
+        targetEfl: cfg.targetEfl,
+        targetT: cfg.targetT,
+      });
       adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm, targetEfl: cfg.targetEfl });
     }
     return sanitizeLens(tmp);
@@ -4690,7 +4790,11 @@
         adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset);
         adNudgeBflForPL(s, cfg);
         const covPush = Array.isArray(curEval?.reasons) && (curEval.reasons.includes("COV") || curEval.reasons.includes("IC")) ? 1.0 : 0.0;
-        adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount, { force: covPush });
+        adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount, {
+          force: covPush,
+          targetEfl: cfg.targetEfl,
+          targetT: cfg.targetT,
+        });
         adQuickSanity(s, {
           targetStopAp: adStopApFromTarget(cfg.targetEfl, cfg.targetT),
           minRearGap: cfg.minRearGapMm,
@@ -4869,23 +4973,40 @@
         const baseLens = adBuildWarmStartSeed(warmInput, cfg) || adConditionSeedLens(srcLens, cfg);
         const baseEval = adEvaluateCandidate(baseLens, cfg, { quick: false });
         const baseItem = { family: `refine-base:${srcLabel}`, lens: clone(baseEval.lens), eval: baseEval };
-        topSeeds.push(baseItem);
+        const refinePool = [baseItem];
         appendADLog(`Refine baseline loaded: ${adFormatEval(baseEval)}`);
 
         const topoBase = adCaptureTopology(baseItem.lens);
-        const extraVariants = Math.min(Math.max(1, cfg.topK - 1), 3);
+        const extraVariants = clamp(Math.round(cfg.topK * 2.0), 4, 16);
         for (let i = 0; i < extraVariants; i++) {
           const m = adMutateLens(baseItem.lens, cfg, topoBase, {
             edgeRmsInf: baseEval.focusInf?.rmsEdge,
             centerRmsInf: baseEval.focusInf?.rmsCenter,
             focusNearOk: baseEval.focusNear?.ok,
+            covFail: Array.isArray(baseEval?.reasons) && baseEval.reasons.includes("COV"),
+            icFail: Array.isArray(baseEval?.reasons) && baseEval.reasons.includes("IC"),
           });
           const tuned = adConditionSeedLens(m.lens, cfg);
           const ev = adEvaluateCandidate(tuned, cfg, { quick: false });
-          if (ev.valid || isUsableNear(ev)) {
-            topSeeds.push({ family: `refine-variant-${i + 1}`, lens: clone(ev.lens), eval: ev });
-          }
+          refinePool.push({ family: `refine-variant-${i + 1}`, lens: clone(ev.lens), eval: ev });
         }
+
+        const hasTrueValid = refinePool.some((x) => !!x?.eval?.valid);
+        refinePool.sort((a, b) => {
+          if (hasTrueValid) return Number(a.eval?.score || 1e12) - Number(b.eval?.score || 1e12);
+          return adNearRank(a.eval, cfg) - adNearRank(b.eval, cfg);
+        });
+
+        const take = Math.min(cfg.topK, refinePool.length);
+        for (let i = 0; i < take; i++) {
+          const item = refinePool[i];
+          if (!item?.eval?.valid && !isUsableNear(item.eval) && i > 0) continue;
+          topSeeds.push(item);
+        }
+        if (!topSeeds.length && refinePool.length) {
+          topSeeds.push(refinePool[0]);
+        }
+        appendADLog(`Refine pool: ${refinePool.length} candidates • selected ${topSeeds.length}`);
       } else {
         appendADLog("Stage A: template synthesis + quick guards...");
         const seeds = await adGenerateSeeds(cfg);
