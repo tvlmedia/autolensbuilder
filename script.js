@@ -1386,10 +1386,7 @@ return {
   total,
   good,
   goodFrac: good / Math.max(1, total),
-
-  // vervang localFrac door density (mag >1 zijn)
   localFrac: localDensity,
-
   mountClipped,
   mountFrac: mountClipped / Math.max(1, total),
   rMm: Number.isFinite(rMm) ? rMm : null,
@@ -1398,7 +1395,9 @@ return {
   valid: true,
 };
 
-  function computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg = SOFT_IC_CFG) {
+} // ✅ DEZE TOEVOEGEN
+
+function computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg = SOFT_IC_CFG) {
     const minN = Math.max(3, Number(cfg.minSamplesForCurve || 8) | 0);
     const n = Math.min(radialMm?.length || 0, gainCurve?.length || 0);
     if (n < minN) {
@@ -1613,8 +1612,8 @@ const centerGain      = Math.max(cfg.eps, centerLocalFrac * centerNatural);  // 
       mapFailRun = 0;
 
       const goodFrac  = clamp(pack.goodFrac, 0, 1);
-const localFrac = clamp(Number(pack.localFrac || 0), 0, 1);
-const naturalGain = naturalCos4AtSensorRadius(work, rMm, sensorX);
+const localFrac = Math.max(cfg.eps, Number(pack.localFrac || 0));
+       const naturalGain = naturalCos4AtSensorRadius(work, rMm, sensorX);
 
 // illumination proxy op radius r: “hoeveel rays vallen in de ring” * cos^4
 const gain = Math.max(0, localFrac * naturalGain);
