@@ -1259,6 +1259,7 @@
   const SOFT_IC_CFG = {
     raysPerBundle: 41,
     thresholdRel: 0.35, // usable circle @ 35% of center illumination
+    localBandMm: 1.0,   // local brightness band around chief-field radius
     thetaStepDeg: 0.5,
     maxFieldDeg: 60,
     diagMarginMm: 0.75,
@@ -1278,15 +1279,6 @@
   let _softIcCacheKey = "";
   let _softIcCacheVal = null;
 
-  function medianAbs(values) {
-    if (!values || !values.length) return null;
-    const arr = values.slice().sort((a, b) => a - b);
-    const n = arr.length;
-    const mid = n >> 1;
-    if (n % 2) return arr[mid];
-    return 0.5 * (arr[mid - 1] + arr[mid]);
-  }
-
   function chiefRadiusAtFieldDeg(workSurfaces, fieldDeg, wavePreset, sensorX) {
     const chief = buildChiefRay(workSurfaces, fieldDeg);
     const tr = traceRayForward(clone(chief), workSurfaces, wavePreset);
@@ -1298,11 +1290,26 @@
   function traceBundleAtFieldForSoftIc(surfaces, fieldDeg, wavePreset, sensorX, raysPerBundle) {
     const rays = buildRays(surfaces, fieldDeg, raysPerBundle);
     const total = rays.length;
+    const rChief = chiefRadiusAtFieldDeg(surfaces, fieldDeg, wavePreset, sensorX);
+    const bandMm = Math.max(0.05, Number(SOFT_IC_CFG.localBandMm || 1.0));
     if (total < 3) {
-      return { total, good: 0, goodFrac: 0, mountClipped: 0, mountFrac: 1, rMm: null, yHits: [], valid: false };
+      return {
+        total,
+        good: 0,
+        goodFrac: 0,
+        localGood: 0,
+        localFrac: 0,
+        mountClipped: 0,
+        mountFrac: 1,
+        rMm: null,
+        rChief: Number.isFinite(rChief) ? rChief : null,
+        yHits: [],
+        valid: false,
+      };
     }
 
     let good = 0;
+    let localGood = 0;
     let mountClipped = 0;
     const yHits = [];
 
@@ -1314,18 +1321,22 @@
       const y = rayHitYAtX(tr.endRay, sensorX);
       if (!Number.isFinite(y)) continue;
       good++;
-      yHits.push(Math.abs(y));
+      const absY = Math.abs(y);
+      yHits.push(absY);
+      if (Number.isFinite(rChief) && Math.abs(absY - rChief) <= bandMm) localGood++;
     }
 
-    const rChief = chiefRadiusAtFieldDeg(surfaces, fieldDeg, wavePreset, sensorX);
-    const rMm = Number.isFinite(rChief) ? rChief : medianAbs(yHits);
+    const rMm = Number.isFinite(rChief) ? rChief : null;
     return {
       total,
       good,
       goodFrac: good / Math.max(1, total),
+      localGood,
+      localFrac: localGood / Math.max(1, total),
       mountClipped,
       mountFrac: mountClipped / Math.max(1, total),
       rMm: Number.isFinite(rMm) ? rMm : null,
+      rChief: Number.isFinite(rChief) ? rChief : null,
       yHits,
       valid: true,
     };
@@ -1478,8 +1489,8 @@
     computeVertices(work, lensShift, sensorX);
 
     const centerPack = traceBundleAtFieldForSoftIc(work, 0, wavePreset, sensorX, cfg.raysPerBundle);
-    const centerGoodFrac = Math.max(cfg.eps, centerPack.goodFrac);
-    if (centerGoodFrac <= cfg.eps * 1.01) {
+    const centerLocalFrac = Math.max(cfg.eps, Number(centerPack.localFrac || 0));
+    if (centerLocalFrac <= cfg.eps * 1.01) {
       return {
         softICmm: 0,
         rEdge: 0,
@@ -1488,7 +1499,8 @@
         usableCircleDiameterMm: 0,
         usableCircleRadiusMm: 0,
         relAtCutoff: 0,
-        centerGoodFrac,
+        centerGoodFrac: centerLocalFrac,
+        centerLocalFrac,
         samples: [],
         focusLensShift: lensShift,
         focusFailed: false,
@@ -1519,11 +1531,13 @@
       mapFailRun = 0;
 
       const goodFrac = clamp(pack.goodFrac, 0, 1);
+      const localFrac = clamp(Number(pack.localFrac || 0), 0, 1);
       fieldSamples.push({
         rMm,
         thetaDeg,
         goodFrac,
-        rawRel: clamp(goodFrac / centerGoodFrac, 0, 1),
+        localFrac,
+        rawRel: clamp(localFrac / centerLocalFrac, 0, 1),
         mountFrac: pack.mountFrac,
       });
 
@@ -1547,7 +1561,8 @@
         usableCircleDiameterMm: 0,
         usableCircleRadiusMm: 0,
         relAtCutoff: 0,
-        centerGoodFrac,
+        centerGoodFrac: centerLocalFrac,
+        centerLocalFrac,
         samples: [],
         focusLensShift: lensShift,
         focusFailed: false,
@@ -1560,6 +1575,7 @@
       const prev = merged[merged.length - 1];
       if (prev && s.rMm <= prev.rMm + 1e-6) {
         prev.goodFrac = Math.min(prev.goodFrac, s.goodFrac);
+        prev.localFrac = Math.min(prev.localFrac, s.localFrac);
         prev.rawRel = Math.min(prev.rawRel, s.rawRel);
         prev.mountFrac = Math.max(prev.mountFrac, s.mountFrac);
         prev.thetaDeg = Math.max(prev.thetaDeg, s.thetaDeg);
@@ -1572,13 +1588,15 @@
       merged.unshift({
         rMm: 0,
         thetaDeg: 0,
-        goodFrac: centerGoodFrac,
+        goodFrac: Math.max(0, Number(centerPack.goodFrac || 0)),
+        localFrac: centerLocalFrac,
         rawRel: 1,
         mountFrac: centerPack.mountFrac,
       });
     } else {
       merged[0].rMm = 0;
-      merged[0].goodFrac = Math.max(merged[0].goodFrac, centerGoodFrac);
+      merged[0].goodFrac = Math.max(merged[0].goodFrac, Number(centerPack.goodFrac || 0));
+      merged[0].localFrac = Math.max(merged[0].localFrac, centerLocalFrac);
       merged[0].rawRel = 1;
     }
 
@@ -1594,6 +1612,7 @@
         rMm: s.rMm,
         thetaDeg: s.thetaDeg,
         goodFrac: s.goodFrac,
+        localFrac: s.localFrac,
         relRaw: s.rawRel,
         relIllum,
         stopsDown: relIllum > cfg.eps ? -Math.log2(relIllum) : Infinity,
@@ -1627,7 +1646,8 @@
       usableCircleDiameterMm: softICmm,
       usableCircleRadiusMm: rEdge,
       relAtCutoff: Number(uc.relAtCutoff || 0),
-      centerGoodFrac,
+      centerGoodFrac: centerLocalFrac,
+      centerLocalFrac,
       samples,
       focusLensShift: lensShift,
       focusFailed: false,
@@ -1643,6 +1663,7 @@
       sensorH: Number(sensorH).toFixed(3),
       softCfg: {
         thresholdRel: Number(SOFT_IC_CFG.thresholdRel).toFixed(4),
+        localBandMm: Number(SOFT_IC_CFG.localBandMm).toFixed(3),
         thetaStepDeg: Number(SOFT_IC_CFG.thetaStepDeg).toFixed(4),
         maxFieldDeg: Number(SOFT_IC_CFG.maxFieldDeg).toFixed(3),
         smoothingHalfWindow: Number(SOFT_IC_CFG.smoothingHalfWindow).toFixed(0),
