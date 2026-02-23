@@ -3583,7 +3583,7 @@
   }
 
   function stageName(stage) {
-    if (stage === 0) return "FL lock";
+    if (stage === 0) return "FL acquire";
     if (stage === 1) return "IC growth";
     if (stage === 2) return "T tune";
     return "Sharpness";
@@ -3597,7 +3597,8 @@
     const eflErrRel = Number.isFinite(efl) && targetEfl > 1e-9
       ? Math.abs(efl - targetEfl) / targetEfl
       : Infinity;
-    const flInBand = eflErrRel <= OPT_STAGE_CFG.flBandRel;
+    // Tiny epsilon avoids "47.50mm @ target 50.00" floating-point edge misses.
+    const flInBand = eflErrRel <= (OPT_STAGE_CFG.flBandRel + 1e-4);
 
     const icMeasured = Number.isFinite(evalRes?.softIcMm) ? Number(evalRes.softIcMm) : 0;
     const icGoalMm = targetIC > 0 ? (targetIC * OPT_STAGE_CFG.icPassFrac) : 0;
@@ -3734,7 +3735,16 @@
       const temp = temp0 * (1 - a) + temp1 * a;
 
       const curPri = buildOptPriority(curEval, targets);
-      const cand = mutateLens(cur, mode, topo, { stage: curPri.stage, targetIC });
+      const bestPriPre = buildOptPriority(best.eval, targets);
+      const useBestBase = !!best?.lens && (
+        (flLocked && Math.random() < 0.88) ||
+        (!flLocked && Math.random() < 0.62) ||
+        (!Number.isFinite(curPri.eflErrRel)) ||
+        (curPri.eflErrRel > 0.35)
+      );
+      const baseLens = useBestBase ? best.lens : cur;
+      const basePri = useBestBase ? bestPriPre : curPri;
+      const cand = mutateLens(baseLens, mode, topo, { stage: basePri.stage, targetIC });
       const candEval = evalLensMerit(cand, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
       const candPri = buildOptPriority(candEval, targets);
 
@@ -3748,7 +3758,10 @@
         // Mild exploration only within the same stage and never violating FL lock.
         const sameStage = candPri.stage === curPri.stage;
         const d = candEval.score - curEval.score;
-        if (!flLocked && sameStage) {
+        const flNotMuchWorse = !Number.isFinite(curPri.eflErrRel)
+          ? Number.isFinite(candPri.eflErrRel)
+          : (candPri.eflErrRel <= curPri.eflErrRel * 1.12 + 0.005);
+        if (!flLocked && sameStage && flNotMuchWorse) {
           accept = (d <= 0) || (Math.random() < Math.exp(-Math.max(0, d) / Math.max(1e-9, temp)));
         }
       }
@@ -3776,6 +3789,19 @@
             `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
           );
         }
+      }
+
+      // Re-anchor when current drifts too far from best; keeps learning around elites.
+      const bestPriPost = buildOptPriority(best.eval, targets);
+      const curPriPost = buildOptPriority(curEval, targets);
+      const curMuchWorse =
+        (curPriPost.stage > bestPriPost.stage) ||
+        (curPriPost.eflErrRel > bestPriPost.eflErrRel + 0.08) ||
+        (curEval.score > best.eval.score * 2.4);
+      if (curMuchWorse && (i % Math.max(40, BATCH / 2) === 0)) {
+        cur = clone(best.lens);
+        curEval = best.eval;
+        flLocked = flLocked || bestPriPost.flInBand;
       }
 
       if (i % BATCH === 0){
