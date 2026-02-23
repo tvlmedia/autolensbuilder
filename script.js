@@ -2855,7 +2855,7 @@
     physWeight: 1.0,
     eflWeight: 1600.0,
     tSlowWeight: 2400.0,
-    tFastWeight: 220.0,
+    tFastWeight: 900.0,
     bflWeight: 2400.0,
     covWeight: 2600.0,
     focusTravelWeight: 40.0,
@@ -2868,7 +2868,7 @@
     guardFailPenalty: 900000.0,
     maxSurfaceCount: 32,
   };
-  const AD_BUILD_TAG = "v2-rescue-r22";
+  const AD_BUILD_TAG = "v2-rescue-r23";
 
   const AD_GLASS_CLASSES = {
     CROWN: ["N-BK7HT", "N-BAK4", "N-BAK2", "N-K5", "N-PSK3", "N-SK14"],
@@ -4227,9 +4227,15 @@
     const airGapSoftMax = Number(cfg.targetEfl || 50) <= 35
       ? 36
       : (Number(cfg.targetEfl || 50) <= 65 ? 30 : (Number(cfg.targetEfl || 50) <= 100 ? 44 : 60));
+    const bflSoftMaxByF = Number(cfg.targetEfl || 50) <= 32
+      ? Number(cfg.targetEfl || 50) * 2.8
+      : (Number(cfg.targetEfl || 50) <= 65
+        ? Number(cfg.targetEfl || 50) * 2.2
+        : Number(cfg.targetEfl || 50) * 2.6);
+    const bflSoftMax = Math.max(Number(cfg.bflMinMm || 52) + 8, bflSoftMaxByF);
     const archBad =
-      (Number.isFinite(lensLengthMm) && lensLengthMm > lenSoftMax * 1.35) ||
-      (Number.isFinite(maxAirGapMm) && maxAirGapMm > airGapSoftMax * 1.60);
+      (Number.isFinite(lensLengthMm) && lensLengthMm > lenSoftMax * 1.20) ||
+      (Number.isFinite(maxAirGapMm) && maxAirGapMm > airGapSoftMax * 1.45);
     let frontPenalty = 0;
     let frontWorstRatioExcess = 0;
     let frontWorstRadiusDeficit = 0;
@@ -4300,7 +4306,10 @@
     const tModelOk = Number.isFinite(T) && T > 0.2 && T < 20;
     const eflOk = Number.isFinite(efl) && eflErrFrac <= eflTol;
     const tOk = Number.isFinite(T) && T <= cfg.targetT * (1 + tSlack);
+    const tFastMin = Number(cfg.targetT || 2.0) * 0.72;
+    const tFastOk = Number.isFinite(T) && T >= tFastMin;
     const bflOk = Number.isFinite(bfl) && bfl >= cfg.bflMinMm;
+    const bflHighBad = Number.isFinite(bfl) && bfl > bflSoftMax * 1.22;
     const intrusionInfShift = focusInf.ok ? adRearIntrusionAtShift(surfaces, focusInf.shift) : Infinity;
     const intrusionNearShift = focusNear.ok ? adRearIntrusionAtShift(surfaces, focusNear.shift) : Infinity;
     const focusInfIntrusionOk = !focusInf.ok || intrusionInfShift <= 1e-6;
@@ -4352,6 +4361,8 @@
     if (!midSpotOk) reasons.push("MID_SPOT");
     if (!eflOk) reasons.push("EFL");
     if (!tOk) reasons.push("T");
+    if (!tFastOk) reasons.push("T_FAST");
+    if (bflHighBad) reasons.push("BFL_HIGH");
     if (!eflSignOk) reasons.push("EFL_SIGN");
     if (!tModelOk) reasons.push("T_MODEL");
 
@@ -4397,12 +4408,14 @@
     if (Number.isFinite(T)) {
       if (T > cfg.targetT) score += cfg.tSlowWeight * (T - cfg.targetT) ** 2;
       else score += cfg.tFastWeight * (cfg.targetT - T) ** 2;
+      if (T < tFastMin) score += cfg.tFastWeight * 2.2 * (tFastMin - T) ** 2;
     } else {
       score += cfg.tSlowWeight;
     }
     if (!tModelOk) score += cfg.guardFailPenalty * 3;
 
     if (Number.isFinite(bfl) && bfl < cfg.bflMinMm) score += cfg.bflWeight * (cfg.bflMinMm - bfl) ** 2;
+    if (Number.isFinite(bfl) && bfl > bflSoftMax) score += cfg.bflWeight * 0.95 * (bfl - bflSoftMax) ** 2;
     if (Number.isFinite(intrusion) && intrusion > 0) score += cfg.bflWeight * intrusion * intrusion;
     if (Number.isFinite(intrusionInfShift) && intrusionInfShift > 0) score += cfg.bflWeight * intrusionInfShift * intrusionInfShift;
     if (Number.isFinite(intrusionNearShift) && intrusionNearShift > 0) score += cfg.bflWeight * intrusionNearShift * intrusionNearShift;
@@ -4752,6 +4765,8 @@
     if (reasons.includes("ARCH")) r += 140_000_000;
     if (reasons.includes("EFL")) r += 120_000_000;
     if (reasons.includes("T")) r += 120_000_000;
+    if (reasons.includes("T_FAST")) r += 180_000_000;
+    if (reasons.includes("BFL_HIGH")) r += 220_000_000;
     if (reasons.includes("EFL_SIGN")) r += 1_400_000_000;
     if (reasons.includes("T_MODEL")) r += 280_000_000;
     const vfInf = Number(ev?.focusInf?.validFrac);
@@ -4790,8 +4805,9 @@
     if (Number.isFinite(t) && t > 0.1) {
       const tSlow = Math.max(0, (t - targetT) / targetT);
       const tFast = Math.max(0, (targetT - t) / targetT);
-      r += 220_000_000 * tSlow * tSlow + 60_000_000 * tFast * tFast;
+      r += 220_000_000 * tSlow * tSlow + 220_000_000 * tFast * tFast;
       if (tSlow > 0.45) r += 180_000_000 * (tSlow - 0.45);
+      if (tFast > 0.28) r += 180_000_000 * (tFast - 0.28);
     }
     const cInf = Number(ev?.focusInf?.rmsCenter);
     const cNear = Number(ev?.focusNear?.rmsCenter);
@@ -5217,31 +5233,73 @@
       const isUsableNear = (ev) => {
         if (!ev) return false;
         const targetE = Math.max(1, Number(cfg.targetEfl || 50));
+        const targetTUse = Math.max(0.6, Number(cfg.targetT || 2.0));
         const e = Number(ev.efl);
+        const bfl = Number(ev.bfl);
         const ic = Number(ev.icDiag);
         const vf = Number(ev.focusNear?.validFrac ?? ev.focusInf?.validFrac);
         const tVal = Number(ev.T);
+        const reasons = Array.isArray(ev.reasons) ? ev.reasons : [];
         if (!Number.isFinite(e) || e <= 1) return false;
         const eFrac = Math.abs(e - targetE) / targetE;
-        if (eFrac > 0.95) return false;
-        if (Number.isFinite(tVal) && tVal > Number(cfg.targetT || 2.0) * 2.2) return false;
-        if (!Number.isFinite(ic) || ic < 4) return false;
-        if (Number.isFinite(vf) && vf < 0.08) return false;
+        if (eFrac > 0.55) return false;
+        if (!Number.isFinite(tVal) || tVal > targetTUse * 2.0 || tVal < targetTUse * 0.60) return false;
+        if (!Number.isFinite(bfl) || bfl < Number(cfg.bflMinMm || 52) - 1.0) return false;
+        if (bfl > Math.max(120, targetE * 2.8)) return false;
+        if (!Number.isFinite(ic) || ic < 8) return false;
+        if (!Number.isFinite(vf) || vf < 0.12) return false;
+        if (reasons.includes("EFL_SIGN") || reasons.includes("T_MODEL")) return false;
         return true;
+      };
+      const evalMetric = (ev) => {
+        if (!ev) return 1e15;
+        return ev.valid ? Number(ev.score || 1e12) : adNearRank(ev, cfg);
+      };
+      const cmpEvalItem = (a, b) => {
+        const av = !!a?.eval?.valid;
+        const bv = !!b?.eval?.valid;
+        if (av !== bv) return av ? -1 : 1;
+        return evalMetric(a?.eval) - evalMetric(b?.eval);
       };
 
       const topSeeds = [];
       if (refineOnly) {
         appendADLog("Stage A skipped: refine-only mode.");
+        const baselineCandidates = [];
         const hasCurrentLens = Array.isArray(currentLensSnapshot?.surfaces) && currentLensSnapshot.surfaces.length >= 4;
-        const srcLens = hasCurrentLens
-          ? clone(currentLensSnapshot)
-          : (prevBest?.lens ? clone(prevBest.lens) : clone(currentLensSnapshot));
-        const srcLabel = hasCurrentLens ? "current lens/json" : (prevBest?.lens ? "previous best" : "current lens");
-        const warmInput = { lens: srcLens, eval: { lens: srcLens } };
-        const baseLens = adBuildWarmStartSeed(warmInput, cfg) || adConditionSeedLens(srcLens, cfg);
+        if (hasCurrentLens) {
+          const evCur = adEvaluateCandidate(currentLensSnapshot, cfg, { quick: false });
+          baselineCandidates.push({ label: "current lens/json", lens: clone(evCur.lens), eval: evCur });
+          appendADLog(`Refine source current: ${adFormatEval(evCur)}`);
+        }
+        if (prevBest?.lens) {
+          const evPrev = adEvaluateCandidate(prevBest.lens, cfg, { quick: false });
+          baselineCandidates.push({ label: "previous best", lens: clone(evPrev.lens), eval: evPrev });
+          appendADLog(`Refine source prev-best: ${adFormatEval(evPrev)}`);
+        }
+        const rescueFamily = adPrimaryRescueFamily(cfg.targetEfl);
+        const rescueSeed = adBuildRescueSeed(cfg, rescueFamily);
+        const evRescue = adEvaluateCandidate(rescueSeed, cfg, { quick: false });
+        baselineCandidates.push({ label: `rescue seed (${rescueFamily})`, lens: clone(evRescue.lens), eval: evRescue });
+        appendADLog(`Refine source rescue: ${adFormatEval(evRescue)}`);
+
+        baselineCandidates.sort(cmpEvalItem);
+        let baseChoice = baselineCandidates[0];
+        const usableChoices = baselineCandidates.filter((x) => x?.eval?.valid || isUsableNear(x?.eval));
+        if ((!baseChoice?.eval?.valid && !isUsableNear(baseChoice?.eval)) && usableChoices.length) {
+          usableChoices.sort(cmpEvalItem);
+          baseChoice = usableChoices[0];
+        }
+        if (!baseChoice) {
+          appendADLog("No refine baseline found; falling back to rescue seed.");
+          baseChoice = { label: `rescue seed (${rescueFamily})`, lens: clone(evRescue.lens), eval: evRescue };
+        }
+        appendADLog(`Refine baseline selected: ${baseChoice.label} • ${adFormatEval(baseChoice.eval)}`);
+
+        const warmInput = { lens: baseChoice.lens, eval: { lens: baseChoice.lens } };
+        const baseLens = adBuildWarmStartSeed(warmInput, cfg) || adConditionSeedLens(baseChoice.lens, cfg);
         const baseEval = adEvaluateCandidate(baseLens, cfg, { quick: false });
-        const baseItem = { family: `refine-base:${srcLabel}`, lens: clone(baseEval.lens), eval: baseEval };
+        const baseItem = { family: `refine-base:${baseChoice.label}`, lens: clone(baseEval.lens), eval: baseEval };
         const refinePool = [baseItem];
         appendADLog(`Refine baseline loaded: ${adFormatEval(baseEval)}`);
 
