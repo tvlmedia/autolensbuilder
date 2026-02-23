@@ -2834,7 +2834,7 @@
     guardFailPenalty: 900000.0,
     maxSurfaceCount: 32,
   };
-  const AD_BUILD_TAG = "v2-rescue-r12";
+  const AD_BUILD_TAG = "v2-rescue-r14";
 
   const AD_GLASS_CLASSES = {
     CROWN: ["N-BK7HT", "N-BAK4", "N-BAK2", "N-K5", "N-PSK3", "N-SK14"],
@@ -4388,6 +4388,37 @@
     return sanitizeLens(tmp);
   }
 
+  function adBuildWarmStartSeed(prevBest, cfg) {
+    const srcLens = prevBest?.eval?.lens || prevBest?.lens;
+    if (!srcLens) return null;
+    const tmp = sanitizeLens(clone(srcLens));
+    const s = tmp.surfaces;
+    const stopApTarget = adStopApFromTarget(cfg.targetEfl, cfg.targetT);
+
+    for (let i = 0; i < 14; i++) {
+      adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm, targetEfl: cfg.targetEfl });
+      adScaleTowardTargetEfl(s, cfg.targetEfl, cfg.wavePreset);
+      adNudgeStopToTargetT(s, cfg.targetT, cfg.wavePreset);
+      adNudgeBflForPL(s, cfg);
+      adNudgeCoverage(s, cfg.sensorW, cfg.sensorH, cfg.wavePreset, cfg.quickRayCount);
+      adQuickSanity(s, { targetStopAp: stopApTarget, minRearGap: cfg.minRearGapMm, targetEfl: cfg.targetEfl });
+    }
+    return sanitizeLens(tmp);
+  }
+
+  function adIsWarmStartCompatible(prevBest, cfg) {
+    if (!prevBest?.eval || !prevBest?.lens) return false;
+    const e = Number(prevBest.eval.efl);
+    const t = Number(prevBest.eval.T);
+    const bfl = Number(prevBest.eval.bfl);
+    if (!Number.isFinite(e) || e <= 1) return false;
+    const eFrac = Math.abs(e - Number(cfg.targetEfl || 50)) / Math.max(1, Number(cfg.targetEfl || 50));
+    if (eFrac > 1.20) return false;
+    if (Number.isFinite(t) && t > Number(cfg.targetT || 2.0) * 3.0) return false;
+    if (Number.isFinite(bfl) && bfl < Number(cfg.bflMinMm || AD_CFG.bflMinMm || 52) - 8) return false;
+    return true;
+  }
+
   async function adGenerateSeeds(cfg) {
     const pool = adFamilyPool(cfg.targetEfl, cfg.targetT, cfg.bflMinMm);
     const valid = [];
@@ -4701,6 +4732,7 @@
       logEvery: clamp(Math.round(AD_CFG.logEvery * Math.sqrt(effort)), 32, 320),
     };
 
+    const prevBest = adBest ? clone(adBest) : null;
     adRunning = true;
     adBest = null;
     adSetRunningUI(true);
@@ -4728,6 +4760,17 @@
         return;
       }
 
+      let warmStartItem = null;
+      if (adIsWarmStartCompatible(prevBest, cfg)) {
+        const warmLens = adBuildWarmStartSeed(prevBest, cfg);
+        if (warmLens) {
+          const warmEval = adEvaluateCandidate(warmLens, cfg, { quick: false });
+          warmStartItem = { family: "warm-prev", lens: clone(warmEval.lens), eval: warmEval };
+          seedPool.push(warmStartItem);
+          appendADLog(`Warm start loaded: ${adFormatEval(warmEval)}`);
+        }
+      }
+
       const hasTrueValid = seedPool.some((x) => !!x?.eval?.valid);
       const isUsableNear = (ev) => {
         if (!ev) return false;
@@ -4749,6 +4792,9 @@
         return adNearRank(a.eval, cfg) - adNearRank(b.eval, cfg);
       });
       const topSeeds = [];
+      if (warmStartItem && (warmStartItem.eval.valid || isUsableNear(warmStartItem.eval))) {
+        topSeeds.push(warmStartItem);
+      }
       const forcedFamilies = ["plbase", "distagon", "retrofocus"];
       for (const fam of forcedFamilies) {
         if (topSeeds.length >= cfg.topK) break;
@@ -4760,11 +4806,20 @@
       }
       for (const item of seedPool) {
         if (topSeeds.length >= cfg.topK) break;
+        if (topSeeds.includes(item)) continue;
         if (!item?.eval?.valid && !isUsableNear(item.eval)) continue;
         topSeeds.push(item);
       }
       if (!topSeeds.length && seedPool.length) {
         topSeeds.push(seedPool[0]);
+      }
+      const minTop = Math.min(3, seedPool.length, cfg.topK);
+      if (topSeeds.length < minTop) {
+        for (const item of seedPool) {
+          if (topSeeds.length >= minTop) break;
+          if (topSeeds.includes(item)) continue;
+          topSeeds.push(item);
+        }
       }
       const trueValidCount = seeds.valid.filter((x) => !!x?.eval?.valid).length;
       appendADLog(`Stage A done: ${trueValidCount} valid seeds (${seedPool.length} usable).`);
@@ -4816,6 +4871,45 @@
           globalBest = rescued;
           adBest = rescued;
           appendADLog(`Rescue done: ${adFormatEval(rescued.eval)}`);
+        }
+      }
+
+      if (!globalBest.eval.valid) {
+        appendADLog("Stage D: continuation from best candidate...");
+        const contCfg = {
+          ...cfg,
+          optimizeIters: clamp(Math.round(cfg.optimizeIters * 0.65), 280, 4200),
+          logEvery: clamp(Math.round(cfg.logEvery * 0.85), 28, 280),
+          tempStart: Math.max(0.7, cfg.tempStart * 0.72),
+          tempEnd: Math.max(0.04, cfg.tempEnd * 0.70),
+          invalidRestartEvery: clamp(Math.round(cfg.invalidRestartEvery * 0.75), 40, 140),
+          covWeight: cfg.covWeight * 1.45,
+          vigWeight: cfg.vigWeight * 1.35,
+          midRmsWeight: cfg.midRmsWeight * 1.35,
+        };
+        const continued = await adOptimizeSeed(
+          { family: "continuation", lens: clone(globalBest.lens), eval: clone(globalBest.eval) },
+          contCfg,
+          1,
+          1,
+        );
+        if (!adRunning) return;
+        if (
+          continued?.eval && (
+            continued.eval.valid ||
+            (
+              !globalBest.eval.valid &&
+              adNearRank(continued.eval, cfg) < adNearRank(globalBest.eval, cfg)
+            ) ||
+            (
+              globalBest.eval.valid &&
+              continued.eval.score < globalBest.eval.score
+            )
+          )
+        ) {
+          globalBest = continued;
+          adBest = continued;
+          appendADLog(`Continuation done: ${adFormatEval(continued.eval)}`);
         }
       }
 
