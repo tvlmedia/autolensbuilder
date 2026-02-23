@@ -1260,20 +1260,45 @@
     stepMm: 1.0,
     sampleCount: 15,
     raysPerBundle: 41,
-    maxFieldDeg: 60,
-    solveIters: 20,
     relMin: 0.20,
     mountMaxFrac: 0.02,
     drasticSlopePerMm: 0.10,
+    minFailRadiusMm: 3.0,
     eps: 1e-6,
   };
 
   let _softIcCacheKey = "";
   let _softIcCacheVal = null;
 
-  function traceBundleThroughputAtField(surfaces, fieldDeg, wavePreset, sensorX, raysPerBundle) {
+  function buildTargetedBundleRaysForRadius(surfaces, rTargetMm, sensorX, raysPerBundle, cfg = SOFT_IC_CFG) {
     const n = Math.max(9, Math.min(101, (Number(raysPerBundle) | 0) || 41));
-    const rays = buildRays(surfaces, fieldDeg, n);
+    const targetY = Math.abs(Number(rTargetMm || 0));
+    const backOffset = Math.max(20, Number(cfg.backOffsetMm || 80));
+    const { xRef, apRef } = getRayReferencePlane(surfaces);
+    const rays = [];
+
+    for (let k = 0; k < n; k++) {
+      const a = (k / (n - 1)) * 2 - 1;
+      const yRef = a * apRef;
+      let dx = sensorX - xRef;
+      if (!Number.isFinite(dx) || Math.abs(dx) < 1e-9) dx = 1e-9;
+      const dy = targetY - yRef;
+      const dir = normalize({ x: dx, y: dy });
+      if (!Number.isFinite(dir.x) || !Number.isFinite(dir.y) || Math.abs(dir.x) < 1e-9) continue;
+      const slope = dir.y / dir.x;
+      const x0 = xRef - backOffset;
+      const y0 = yRef - slope * backOffset; // ensure the ray passes through (xRef, yRef)
+      rays.push({ p: { x: x0, y: y0 }, d: dir });
+    }
+    return rays;
+  }
+
+  function traceTargetedBundleThroughputAtRadius(surfaces, rTargetMm, wavePreset, sensorX, raysPerBundle, cfg = SOFT_IC_CFG) {
+    const rays = buildTargetedBundleRaysForRadius(surfaces, rTargetMm, sensorX, raysPerBundle, cfg);
+    const total = rays.length;
+    if (total < 3) {
+      return { total, good: 0, goodFrac: 0, mountClipped: 0, mountFrac: 1, valid: false };
+    }
 
     let good = 0;
     let mountClipped = 0;
@@ -1286,61 +1311,14 @@
       if (Number.isFinite(y)) good++;
     }
 
-    const total = n;
     return {
       total,
       good,
       goodFrac: good / Math.max(1, total),
       mountClipped,
       mountFrac: mountClipped / Math.max(1, total),
+      valid: true,
     };
-  }
-
-  function bundleCenterSensorRadiusAtFieldDeg(surfaces, fieldDeg, wavePreset, sensorX) {
-    const rays = buildRays(surfaces, fieldDeg, 9);
-    if (!rays.length) return null;
-    const mid = rays[(rays.length / 2) | 0];
-    const tr = traceRayForward(clone(mid), surfaces, wavePreset);
-    if (!tr || !tr.endRay || tr.tir || tr.vignetted || tr.clippedByMount) return null;
-    const y = rayHitYAtX(tr.endRay, sensorX);
-    return Number.isFinite(y) ? Math.abs(y) : null;
-  }
-
-  function findFieldDegForRadius(surfaces, rTargetMm, wavePreset, sensorX, cfg = SOFT_IC_CFG) {
-    const target = Math.max(0, Number(rTargetMm || 0));
-    const maxField = Math.max(5, Number(cfg.maxFieldDeg || 60));
-    const iters = Math.max(8, Number(cfg.solveIters || 20) | 0);
-    const step = Math.max(0.25, Number(cfg.fieldStepDeg || 1.0));
-
-    if (target <= 1e-9) return 0;
-
-    let lo = 0;
-    const y0 = bundleCenterSensorRadiusAtFieldDeg(surfaces, lo, wavePreset, sensorX);
-    if (!Number.isFinite(y0)) return null;
-
-    let hi = null;
-    for (let th = step; th <= maxField + 1e-9; th += step) {
-      const y = bundleCenterSensorRadiusAtFieldDeg(surfaces, th, wavePreset, sensorX);
-      if (!Number.isFinite(y)) continue;
-      if (y >= target) {
-        hi = th;
-        break;
-      }
-      lo = th;
-    }
-    if (!Number.isFinite(hi)) return null;
-
-    for (let i = 0; i < iters; i++) {
-      const mid = 0.5 * (lo + hi);
-      const yMid = bundleCenterSensorRadiusAtFieldDeg(surfaces, mid, wavePreset, sensorX);
-      if (!Number.isFinite(yMid)) {
-        hi = mid;
-        continue;
-      }
-      if (yMid < target) lo = mid;
-      else hi = mid;
-    }
-    return 0.5 * (lo + hi);
   }
 
   function sampleRadii(halfDiag, cfg = SOFT_IC_CFG) {
@@ -1378,13 +1356,8 @@
 
     const lensShift = af.shift;
     computeVertices(work, lensShift, sensorX);
-    const mapDebug = {
-      y5: bundleCenterSensorRadiusAtFieldDeg(work, 5, wavePreset, sensorX),
-      y10: bundleCenterSensorRadiusAtFieldDeg(work, 10, wavePreset, sensorX),
-      y20: bundleCenterSensorRadiusAtFieldDeg(work, 20, wavePreset, sensorX),
-    };
 
-    const centerPack = traceBundleThroughputAtField(work, 0, wavePreset, sensorX, cfg.raysPerBundle);
+    const centerPack = traceTargetedBundleThroughputAtRadius(work, 0, wavePreset, sensorX, cfg.raysPerBundle, cfg);
     const centerGoodFrac = Math.max(cfg.eps, centerPack.goodFrac);
     if (centerGoodFrac <= cfg.eps * 1.01) {
       return {
@@ -1396,7 +1369,6 @@
         focusLensShift: lensShift,
         focusFailed: false,
         drasticDropRadiusMm: null,
-        mapDebug,
       };
     }
 
@@ -1406,16 +1378,17 @@
     let firstFail = null;
     let prev = null;
     let drasticDropRadiusMm = null;
+    let failRun = 0;
+    const minFailRadiusMm = Math.max(0, Number(cfg.minFailRadiusMm || 3));
 
     for (const rTarget of radii) {
-      const thetaDeg = findFieldDegForRadius(work, rTarget, wavePreset, sensorX, cfg);
-      if (!Number.isFinite(thetaDeg)) break;
-      const pack = traceBundleThroughputAtField(work, thetaDeg, wavePreset, sensorX, cfg.raysPerBundle);
+      const pack = traceTargetedBundleThroughputAtRadius(work, rTarget, wavePreset, sensorX, cfg.raysPerBundle, cfg);
+      if (!pack.valid) continue;
       const relIllum = clamp(pack.goodFrac / centerGoodFrac, 0, 1);
       const stopsDown = relIllum > cfg.eps ? -Math.log2(relIllum) : Infinity;
       const pass = (relIllum >= cfg.relMin) && (pack.mountFrac <= cfg.mountMaxFrac);
 
-      const s = { rMm: rTarget, thetaDeg, goodFrac: pack.goodFrac, relIllum, stopsDown, mountFrac: pack.mountFrac, pass };
+      const s = { rMm: rTarget, thetaDeg: null, goodFrac: pack.goodFrac, relIllum, stopsDown, mountFrac: pack.mountFrac, pass };
       samples.push(s);
 
       if (prev && drasticDropRadiusMm == null) {
@@ -1425,8 +1398,14 @@
       }
       prev = s;
 
-      if (pass) lastPass = s;
-      else if (lastPass && !firstFail) firstFail = s;
+      if (pass) {
+        lastPass = s;
+        failRun = 0;
+      } else if (lastPass && s.rMm >= minFailRadiusMm) {
+        if (!firstFail) firstFail = s;
+        failRun++;
+        if (failRun >= 2) break; // avoid stopping on a single glitch
+      }
     }
 
     let rEdge = lastPass ? lastPass.rMm : 0;
@@ -1448,7 +1427,6 @@
       focusLensShift: lensShift,
       focusFailed: false,
       drasticDropRadiusMm,
-      mapDebug,
     };
   }
 
@@ -2289,10 +2267,6 @@
       : `FOV: H ${fov.hfov.toFixed(1)}° • V ${fov.vfov.toFixed(1)}° • D ${fov.dfov.toFixed(1)}°`;
 
     const softIc = getSoftIcForCurrentLens(lens.surfaces, sensorW, sensorH, wavePreset, rayCount);
-    const dbgY5 = softIc?.mapDebug?.y5;
-    const dbgY10 = softIc?.mapDebug?.y10;
-    const dbgY20 = softIc?.mapDebug?.y20;
-    const mapDbgTxt = `map y@5:${Number.isFinite(dbgY5)?dbgY5.toFixed(1):"—"} y@10:${Number.isFinite(dbgY10)?dbgY10.toFixed(1):"—"} y@20:${Number.isFinite(dbgY20)?dbgY20.toFixed(1):"—"}`;
     const softIcTxt = softIc.focusFailed
       ? "SoftIC20: focus failed"
       : `SoftIC20: ${softIc.softICmm.toFixed(2)}mm • center ${(softIc.centerGoodFrac * 100).toFixed(0)}%`;
@@ -2384,8 +2358,7 @@
     if (ui.metaInfo) {
       ui.metaInfo.textContent =
         `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm • ` +
-        (softIc.focusFailed ? "SoftIC20 focus failed" : `SoftIC20 ${softIc.softICmm.toFixed(2)}mm`) +
-        ` • ${mapDbgTxt}`;
+        (softIc.focusFailed ? "SoftIC20 focus failed" : `SoftIC20 ${softIc.softICmm.toFixed(2)}mm`);
     }
 
     resizeCanvasToCSS();
@@ -2418,7 +2391,6 @@
       tGeomTxt,
       tpTxt,
       softIcTxt,
-      mapDbgTxt,
       fovTxt,
       rearTxt,
       lenTxt,
