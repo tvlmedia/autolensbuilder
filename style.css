@@ -228,18 +228,6 @@ body{
 }
 .ctrl input[type="range"]{ padding:0; height:34px; }
 
-#adLog{
-  min-height:104px;
-  max-height:60vh;
-}
-#adLog.adLogExpanded{
-  min-height:320px;
-  height:320px;
-}
-.isHidden{
-  display:none !important;
-}
-
 /* ===========================
    TABLE
    =========================== */

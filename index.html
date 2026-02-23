@@ -40,9 +40,13 @@
       <button id="btnScaleToFocal" class="btn" type="button">Scale → FL</button>
       <button id="btnSetTStop" class="btn" type="button">Set T</button>
       <button id="btnAutoFocus" class="btn" type="button">Auto focus</button>
-      <button id="btnAutoDesign" class="btn btnPrimary" type="button">Autodesign Prime</button>
-      <button id="btnAutoDesignPreview" class="btn" type="button">Preview Best</button>
-      <button id="btnAutoDesignStop" class="btn" type="button">Stop AD</button>
+
+      <div class="sep" aria-hidden="true"></div>
+
+      <button id="btnOptStart" class="btn btnPrimary" type="button">Optimize</button>
+      <button id="btnOptStop" class="btn" type="button">Stop</button>
+      <button id="btnOptApply" class="btn" type="button">Apply best</button>
+      <button id="btnOptBench" class="btn" type="button" title="Ruwe snelheidstest (200 evals)">Bench</button>
 
       <div class="sep" aria-hidden="true"></div>
 
@@ -127,50 +131,41 @@
             <div class="ctrl two ctrlDivider"></div>
 
             <div class="ctrl two">
-              <div class="subTitle">Autodesigner v2</div>
-              <div class="hint" style="margin-top:6px">Input: Target EFL + Target T. Sensor/Mount/IC guards staan vast op Alexa LF + PL.</div>
+              <div class="subTitle">Optimizer</div>
+              <div class="hint" style="margin-top:6px">Merit is 'lager = beter'. Optimizer probeert random + slimme mutaties en bewaart beste design.</div>
             </div>
 
             <div class="ctrl">
-              <label for="adTargetEFL">Target EFL (mm)</label>
-              <input id="adTargetEFL" type="number" step="0.1" value="50" />
+              <label for="optTargetFL">Target FL (mm)</label>
+              <input id="optTargetFL" type="number" step="0.1" value="75" />
             </div>
 
             <div class="ctrl">
-              <label for="adTargetT">Target T</label>
-              <input id="adTargetT" type="number" step="0.05" value="2.0" />
+              <label for="optTargetT">Target T</label>
+              <input id="optTargetT" type="number" step="0.05" value="2.0" />
             </div>
 
             <div class="ctrl">
-              <label for="adFocusTarget">Focus target</label>
-              <select id="adFocusTarget">
-                <option value="both" selected>Infinity + 2000mm</option>
-                <option value="inf">Infinity only</option>
-                <option value="near">2000mm only</option>
+              <label for="optIters">Iterations</label>
+              <input id="optIters" type="number" step="1" value="2000" min="10" />
+            </div>
+
+            <div class="ctrl">
+              <label for="optPop">Exploration</label>
+              <select id="optPop">
+                <option value="safe" selected>Safe</option>
+                <option value="wild">Wild</option>
               </select>
             </div>
 
-            <div class="ctrl">
-              <label for="adAttempts">Attempts / Effort</label>
-              <input id="adAttempts" type="number" step="1" min="1" max="12" value="1" />
-            </div>
-
-            <div class="ctrl">
-              <button id="btnAdLogExpand" class="btn" type="button">Bigger log</button>
-            </div>
-
-            <div class="ctrl">
-              <button id="btnAdToggleDetails" class="btn" type="button">Collapse details</button>
-            </div>
-
             <div class="ctrl two">
-              <label for="adLog">Autodesigner log</label>
-              <textarea id="adLog" class="glassNote" rows="4" readonly>—</textarea>
+              <label for="optLog">Optimizer log</label>
+              <textarea id="optLog" class="glassNote" rows="3" readonly>—</textarea>
             </div>
           </div>
         </section>
 
-        <section id="surfaceTableWrap" class="tableWrap" aria-label="Surface table">
+        <section class="tableWrap" aria-label="Surface table">
           <table class="tbl" aria-describedby="surfaceTableHelp">
             <thead>
               <tr>
@@ -191,7 +186,7 @@
         </section>
       </div>
 
-      <section id="statusPanel" class="status" aria-label="Status">
+      <section class="status" aria-label="Status">
         <div id="statusText" class="statusLine">—</div>
 
         <div class="badges">
