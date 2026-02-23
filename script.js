@@ -1444,12 +1444,18 @@
     const validFrac = pack ? ((pack.n || 0) / Math.max(1, rayCount)) : null;
     const insideFrac = Number.isFinite(pack?.insideFrac) ? pack.insideFrac : null;
 
-    const reqVigOk = Number.isFinite(vigFrac) && vigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac;
-    const reqValidOk = Number.isFinite(validFrac) && validFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
+    const pack0 = traceBundleAtFieldCoverage(surfaces, 0, rayCount, wavePreset, sensorX, halfEff);
+    const baseVig = Number.isFinite(pack0?.vigFrac) ? pack0.vigFrac : 1;
+    const baseValid = pack0 ? ((pack0.n || 0) / Math.max(1, rayCount)) : 0;
+
+    const reqVigOkAbs = Number.isFinite(vigFrac) && vigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac;
+    const reqVigOkRel = Number.isFinite(vigFrac) && (vigFrac - baseVig) <= IMAGE_CIRCLE_CFG.maxExtraReqVigFrac;
+    const reqValidOkAbs = Number.isFinite(validFrac) && validFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
+    const reqValidOkRel = Number.isFinite(validFrac) && validFrac >= (baseValid - IMAGE_CIRCLE_CFG.maxReqValidDrop);
     const reqInsideOk = Number.isFinite(insideFrac) && insideFrac >= IMAGE_CIRCLE_CFG.minReqInsideFrac;
 
     return {
-      ok: !!chiefOk && reqVigOk && reqValidOk && reqInsideOk,
+      ok: !!chiefOk && reqVigOkAbs && reqVigOkRel && reqValidOkAbs && reqValidOkRel && reqInsideOk,
       req,
       vigFrac,
       validFrac,
@@ -1582,9 +1588,11 @@
   };
   const IMAGE_CIRCLE_CFG = {
     minDiagMm: 45.0,        // full-frame coverage floor with small margin
-    maxReqVigFrac: 0.0,     // at required edge: no hard-clipped rays
-    minReqValidFrac: 0.995, // at required edge: essentially all rays must remain valid
-    minReqInsideFrac: 0.995,// at required edge: essentially all rays must stay inside sensor edge
+    maxReqVigFrac: 0.16,    // absolute ceiling: too much clipping is always a fail
+    minReqValidFrac: 0.82,  // absolute floor
+    minReqInsideFrac: 0.90, // absolute floor for sensor-edge containment
+    maxExtraReqVigFrac: 0.05, // edge clipping over on-axis baseline
+    maxReqValidDrop: 0.10,    // max allowed valid-ray drop vs on-axis baseline
     sensorClipTolMm: 0.02,  // tiny tolerance for floating-point/rounding at the edge
     edgeGuardMm: 0.90,      // safety margin so a reported "45mm" is visually clean in preview
   };
