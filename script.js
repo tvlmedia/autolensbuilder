@@ -1228,8 +1228,8 @@
   }
 
   const IMG_CIRCLE_CFG = {
-    subtleVignetteFrac: 0.02, // no visible hard circular edge at the claimed IC
-    minValidFrac: 0.95,       // near-full transmission at the claimed IC edge
+    subtleVignetteFrac: 0.12, // allow slight edge falloff, reject clear hard cutoff
+    minValidFrac: 0.55,       // enough rays must remain to consider field usable
     maxFieldDeg: 60,
     coarseStepDeg: 1.5,
     refineIters: 10,
@@ -1245,6 +1245,21 @@
     return defaultTargetImageCircleMm(sensorW, sensorH);
   }
 
+  function bundleCenterHalfHeightMm(traces, sensorX) {
+    const ys = [];
+    for (const tr of traces || []) {
+      if (!tr || tr.vignetted || tr.tir || !tr.endRay) continue;
+      const y = rayHitYAtX(tr.endRay, sensorX);
+      if (Number.isFinite(y)) ys.push(y);
+    }
+    if (!ys.length) return null;
+    ys.sort((a, b) => a - b);
+    const mid = (ys.length - 1) * 0.5;
+    const lo = Math.floor(mid), hi = Math.ceil(mid);
+    const yMed = (ys[lo] + ys[hi]) * 0.5;
+    return Math.abs(yMed);
+  }
+
   function imageCircleEdgeSample(surfaces, fieldDeg, rayCount, wavePreset, sensorX, opts = {}) {
     const minRays = Math.max(9, Number(opts.minRays || 15));
     const maxRays = Math.max(minRays, Number(opts.maxRays || 41));
@@ -1256,19 +1271,11 @@
     if (pack.vigFrac > maxVig) return null;
     if (validFrac < minValid) return null;
 
-    const chief = buildChiefRay(surfaces, fieldDeg);
-    let chiefTr = traceRayForward(clone(chief), surfaces, wavePreset);
-    if ((!chiefTr || chiefTr.vignetted || chiefTr.tir || !chiefTr.endRay) && Math.abs(fieldDeg) < 1e-9) {
-      const xStart = (surfaces[0]?.vx ?? 0) - 120;
-      const axisRay = { p: { x: xStart, y: 0 }, d: { x: 1, y: 0 } };
-      chiefTr = traceRayForward(clone(axisRay), surfaces, wavePreset);
-    }
-    if (!chiefTr || chiefTr.vignetted || chiefTr.tir || !chiefTr.endRay) return null;
-    const chiefY = rayHitYAtX(chiefTr.endRay, sensorX);
-    if (!Number.isFinite(chiefY)) return null;
+    const halfByCenter = bundleCenterHalfHeightMm(pack.traces, sensorX);
+    if (!Number.isFinite(halfByCenter)) return null;
 
     return {
-      halfSizeMm: Math.abs(chiefY),
+      halfSizeMm: Math.abs(halfByCenter),
       vigFrac: pack.vigFrac,
       validFrac,
       fieldDeg,
@@ -1282,6 +1289,14 @@
     let loField = 0;
     let hiField = step;
     let best = imageCircleEdgeSample(surfaces, 0, rayCount, wavePreset, sensorX, opts);
+    if (!best) {
+      // center fallback: if center already has heavy clipping, still report a conservative non-zero IC
+      best = imageCircleEdgeSample(surfaces, 0, rayCount, wavePreset, sensorX, {
+        ...opts,
+        subtleVignetteFrac: 0.60,
+        minValidFrac: 0.20,
+      });
+    }
     if (!best) return { diameterMm: 0, halfSizeMm: 0, edgeFieldDeg: 0, vigFrac: 1, validFrac: 0 };
 
     for (let f = step; f <= hiMax + 1e-9; f += step) {
