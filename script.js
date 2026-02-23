@@ -1260,12 +1260,17 @@
     stepMm: 1.0,
     sampleCount: 15,
     raysPerBundle: 41,
-    relMin: 0.20,
-    mountMaxFrac: 0.02,
+    relMin: 0.22,
+    mountMaxFrac: 0.015,
     drasticSlopePerMm: 0.10,
     minFailRadiusMm: 3.0,
     eps: 1e-6,
   };
+
+  function softIcLabel(cfg = SOFT_IC_CFG) {
+    const pct = Math.round(Number(cfg?.relMin ?? 0) * 100);
+    return `SoftIC${pct}`;
+  }
 
   let _softIcCacheKey = "";
   let _softIcCacheVal = null;
@@ -2267,9 +2272,10 @@
       : `FOV: H ${fov.hfov.toFixed(1)}° • V ${fov.vfov.toFixed(1)}° • D ${fov.dfov.toFixed(1)}°`;
 
     const softIc = getSoftIcForCurrentLens(lens.surfaces, sensorW, sensorH, wavePreset, rayCount);
+    const softIcName = softIcLabel();
     const softIcTxt = softIc.focusFailed
-      ? "SoftIC20: focus failed"
-      : `SoftIC20: ${softIc.softICmm.toFixed(2)}mm • center ${(softIc.centerGoodFrac * 100).toFixed(0)}%`;
+      ? `${softIcName}: focus failed`
+      : `${softIcName}: ${softIc.softICmm.toFixed(2)}mm • center ${(softIc.centerGoodFrac * 100).toFixed(0)}%`;
 
     const distPct = estimateDistortionPct(lens.surfaces, wavePreset, sensorX, sensorW, sensorH, efl, "d");
 
@@ -2324,9 +2330,7 @@
     }
     if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
     if (ui.softIC) {
-      ui.softIC.textContent = softIc.focusFailed
-        ? "SoftIC20: focus failed"
-        : `SoftIC20: ${softIc.softICmm.toFixed(2)}mm • center ${(softIc.centerGoodFrac * 100).toFixed(0)}%`;
+      ui.softIC.textContent = softIcTxt;
     }
     if (ui.dist) ui.dist.textContent = `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
     if (ui.fov) ui.fov.textContent = fovTxt;
@@ -2334,7 +2338,7 @@
     if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
     if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T_eff≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
-    if (ui.softICTop) ui.softICTop.textContent = ui.softIC?.textContent || "SoftIC20: —";
+    if (ui.softICTop) ui.softICTop.textContent = ui.softIC?.textContent || `${softIcName}: —`;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.distTop) ui.distTop.textContent = ui.dist?.textContent || `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
 
@@ -2358,7 +2362,7 @@
     if (ui.metaInfo) {
       ui.metaInfo.textContent =
         `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm • ` +
-        (softIc.focusFailed ? "SoftIC20 focus failed" : `SoftIC20 ${softIc.softICmm.toFixed(2)}mm`);
+        (softIc.focusFailed ? `${softIcName} focus failed` : `${softIcName} ${softIc.softICmm.toFixed(2)}mm`);
     }
 
     resizeCanvasToCSS();
