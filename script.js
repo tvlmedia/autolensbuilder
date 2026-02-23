@@ -1336,15 +1336,27 @@
   }
 
   function chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, fieldDeg) {
-    const chief2 = buildChiefRay(surfaces, fieldDeg);
-    const chief = {
-      p: { x: chief2.p.x, y: chief2.p.y, z: 0 },
-      d: { x: chief2.d.x, y: chief2.d.y, z: 0 },
+    const chiefF = buildChiefRay(surfaces, fieldDeg);
+    const rayF = {
+      p: { x: chiefF.p.x, y: chiefF.p.y, z: 0 },
+      d: { x: chiefF.d.x, y: chiefF.d.y, z: 0 },
     };
-    const tr = traceRayForward3D(clone(chief), surfaces, wavePreset);
-    if (!tr || tr.vignetted || tr.tir) return null;
-    const hit = rayHitAtX3D(tr.endRay, sensorX);
-    return Number.isFinite(hit?.y) ? Math.abs(hit.y) : null;
+    const trF = traceRayForward3D(clone(rayF), surfaces, wavePreset);
+    if (!trF || trF.vignetted || trF.tir) return null;
+    const hitF = rayHitAtX3D(trF.endRay, sensorX);
+    if (!hitF) return null;
+
+    const chief0 = buildChiefRay(surfaces, 0);
+    const ray0 = {
+      p: { x: chief0.p.x, y: chief0.p.y, z: 0 },
+      d: { x: chief0.d.x, y: chief0.d.y, z: 0 },
+    };
+    const tr0 = traceRayForward3D(clone(ray0), surfaces, wavePreset);
+    if (!tr0 || tr0.vignetted || tr0.tir) return null;
+    const hit0 = rayHitAtX3D(tr0.endRay, sensorX);
+    if (!hit0) return null;
+
+    return Math.hypot(hitF.y - hit0.y, hitF.z - hit0.z);
   }
 
   // Inverse chief mapping: which field angle lands chief ray at this sensor half-size.
@@ -1410,6 +1422,66 @@
       else hi = mid;
     }
     return best;
+  }
+
+  function evaluateCoverageAtHalfMm(surfaces, wavePreset, sensorX, halfMm, rayCount = 101) {
+    const half = Math.max(0.05, Number(halfMm) || 0);
+    const req = requiredFieldForSensorHalfMm(surfaces, wavePreset, sensorX, half);
+    if (!Number.isFinite(req)) {
+      return {
+        ok: false, req: null,
+        vigFrac: null, validFrac: null, insideFrac: null,
+        reqVigPct: null, reqValidPct: null, reqInsidePct: null,
+      };
+    }
+
+    const halfEff = Math.max(0.05, half - Math.max(0, IMAGE_CIRCLE_CFG.edgeGuardMm || 0));
+    const chiefR = chiefImageHeightAtFieldMm(surfaces, wavePreset, sensorX, req);
+    const chiefOk = Number.isFinite(chiefR) && chiefR <= halfEff + (IMAGE_CIRCLE_CFG.sensorClipTolMm || 0);
+
+    const pack = traceBundleAtFieldCoverage(surfaces, req, rayCount, wavePreset, sensorX, halfEff);
+    const vigFrac = Number.isFinite(pack?.vigFrac) ? pack.vigFrac : null;
+    const validFrac = pack ? ((pack.n || 0) / Math.max(1, rayCount)) : null;
+    const insideFrac = Number.isFinite(pack?.insideFrac) ? pack.insideFrac : null;
+
+    const reqVigOk = Number.isFinite(vigFrac) && vigFrac <= IMAGE_CIRCLE_CFG.maxReqVigFrac;
+    const reqValidOk = Number.isFinite(validFrac) && validFrac >= IMAGE_CIRCLE_CFG.minReqValidFrac;
+    const reqInsideOk = Number.isFinite(insideFrac) && insideFrac >= IMAGE_CIRCLE_CFG.minReqInsideFrac;
+
+    return {
+      ok: !!chiefOk && reqVigOk && reqValidOk && reqInsideOk,
+      req,
+      vigFrac,
+      validFrac,
+      insideFrac,
+      reqVigPct: Number.isFinite(vigFrac) ? Math.round(vigFrac * 100) : null,
+      reqValidPct: Number.isFinite(validFrac) ? Math.round(validFrac * 100) : null,
+      reqInsidePct: Number.isFinite(insideFrac) ? Math.round(insideFrac * 100) : null,
+    };
+  }
+
+  function solveImageCircleHalfMm(surfaces, wavePreset, sensorX, rayCount = 101, maxHalfMm = 60) {
+    const maxHalf = Math.max(0.5, Number(maxHalfMm) || 60);
+    let lo = 0;
+    let hi = maxHalf;
+    let best = { ok: true, req: 0, vigFrac: 0, validFrac: 1, insideFrac: 1, reqVigPct: 0, reqValidPct: 100, reqInsidePct: 100 };
+
+    const hiEval = evaluateCoverageAtHalfMm(surfaces, wavePreset, sensorX, hi, rayCount);
+    if (hiEval.ok) {
+      return { halfMm: hi, diagMm: 2 * hi, maxField: hiEval.req, evalAtHalf: hiEval };
+    }
+
+    for (let i = 0; i < 20; i++) {
+      const mid = 0.5 * (lo + hi);
+      const ev = evaluateCoverageAtHalfMm(surfaces, wavePreset, sensorX, mid, rayCount);
+      if (ev.ok) {
+        lo = mid;
+        best = ev;
+      } else {
+        hi = mid;
+      }
+    }
+    return { halfMm: lo, diagMm: 2 * lo, maxField: best.req, evalAtHalf: best };
   }
 
   // -------------------- EFL/BFL (paraxial-ish) --------------------
@@ -2471,31 +2543,26 @@
     const icProbeHalfMm = Math.max(covHalfMm, COVERAGE_CFG.icProbeHalfMm);
     const strictRayCount = Math.max(rayCount, COVERAGE_CFG.displayRayCount);
     const icTargetDiag = (covMode === "d") ? (2 * covHalfMm) : null;
-    const maxField = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, covHalfMm, strictRayCount);
-    const maxFieldIc = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, icProbeHalfMm, strictRayCount);
-    const req = requiredFieldForSensorHalfMm(lens.surfaces, wavePreset, sensorX, covHalfMm);
-    const covers = Number.isFinite(req) ? (maxField + COVERAGE_CFG.marginDeg >= req) : false;
+    const targetEval = evaluateCoverageAtHalfMm(lens.surfaces, wavePreset, sensorX, covHalfMm, strictRayCount);
+    const req = targetEval.req;
+    const covers = !!targetEval.ok;
+    const icSolve = solveImageCircleHalfMm(lens.surfaces, wavePreset, sensorX, strictRayCount, icProbeHalfMm);
+    const maxField = Number.isFinite(icSolve.maxField) ? icSolve.maxField : 0;
+    const maxFieldIc = maxField;
 
     let covTxt = !fov
       ? "COV(D): —"
-      : `COV(D): ±${maxField.toFixed(1)}° • REQ(D): ${(req ?? 0).toFixed(1)}° • ${covers ? "COVERS ✅" : "NO ❌"}`;
+      : `COV(D): ±${maxField.toFixed(1)}° • REQ(D): ${Number.isFinite(req) ? req.toFixed(1) : "—"}° • ${covers ? "COVERS ✅" : "NO ❌"}`;
     const distPct = estimateDistortionPct(lens.surfaces, wavePreset, sensorX, sensorW, sensorH, efl, covMode);
 
-    const reqHalfEff = Math.max(0.1, covHalfMm - Math.max(0, IMAGE_CIRCLE_CFG.edgeGuardMm || 0));
-    const packReqStrict = Number.isFinite(req) && req > 0
-      ? traceBundleAtFieldCoverage(lens.surfaces, req, strictRayCount, wavePreset, sensorX, reqHalfEff)
-      : null;
-    const reqVigFracStrict = Number.isFinite(packReqStrict?.vigFrac) ? packReqStrict.vigFrac : null;
-    const reqValidFracStrict = packReqStrict ? ((packReqStrict.n || 0) / Math.max(1, strictRayCount)) : null;
-    const reqInsideFracStrict = Number.isFinite(packReqStrict?.insideFrac) ? packReqStrict.insideFrac : null;
+    const reqVigFracStrict = targetEval.vigFrac;
+    const reqValidFracStrict = targetEval.validFrac;
+    const reqInsideFracStrict = targetEval.insideFrac;
     const reqVigPctStrict = Number.isFinite(reqVigFracStrict) ? Math.round(reqVigFracStrict * 100) : null;
     const reqValidPctStrict = Number.isFinite(reqValidFracStrict) ? Math.round(reqValidFracStrict * 100) : null;
     const reqInsidePctStrict = Number.isFinite(reqInsideFracStrict) ? Math.round(reqInsideFracStrict * 100) : null;
 
-    const imageCircleDiagStrict = imageCircleDiagFromTracedFieldMm(lens.surfaces, wavePreset, sensorX, maxFieldIc);
-    const imageCircleDiag = Number.isFinite(imageCircleDiagStrict)
-      ? imageCircleDiagStrict
-      : imageCircleDiagFromHalfFieldMm(efl, maxFieldIc);
+    const imageCircleDiag = Number.isFinite(icSolve.diagMm) ? icSolve.diagMm : null;
     const imageCircleTarget = Number.isFinite(icTargetDiag)
       ? icTargetDiag
       : imageCircleDiagFromHalfFieldMm(efl, req);
