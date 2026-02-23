@@ -1520,9 +1520,9 @@
     computeVertices(work, lensShift, sensorX);
 
     const centerPack = traceBundleAtFieldForSoftIc(work, 0, wavePreset, sensorX, cfg.raysPerBundle);
-    const centerLocalFrac = Math.max(cfg.eps, Number(centerPack.localFrac || 0));
-    const centerNatural = naturalCos4AtSensorRadius(work, 0, sensorX);
-    const centerGain = Math.max(cfg.eps, centerLocalFrac * centerNatural);
+    const centerGoodFrac  = Math.max(cfg.eps, Number(centerPack.goodFrac || 0));
+const centerNatural   = naturalCos4AtSensorRadius(work, 0, sensorX); // is ~1
+const centerGain      = Math.max(cfg.eps, centerGoodFrac * centerNatural);
     if (centerGain <= cfg.eps * 1.01) {
       return {
         softICmm: 0,
@@ -1564,10 +1564,10 @@
       }
       mapFailRun = 0;
 
-      const goodFrac = clamp(pack.goodFrac, 0, 1);
-      const localFrac = clamp(Number(pack.localFrac || 0), 0, 1);
-      const naturalGain = naturalCos4AtSensorRadius(work, rMm, sensorX);
-      const gain = clamp(localFrac * naturalGain, 0, 1);
+     const goodFrac = clamp(pack.goodFrac, 0, 1);
+const naturalGain = naturalCos4AtSensorRadius(work, rMm, sensorX);
+const gain = clamp(goodFrac * naturalGain, 0, 1);
+rawRel = clamp(gain / centerGain, 0, 1);
       fieldSamples.push({
         rMm,
         thetaDeg,
