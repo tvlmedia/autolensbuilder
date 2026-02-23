@@ -558,6 +558,14 @@
     scheduleAutosave();
   }
 
+
+   function median(arr){
+  if (!arr || arr.length === 0) return null;
+  const a = arr.slice().sort((x,y)=>x-y);
+  const m = (a.length/2)|0;
+  return (a.length % 2) ? a[m] : 0.5*(a[m-1]+a[m]);
+}
+   
   // -------------------- math helpers --------------------
   function normalize(v) {
     const m = Math.hypot(v.x, v.y);
@@ -1325,39 +1333,63 @@
     }
 
     let good = 0;
-    let localGood = 0;
-    let mountClipped = 0;
-    const yHits = [];
+let mountClipped = 0;
+const yHits = [];
 
-    for (const ray of rays) {
-      const tr = traceRayForward(clone(ray), surfaces, wavePreset);
-      if (!tr || tr.tir || !tr.endRay) continue;
-      if (tr.clippedByMount) mountClipped++;
-      if (tr.vignetted) continue;
-      const y = rayHitYAtX(tr.endRay, sensorX);
-      if (!Number.isFinite(y)) continue;
-      good++;
-      const absY = Math.abs(y);
-      yHits.push(absY);
-      if (Number.isFinite(rChief) && Math.abs(absY - rChief) <= bandMm) localGood++;
-    }
+for (const ray of rays) {
+  const tr = traceRayForward(clone(ray), surfaces, wavePreset);
+  if (!tr || tr.tir || !tr.endRay) continue;
+  if (tr.clippedByMount) mountClipped++;
+  if (tr.vignetted) continue;
 
-    const rMm = Number.isFinite(rChief) ? rChief : null;
-   const gf = good / Math.max(1, total);
+  const y = rayHitYAtX(tr.endRay, sensorX);
+  if (!Number.isFinite(y)) continue;
 
-// center-field: definieer “illumination @ center” als 1.0
-let lf = localGood / Math.max(1, total);
-if (Math.abs(fieldDeg) <= 1e-9) {
-  lf = 1.0;
-  localGood = good;
+  good++;
+  yHits.push(Math.abs(y));
 }
+
+const rMm = Number.isFinite(rChief) ? rChief : null;
+
+// ---- local ring "illumination" proxy via density ----
+// idee: I(r) ~ 1 / (median spacing van rays rond rChief)
+let localDensity = 0;
+if (yHits.length >= 7 && Number.isFinite(rMm)) {
+  const ys = yHits.slice().sort((a,b)=>a-b);
+
+  // find closest index to rMm
+  let bestI = 0;
+  let bestD = Infinity;
+  for (let i=0;i<ys.length;i++){
+    const d = Math.abs(ys[i]-rMm);
+    if (d < bestD){ bestD=d; bestI=i; }
+  }
+
+  const k = 3; // window half-width
+  const i0 = Math.max(1, bestI - k);
+  const i1 = Math.min(ys.length - 2, bestI + k);
+
+  const deltas = [];
+  for (let i=i0;i<=i1;i++){
+    const d = ys[i+1] - ys[i];
+    if (d > 1e-9) deltas.push(d);
+  }
+
+  const md = median(deltas);
+  if (md != null) localDensity = 1 / (md + 1e-9);
+}
+
+// center-field: definieer density=1 (normalisatie gebeurt later)
+if (Math.abs(fieldDeg) <= 1e-9) localDensity = 1.0;
 
 return {
   total,
   good,
-  goodFrac: gf,
-  localGood,
-  localFrac: lf,
+  goodFrac: good / Math.max(1, total),
+
+  // vervang localFrac door density (mag >1 zijn)
+  localFrac: localDensity,
+
   mountClipped,
   mountFrac: mountClipped / Math.max(1, total),
   rMm: Number.isFinite(rMm) ? rMm : null,
@@ -1365,7 +1397,6 @@ return {
   yHits,
   valid: true,
 };
-  }
 
   function computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg = SOFT_IC_CFG) {
     const minN = Math.max(3, Number(cfg.minSamplesForCurve || 8) | 0);
@@ -1586,8 +1617,8 @@ const localFrac = clamp(Number(pack.localFrac || 0), 0, 1);
 const naturalGain = naturalCos4AtSensorRadius(work, rMm, sensorX);
 
 // illumination proxy op radius r: “hoeveel rays vallen in de ring” * cos^4
-const gain = clamp(localFrac * naturalGain, 0, 1);
-
+const gain = Math.max(0, localFrac * naturalGain);
+       
 fieldSamples.push({
   rMm,
   thetaDeg,
@@ -1657,8 +1688,8 @@ fieldSamples.push({
     }
 
     const radialMm = merged.map((s) => s.rMm);
-    const gainCurve = merged.map((s) => clamp(Number(s.gain || 0), 0, 1));
-    const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg);
+const gainCurve = merged.map((s) => Math.max(0, Number(s.gain || 0)));
+     const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, cfg);
 
     const relCurve = (uc.relCurve?.length === merged.length)
       ? uc.relCurve
