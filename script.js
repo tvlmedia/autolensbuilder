@@ -1014,6 +1014,7 @@
     let pts = [];
     let vignetted = false;
     let tir = false;
+    let clippedByMount = false;
 
     pts.push({ x: ray.p.x, y: ray.p.y });
 
@@ -1031,7 +1032,7 @@
       const mountHit = (!skipIMS && nBefore <= 1.000001)
         ? mountClipHitAlongRay(ray, hitInfo?.t ?? Infinity)
         : null;
-      if (mountHit) { pts.push(mountHit.hit); vignetted = true; break; }
+      if (mountHit) { pts.push(mountHit.hit); vignetted = true; clippedByMount = true; break; }
 
       if (!hitInfo) { vignetted = true; break; }
 
@@ -1059,7 +1060,7 @@
       nBefore = nAfter;
     }
 
-    return { pts, vignetted, tir, endRay: ray };
+    return { pts, vignetted, tir, clippedByMount, endRay: ray };
   }
 
   // -------------------- ray bundles --------------------
@@ -1251,6 +1252,207 @@
     if (mode === "v") return Math.max(0.1, sensorH * 0.5);
     const d = Math.hypot(sensorW, sensorH);
     return Math.max(0.1, d * 0.5);
+  }
+
+  const SOFT_IC_CFG = {
+    stepMm: 1.0,
+    sampleCount: 15,
+    raysPerBundle: 41,
+    maxFieldDeg: 60,
+    solveIters: 20,
+    relMin: 0.20,
+    mountMaxFrac: 0.02,
+    drasticSlopePerMm: 0.10,
+    eps: 1e-6,
+  };
+
+  let _softIcCacheKey = "";
+  let _softIcCacheVal = null;
+
+  function traceBundleThroughputAtField(surfaces, fieldDeg, wavePreset, sensorX, raysPerBundle) {
+    const n = Math.max(9, Math.min(101, (Number(raysPerBundle) | 0) || 41));
+    const rays = buildRays(surfaces, fieldDeg, n);
+
+    let good = 0;
+    let mountClipped = 0;
+    for (const r of rays) {
+      const tr = traceRayForward(clone(r), surfaces, wavePreset);
+      if (!tr || tr.tir || !tr.endRay) continue;
+      if (tr.clippedByMount) mountClipped++;
+      if (tr.vignetted) continue;
+      const y = rayHitYAtX(tr.endRay, sensorX);
+      if (Number.isFinite(y)) good++;
+    }
+
+    const total = n;
+    return {
+      total,
+      good,
+      goodFrac: good / Math.max(1, total),
+      mountClipped,
+      mountFrac: mountClipped / Math.max(1, total),
+    };
+  }
+
+  function chiefSensorRadiusAtFieldDeg(surfaces, fieldDeg, wavePreset, sensorX) {
+    const chief = buildChiefRay(surfaces, fieldDeg);
+    const tr = traceRayForward(clone(chief), surfaces, wavePreset);
+    if (!tr || !tr.endRay || tr.tir || tr.vignetted) return null;
+    const y = rayHitYAtX(tr.endRay, sensorX);
+    if (!Number.isFinite(y)) return null;
+    return Math.abs(y);
+  }
+
+  function findFieldDegForRadius(surfaces, rTargetMm, wavePreset, sensorX, cfg = SOFT_IC_CFG) {
+    const target = Math.max(0, Number(rTargetMm || 0));
+    const maxField = Math.max(5, Number(cfg.maxFieldDeg || 60));
+    const iters = Math.max(8, Number(cfg.solveIters || 20) | 0);
+
+    if (target <= 1e-9) return 0;
+
+    let lo = 0;
+    let hi = maxField;
+    let yLo = chiefSensorRadiusAtFieldDeg(surfaces, lo, wavePreset, sensorX);
+    let yHi = chiefSensorRadiusAtFieldDeg(surfaces, hi, wavePreset, sensorX);
+    if (!Number.isFinite(yLo)) return null;
+    if (!Number.isFinite(yHi) || yHi < target) return null;
+
+    for (let i = 0; i < iters; i++) {
+      const mid = 0.5 * (lo + hi);
+      const yMid = chiefSensorRadiusAtFieldDeg(surfaces, mid, wavePreset, sensorX);
+      if (!Number.isFinite(yMid)) {
+        hi = mid;
+        continue;
+      }
+      if (yMid < target) lo = mid;
+      else hi = mid;
+    }
+    return 0.5 * (lo + hi);
+  }
+
+  function sampleRadii(halfDiag, cfg = SOFT_IC_CFG) {
+    const stepMm = Math.max(0.2, Number(cfg.stepMm || 1.0));
+    const list = [];
+    for (let r = 0; r <= halfDiag + 1e-9; r += stepMm) list.push(Math.min(halfDiag, r));
+    if (list[list.length - 1] < halfDiag - 1e-9) list.push(halfDiag);
+    if (list.length < 3) {
+      const n = Math.max(3, Number(cfg.sampleCount || 15) | 0);
+      list.length = 0;
+      for (let i = 0; i < n; i++) list.push((i / (n - 1)) * halfDiag);
+    }
+    return list;
+  }
+
+  function estimateSoftImageCircleStandalone(surfaces, sensorW, sensorH, wavePreset, rayCount) {
+    const cfg = SOFT_IC_CFG;
+    const sensorX = 0.0;
+    const halfDiag = 0.5 * Math.hypot(sensorW, sensorH);
+    const work = clone(surfaces);
+
+    const af = bestLensShiftForDesign(work, 0, rayCount, wavePreset);
+    if (!af.ok) {
+      return {
+        softICmm: 0,
+        rEdge: 0,
+        relMin: cfg.relMin,
+        centerGoodFrac: 0,
+        samples: [],
+        focusLensShift: 0,
+        focusFailed: true,
+        drasticDropRadiusMm: null,
+      };
+    }
+
+    const lensShift = af.shift;
+    computeVertices(work, lensShift, sensorX);
+
+    const centerPack = traceBundleThroughputAtField(work, 0, wavePreset, sensorX, cfg.raysPerBundle);
+    const centerGoodFrac = Math.max(cfg.eps, centerPack.goodFrac);
+    if (centerGoodFrac <= cfg.eps * 1.01) {
+      return {
+        softICmm: 0,
+        rEdge: 0,
+        relMin: cfg.relMin,
+        centerGoodFrac,
+        samples: [],
+        focusLensShift: lensShift,
+        focusFailed: false,
+        drasticDropRadiusMm: null,
+      };
+    }
+
+    const radii = sampleRadii(halfDiag, cfg);
+    const samples = [];
+    let lastPass = null;
+    let firstFail = null;
+    let prev = null;
+    let drasticDropRadiusMm = null;
+
+    for (const rTarget of radii) {
+      const thetaDeg = findFieldDegForRadius(work, rTarget, wavePreset, sensorX, cfg);
+      if (!Number.isFinite(thetaDeg)) break;
+      const pack = traceBundleThroughputAtField(work, thetaDeg, wavePreset, sensorX, cfg.raysPerBundle);
+      const relIllum = clamp(pack.goodFrac / centerGoodFrac, 0, 1);
+      const stopsDown = relIllum > cfg.eps ? -Math.log2(relIllum) : Infinity;
+      const pass = (relIllum >= cfg.relMin) && (pack.mountFrac <= cfg.mountMaxFrac);
+
+      const s = { rMm: rTarget, thetaDeg, goodFrac: pack.goodFrac, relIllum, stopsDown, mountFrac: pack.mountFrac, pass };
+      samples.push(s);
+
+      if (prev && drasticDropRadiusMm == null) {
+        const dr = Math.max(1e-9, s.rMm - prev.rMm);
+        const slope = (prev.relIllum - s.relIllum) / dr;
+        if (slope > cfg.drasticSlopePerMm) drasticDropRadiusMm = s.rMm;
+      }
+      prev = s;
+
+      if (pass) lastPass = s;
+      else if (lastPass && !firstFail) firstFail = s;
+    }
+
+    let rEdge = lastPass ? lastPass.rMm : 0;
+    if (lastPass && firstFail) {
+      const a = firstFail.relIllum - lastPass.relIllum;
+      if (Math.abs(a) > 1e-9) {
+        const t = clamp((cfg.relMin - lastPass.relIllum) / a, 0, 1);
+        rEdge = lastPass.rMm + (firstFail.rMm - lastPass.rMm) * t;
+      }
+    }
+    rEdge = clamp(rEdge, 0, halfDiag);
+
+    return {
+      softICmm: 2 * rEdge,
+      rEdge,
+      relMin: cfg.relMin,
+      centerGoodFrac,
+      samples,
+      focusLensShift: lensShift,
+      focusFailed: false,
+      drasticDropRadiusMm,
+    };
+  }
+
+  function getSoftIcForCurrentLens(surfaces, sensorW, sensorH, wavePreset, rayCount) {
+    const keyObj = {
+      wavePreset,
+      rayCount,
+      sensorW: Number(sensorW).toFixed(3),
+      sensorH: Number(sensorH).toFixed(3),
+      surfaces: (surfaces || []).map((s) => ({
+        type: String(s.type || ""),
+        R: Number(s.R || 0).toFixed(6),
+        t: Number(s.t || 0).toFixed(6),
+        ap: Number(s.ap || 0).toFixed(6),
+        glass: String(s.glass || "AIR"),
+        stop: !!s.stop,
+      })),
+    };
+    const key = JSON.stringify(keyObj);
+    if (key === _softIcCacheKey && _softIcCacheVal) return _softIcCacheVal;
+    const val = estimateSoftImageCircleStandalone(surfaces, sensorW, sensorH, wavePreset, rayCount);
+    _softIcCacheKey = key;
+    _softIcCacheVal = val;
+    return val;
   }
 
   function estimateDistortionPct(surfaces, wavePreset, sensorX, sensorW, sensorH, efl, mode = "d") {
@@ -2066,6 +2268,11 @@
       ? "FOV: —"
       : `FOV: H ${fov.hfov.toFixed(1)}° • V ${fov.vfov.toFixed(1)}° • D ${fov.dfov.toFixed(1)}°`;
 
+    const softIc = getSoftIcForCurrentLens(lens.surfaces, sensorW, sensorH, wavePreset, rayCount);
+    const softIcTxt = softIc.focusFailed
+      ? "SoftIC20: focus failed"
+      : `SoftIC20: ${softIc.softICmm.toFixed(2)}mm • center ${(softIc.centerGoodFrac * 100).toFixed(0)}%`;
+
     const distPct = estimateDistortionPct(lens.surfaces, wavePreset, sensorX, sensorW, sensorH, efl, "d");
 
     const rearVx = lastPhysicalVertexX(lens.surfaces);
@@ -2142,9 +2349,13 @@
 
     if (ui.status) {
       ui.status.textContent =
-        `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${meritTxt}`;
+        `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${softIcTxt} • ${meritTxt}`;
     }
-    if (ui.metaInfo) ui.metaInfo.textContent = `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm`;
+    if (ui.metaInfo) {
+      ui.metaInfo.textContent =
+        `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm • ` +
+        (softIc.focusFailed ? "SoftIC20 focus failed" : `SoftIC20 ${softIc.softICmm.toFixed(2)}mm`);
+    }
 
     resizeCanvasToCSS();
     const r = canvas.getBoundingClientRect();
@@ -2175,6 +2386,7 @@
       tTxt,
       tGeomTxt,
       tpTxt,
+      softIcTxt,
       fovTxt,
       rearTxt,
       lenTxt,
