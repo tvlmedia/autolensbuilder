@@ -3346,6 +3346,7 @@
     const stage = Number(opt?.stage ?? 0);
     const targetIC = Math.max(0, Number(opt?.targetIC || 0));
     const icStage = (stage === 1 && targetIC > 0);
+    const keepFl = !!opt?.keepFl;
 
     const s = L.surfaces;
 
@@ -3371,6 +3372,15 @@
     // main: perturb a few parameters
     let kChanges = mode === "wild" ? 6 : 3;
     if (icStage) kChanges += (mode === "wild" ? 5 : 4);
+    if (icStage && keepFl) kChanges += 2;
+
+    const radiusScale = keepFl ? (mode === "wild" ? 0.12 : 0.06) : (mode === "wild" ? 0.35 : 0.18);
+    const thickScale  = keepFl ? (mode === "wild" ? 0.18 : 0.08) : (mode === "wild" ? 0.55 : 0.25);
+
+    const rThresh = (!icStage ? 0.45 : (keepFl ? 0.12 : 0.30));
+    const tThresh = (!icStage ? 0.70 : (keepFl ? 0.24 : 0.48));
+    const aThresh = (!icStage ? 0.88 : (keepFl ? 0.99 : 0.98));
+
     for (let c=0;c<kChanges;c++){
       const idxs = s.map((x,i)=>({x,i})).filter(o=>!surfaceIsLocked(o.x));
       if (!idxs.length) break;
@@ -3378,20 +3388,18 @@
       const ss = o.x;
 
       const choice = Math.random();
-      if ((!icStage && choice < 0.45) || (icStage && choice < 0.30)){
+      if (choice < rThresh){
         // radius tweak
-        const scale = mode === "wild" ? 0.35 : 0.18;
-        const d = randn() * scale;
+        const d = randn() * radiusScale;
         const R = Number(ss.R || 0);
         const absR = Math.max(PHYS_CFG.minRadius, Math.abs(R));
         const newAbs = absR * (1 + d);
         ss.R = (R >= 0 ? 1 : -1) * clamp(newAbs, PHYS_CFG.minRadius, 450);
-      } else if ((!icStage && choice < 0.70) || (icStage && choice < 0.48)){
+      } else if (choice < tThresh){
         // thickness tweak
-        const scale = mode === "wild" ? 0.55 : 0.25;
-        const d = randn() * scale;
+        const d = randn() * thickScale;
         ss.t = clamp(Number(ss.t||0) * (1 + d), PHYS_CFG.minThickness, 42);
-      } else if ((!icStage && choice < 0.88) || (icStage && choice < 0.98)){
+      } else if (choice < aThresh){
         // aperture tweak
         if (icStage) {
           // In IC phase, strongly prefer larger clear apertures.
@@ -3461,6 +3469,35 @@
     quickSanity(s);
     if (topo) enforceTopology(s, topo);
     return sanitizeLens(L);
+  }
+
+  function nudgeLensTowardFocal(lensObj, targetEfl, wavePreset, strength = 0.6, maxStep = 0.20) {
+    if (!lensObj?.surfaces || !(Number.isFinite(targetEfl) && targetEfl > 1)) return false;
+    const surfaces = lensObj.surfaces;
+    computeVertices(surfaces, 0, 0);
+    const p = estimateEflBflParaxial(surfaces, wavePreset);
+    const efl = Number(p?.efl);
+    if (!(Number.isFinite(efl) && efl > 1e-6)) return false;
+
+    const kRaw = targetEfl / efl;
+    if (!Number.isFinite(kRaw) || kRaw <= 0) return false;
+
+    const s = clamp(Number(strength), 0, 1);
+    const cap = clamp(Number(maxStep), 0.01, 0.60);
+    const k = clamp(1 + (kRaw - 1) * s, 1 - cap, 1 + cap);
+    if (!Number.isFinite(k) || Math.abs(k - 1) < 1e-6) return false;
+
+    for (let i = 0; i < surfaces.length; i++) {
+      const ss = surfaces[i];
+      if (surfaceIsLocked(ss)) continue;
+      const t = String(ss?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      ss.R = Number(ss.R || 0) * k;
+      ss.t = clamp(Number(ss.t || 0) * k, PHYS_CFG.minThickness, 42);
+      ss.ap = clamp(Number(ss.ap || 0) * k, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+    }
+    quickSanity(surfaces);
+    return true;
   }
 
   function evalLensMerit(lensObj, {
@@ -3744,7 +3781,20 @@
       );
       const baseLens = useBestBase ? best.lens : cur;
       const basePri = useBestBase ? bestPriPre : curPri;
-      const cand = mutateLens(baseLens, mode, topo, { stage: basePri.stage, targetIC });
+      const cand = mutateLens(baseLens, mode, topo, { stage: basePri.stage, targetIC, keepFl: flLocked });
+      // Keep FL search from hovering around ~5% by adding a small deterministic focal nudge.
+      if (basePri.stage === 0) {
+        const nearEdge = Number.isFinite(basePri.eflErrRel) && basePri.eflErrRel <= 0.08;
+        nudgeLensTowardFocal(
+          cand,
+          targetEfl,
+          wavePreset,
+          nearEdge ? 0.95 : 0.75,
+          nearEdge ? 0.08 : 0.20
+        );
+      } else if (flLocked && Math.random() < 0.85) {
+        nudgeLensTowardFocal(cand, targetEfl, wavePreset, 0.28, 0.04);
+      }
       const candEval = evalLensMerit(cand, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
       const candPri = buildOptPriority(candEval, targets);
 
