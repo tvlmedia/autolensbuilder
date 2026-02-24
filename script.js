@@ -3716,6 +3716,17 @@
     return A.score - B.score;
   }
 
+  function planEnergy(pri) {
+    if (!pri) return Infinity;
+    return (
+      pri.stage * 100000 +
+      pri.eflErrRel * 10000 +
+      pri.icNeedMm * 220 +
+      pri.tErrAbs * 95 +
+      pri.sharpness * 15
+    );
+  }
+
   function isEvalBetterByPlan(a, b, targets) {
     return compareEvalByPlan(a, b, targets) < 0;
   }
@@ -3783,30 +3794,42 @@
 
       const curPri = buildOptPriority(curEval, targets);
       const bestPriPre = buildOptPriority(best.eval, targets);
-      const useBestBase = !!best?.lens && (
-        (flLocked && Math.random() < 0.88) ||
-        (!flLocked && Math.random() < 0.62) ||
-        (!Number.isFinite(curPri.eflErrRel)) ||
-        (curPri.eflErrRel > 0.35)
-      );
-      const baseLens = useBestBase ? best.lens : cur;
-      const basePri = useBestBase ? bestPriPre : curPri;
-      const cand = mutateLens(baseLens, mode, topo, { stage: basePri.stage, targetIC, keepFl: flLocked });
-      // Keep FL search from hovering around ~5% by adding a small deterministic focal nudge.
-      if (basePri.stage === 0) {
-        const nearEdge = Number.isFinite(basePri.eflErrRel) && basePri.eflErrRel <= 0.03;
-        nudgeLensTowardFocal(
-          cand,
-          targetEfl,
-          wavePreset,
-          nearEdge ? 1.0 : 0.82,
-          nearEdge ? 0.06 : 0.18
+      const tries = (curPri.stage === 1)
+        ? (flLocked ? 5 : 3)
+        : (flLocked ? 3 : 2);
+      let cand = null;
+      let candEval = null;
+      let candPri = null;
+      for (let trIdx = 0; trIdx < tries; trIdx++) {
+        const useBestBase = !!best?.lens && (
+          (flLocked && Math.random() < 0.92) ||
+          (!flLocked && Math.random() < 0.66) ||
+          (!Number.isFinite(curPri.eflErrRel)) ||
+          (curPri.eflErrRel > 0.35)
         );
-      } else if (flLocked && Math.random() < 0.85) {
-        nudgeLensTowardFocal(cand, targetEfl, wavePreset, 0.36, 0.04);
+        const baseLens = useBestBase ? best.lens : cur;
+        const basePri = useBestBase ? bestPriPre : curPri;
+        const c = mutateLens(baseLens, mode, topo, { stage: basePri.stage, targetIC, keepFl: flLocked });
+        // Keep FL search from hovering around ~5% by adding a small deterministic focal nudge.
+        if (basePri.stage === 0) {
+          const nearEdge = Number.isFinite(basePri.eflErrRel) && basePri.eflErrRel <= 0.03;
+          nudgeLensTowardFocal(
+            c,
+            targetEfl,
+            wavePreset,
+            nearEdge ? 1.0 : 0.82,
+            nearEdge ? 0.06 : 0.18
+          );
+        } else if (flLocked && Math.random() < 0.90) {
+          nudgeLensTowardFocal(c, targetEfl, wavePreset, 0.40, 0.045);
+        }
+        const ce = evalLensMerit(c, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+        if (!candEval || isEvalBetterByPlan(ce, candEval, targets)) {
+          cand = c;
+          candEval = ce;
+          candPri = buildOptPriority(ce, targets);
+        }
       }
-      const candEval = evalLensMerit(cand, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
-      const candPri = buildOptPriority(candEval, targets);
 
       let accept = false;
       // Once we have entered FL band, never accept candidates outside the 5% band.
@@ -3818,14 +3841,17 @@
       } else if (isEvalBetterByPlan(candEval, curEval, targets)) {
         accept = true;
       } else {
-        // Mild exploration only within the same stage and never violating FL lock.
+        // Controlled exploration within FL constraints, to avoid optimizer stagnation.
         const sameStage = candPri.stage === curPri.stage;
-        const d = candEval.score - curEval.score;
-        const flNotMuchWorse = !Number.isFinite(curPri.eflErrRel)
-          ? Number.isFinite(candPri.eflErrRel)
-          : (candPri.eflErrRel <= curPri.eflErrRel * 1.12 + 0.005);
-        if (!flLocked && sameStage && flNotMuchWorse) {
-          accept = (d <= 0) || (Math.random() < Math.exp(-Math.max(0, d) / Math.max(1e-9, temp)));
+        if (sameStage) {
+          const dE = planEnergy(candPri) - planEnergy(curPri);
+          const tempScale = (curPri.stage === 1 ? 520 : 300) * Math.max(0.10, temp);
+          const uphillProb = Math.exp(-Math.max(0, dE) / Math.max(1e-6, tempScale));
+          if (flLocked) {
+            accept = Math.random() < uphillProb;
+          } else {
+            accept = (dE <= 0) || (Math.random() < uphillProb);
+          }
         }
       }
       if (accept){
