@@ -1280,6 +1280,8 @@
     flBandRel: 0.05,      // once FL is in +/-5%, keep all accepted updates in this band
     flStageRel: 0.01,     // do not leave FL phase until within +/-1%
     flPreferRel: 0.002,   // in later phases, do not accept >0.2% FL degradation
+    flHoldRel: 0.013,     // hard FL hold after lock (about +/-1.3%)
+    icStageDriftRel: 0.006, // allow a bit more FL drift during IC growth
     icPassFrac: 0.95,     // IC phase is "good enough" at >=95% of requested IC
     tGoodAbs: 0.25,       // T phase considered good when absolute T error <= 0.25
   };
@@ -3473,6 +3475,91 @@
     return sanitizeLens(L);
   }
 
+  function applyCoverageBoostMutation(
+    surfaces,
+    { targetIC = 0, targetEfl = 50, targetT = 0, icNeedMm = 0, keepFl = false } = {}
+  ) {
+    if (!Array.isArray(surfaces) || surfaces.length < 3) return;
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    const need = Math.max(0, Number(icNeedMm || 0));
+    const growth = clamp(
+      1.10 + 0.06 * Math.random() + Math.min(0.22, need * 0.012),
+      1.08,
+      keepFl ? 1.28 : 1.35
+    );
+
+    for (let i = 0; i < surfaces.length; i++) {
+      const s = surfaces[i];
+      if (surfaceIsLocked(s)) continue;
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+
+      const rear = (stopIdx >= 0 && i > stopIdx && i < surfaces.length - 1);
+      const localGrow = growth * (rear ? (1.04 + Math.random() * 0.08) : 1.0);
+      let ap = Number(s.ap || 0) * localGrow;
+
+      // Keep aperture growth physically reachable by growing radius together.
+      const signR = Math.sign(Number(s.R || 1)) || 1;
+      let absR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(s.R || 0)));
+      const needAbsR = (ap / AP_SAFETY) * 1.10;
+      if (absR < needAbsR) {
+        const alpha = keepFl ? 0.58 : 0.74;
+        absR = absR + (needAbsR - absR) * alpha;
+      }
+      s.R = signR * clamp(absR, PHYS_CFG.minRadius, 600);
+
+      s.ap = clamp(ap, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+      const tGrow = rear ? (1.02 + Math.random() * 0.08) : (1.01 + Math.random() * 0.05);
+      s.t = clamp(Number(s.t || 0) * tGrow, PHYS_CFG.minThickness, 42);
+    }
+
+    // Drive stop toward target T, and ensure neighbors can support it.
+    if (stopIdx >= 0) {
+      const stop = surfaces[stopIdx];
+      const stopNeed = (targetT > 0 && targetEfl > 1) ? (targetEfl / (2 * targetT)) : 0;
+      const stopBoost = stopNeed > 0
+        ? Math.max(stopNeed * 0.98, Number(stop.ap || 0) * (1.10 + Math.random() * 0.16))
+        : Number(stop.ap || 0) * (1.08 + Math.random() * 0.14);
+      stop.ap = clamp(stopBoost, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+
+      const neighNeed = stop.ap / 1.06;
+      for (let d = 1; d <= 3; d++) {
+        const ids = [stopIdx - d, stopIdx + d];
+        for (const id of ids) {
+          if (id < 0 || id >= surfaces.length) continue;
+          const s = surfaces[id];
+          if (surfaceIsLocked(s)) continue;
+          const t = String(s?.type || "").toUpperCase();
+          if (t === "OBJ" || t === "IMS") continue;
+
+          s.ap = clamp(Math.max(Number(s.ap || 0), neighNeed * (1 - d * 0.06)), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+          const signR = Math.sign(Number(s.R || 1)) || 1;
+          const absR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(s.R || 0)));
+          const needAbsR = (Number(s.ap || 0) / AP_SAFETY) * 1.08;
+          s.R = signR * clamp(Math.max(absR, needAbsR), PHYS_CFG.minRadius, 600);
+        }
+      }
+    }
+
+    // Coverage floor by target IC (kept moderate to avoid instant hard-fails).
+    if (targetIC > 0) {
+      const floorBase = clamp(targetIC * (keepFl ? 0.36 : 0.40), 8.0, 25.0);
+      for (let i = 0; i < surfaces.length; i++) {
+        const s = surfaces[i];
+        if (surfaceIsLocked(s)) continue;
+        const t = String(s?.type || "").toUpperCase();
+        if (t === "OBJ" || t === "IMS") continue;
+        if (Number(s.ap || 0) < floorBase) {
+          s.ap = clamp(floorBase, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+          const signR = Math.sign(Number(s.R || 1)) || 1;
+          const absR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(s.R || 0)));
+          const needAbsR = (Number(s.ap || 0) / AP_SAFETY) * 1.05;
+          s.R = signR * clamp(Math.max(absR, needAbsR), PHYS_CFG.minRadius, 600);
+        }
+      }
+    }
+  }
+
   function nudgeLensTowardFocal(lensObj, targetEfl, wavePreset, strength = 0.6, maxStep = 0.20) {
     if (!lensObj?.surfaces || !(Number.isFinite(targetEfl) && targetEfl > 1)) return false;
     const surfaces = lensObj.surfaces;
@@ -3856,7 +3943,7 @@
       const curPri = buildOptPriority(curEval, targets);
       const bestPriPre = buildOptPriority(best.eval, targets);
       const tries = (curPri.stage === 1)
-        ? (flLocked ? 5 : 3)
+        ? (flLocked ? (curPri.icNeedMm > 9 ? 8 : 6) : 4)
         : (flLocked ? 3 : 2);
       let cand = null;
       let candEval = null;
@@ -3871,6 +3958,17 @@
         const baseLens = useBestBase ? best.lens : cur;
         const basePri = useBestBase ? bestPriPre : curPri;
         const c = mutateLens(baseLens, mode, topo, { stage: basePri.stage, targetIC, keepFl: flLocked });
+        if (basePri.stage === 1 && basePri.icNeedMm > 2.5 && Math.random() < 0.78) {
+          applyCoverageBoostMutation(c.surfaces, {
+            targetIC,
+            targetEfl,
+            targetT,
+            icNeedMm: basePri.icNeedMm,
+            keepFl: flLocked,
+          });
+          quickSanity(c.surfaces);
+          if (topo) enforceTopology(c.surfaces, topo);
+        }
         // Keep FL search from hovering around ~5% by adding a small deterministic focal nudge.
         if (basePri.stage === 0) {
           const nearEdge = Number.isFinite(basePri.eflErrRel) && basePri.eflErrRel <= 0.03;
@@ -3899,9 +3997,9 @@
         accept = false;
       } else
       // Once we have entered FL band, never accept candidates outside the 5% band.
-      if (flLocked && !candPri.flInBand) {
+      if (flLocked && candPri.eflErrRel > OPT_STAGE_CFG.flHoldRel) {
         accept = false;
-      } else if (curPri.flInBand && candPri.eflErrRel > curPri.eflErrRel + OPT_STAGE_CFG.flPreferRel) {
+      } else if (curPri.flInBand && candPri.eflErrRel > curPri.eflErrRel + (curPri.stage === 1 ? OPT_STAGE_CFG.icStageDriftRel : OPT_STAGE_CFG.flPreferRel)) {
         // In-band: never drift FL away more than a tiny amount.
         accept = false;
       } else if (isEvalBetterByPlan(candEval, curEval, targets)) {
