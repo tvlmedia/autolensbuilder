@@ -3527,6 +3527,8 @@
     const sensorX = 0.0;
     computeVertices(surfaces, lensShift, sensorX);
     const phys = evaluatePhysicalConstraints(surfaces);
+    const rearVx = lastPhysicalVertexX(surfaces);
+    const intrusion = Number.isFinite(rearVx) ? (rearVx - (-PL_FFD)) : Infinity;
 
     if (phys.hardFail) {
       const score = MERIT_CFG.hardInvalidPenalty + Math.max(0, Number(phys.penalty || 0));
@@ -3538,8 +3540,12 @@
         softIcMm: 0,
         icShortfallMm,
         bfl: null,
-        intrusion: 0,
+        intrusion,
         vigFrac: 1,
+        hardInvalid: true,
+        physPenalty: Number(phys.penalty || 0),
+        worstOverlap: Number(phys.worstOverlap || 0),
+        worstPinch: Number(phys.worstPinch || 0),
         lensShift,
         rms0: null,
         rmsE: null,
@@ -3567,9 +3573,6 @@
     const T = estimateEffectiveT(Tgeom, centerTp.goodFrac);
 
     const fov = computeFovDeg(efl, sensorW, sensorH);
-
-    const rearVx = lastPhysicalVertexX(surfaces);
-    const intrusion = rearVx - (-PL_FFD);
 
     const meritRes = computeMeritV1({
       surfaces,
@@ -3613,6 +3616,10 @@
       bfl,
       intrusion,
       vigFrac,
+      hardInvalid: !!phys.hardFail,
+      physPenalty: Number(phys.penalty || 0),
+      worstOverlap: Number(phys.worstOverlap || 0),
+      worstPinch: Number(phys.worstPinch || 0),
       goodFrac0: centerTp.goodFrac,
       lensShift,
       rms0: meritRes.breakdown.rmsCenter,
@@ -3622,6 +3629,7 @@
   }
 
   function stageName(stage) {
+    if (stage < 0) return "Physics fix";
     if (stage === 0) return "FL acquire";
     if (stage === 1) return "IC growth";
     if (stage === 2) return "T tune";
@@ -3632,6 +3640,18 @@
     const efl = Number(evalRes?.efl);
     const T = Number(evalRes?.T);
     const score = Number.isFinite(evalRes?.score) ? Number(evalRes.score) : 1e9;
+    const hardInvalid = !!evalRes?.hardInvalid;
+    const intrusionMm = Math.max(0, Number(evalRes?.intrusion || 0));
+    const overlapMm = Math.max(0, Number(evalRes?.worstOverlap || 0));
+    const pinchMm = Math.max(0, Number(evalRes?.worstPinch || 0));
+    const physPenalty = Math.max(0, Number(evalRes?.physPenalty || 0));
+    const feasible = !hardInvalid && intrusionMm <= 1e-3 && overlapMm <= 1e-3;
+    const feasibilityDebt =
+      (hardInvalid ? 5000 : 0) +
+      intrusionMm * 1200 +
+      overlapMm * 2000 +
+      Math.max(0, pinchMm - 0.35) * 160 +
+      physPenalty * 0.02;
 
     const eflErrRel = Number.isFinite(efl) && targetEfl > 1e-9
       ? Math.abs(efl - targetEfl) / targetEfl
@@ -3657,8 +3677,8 @@
       1.7 * (Number.isFinite(rmsE) ? rmsE : 999) +
       0.5 * (Number.isFinite(vigFrac) ? vigFrac : 1);
 
-    let stage = 0;
-    if (flReady) {
+    let stage = feasible ? 0 : -1;
+    if (feasible && flReady) {
       if (!icGood) stage = 1;
       else if (!tGood) stage = 2;
       else stage = 3;
@@ -3668,6 +3688,13 @@
       stage,
       stageName: stageName(stage),
       score,
+      feasible,
+      feasibilityDebt,
+      hardInvalid,
+      intrusionMm,
+      overlapMm,
+      pinchMm,
+      physPenalty,
       efl,
       eflErrRel,
       flInBand,
@@ -3687,6 +3714,16 @@
     if (!b) return -1;
     const A = buildOptPriority(a, targets);
     const B = buildOptPriority(b, targets);
+
+    // Hard physical feasibility gate.
+    if (A.feasible !== B.feasible) return A.feasible ? -1 : 1;
+    if (!A.feasible && !B.feasible) {
+      if (Math.abs(A.feasibilityDebt - B.feasibilityDebt) > 1e-3) {
+        return A.feasibilityDebt - B.feasibilityDebt;
+      }
+      if (Math.abs(A.eflErrRel - B.eflErrRel) > 1e-6) return A.eflErrRel - B.eflErrRel;
+      return A.score - B.score;
+    }
 
     // Across all stages, keep FL as primary anchor unless effectively equal.
     if (Math.abs(A.eflErrRel - B.eflErrRel) > OPT_STAGE_CFG.flPreferRel) {
@@ -3718,6 +3755,9 @@
 
   function planEnergy(pri) {
     if (!pri) return Infinity;
+    if (!pri.feasible) {
+      return 1e9 + pri.feasibilityDebt * 100 + pri.eflErrRel * 1e5;
+    }
     return (
       pri.stage * 100000 +
       pri.eflErrRel * 10000 +
@@ -3753,6 +3793,24 @@
     return `T ${tTxt} (target ${targetT.toFixed(2)} • err ${eTxt}${p.tGood ? " ✅" : ""})`;
   }
 
+  function fmtPhysOpt(evalRes, targets) {
+    const p = buildOptPriority(evalRes, targets);
+    if (p.feasible) return "PHYS OK ✅";
+    const intrTxt = Number.isFinite(p.intrusionMm) ? p.intrusionMm.toFixed(2) : "—";
+    const ovTxt = Number.isFinite(p.overlapMm) ? p.overlapMm.toFixed(2) : "—";
+    return `PHYS INVALID ❌ (intr ${intrTxt}mm • overlap ${ovTxt}mm)`;
+  }
+
+  function fmtStageStep(stage) {
+    if (!Number.isFinite(stage) || stage < 0) return "0/4";
+    return `${Math.min(4, (stage | 0) + 1)}/4`;
+  }
+
+  function fmtIntrusion(evalRes) {
+    const v = Number(evalRes?.intrusion);
+    return Number.isFinite(v) ? `${v.toFixed(2)}mm` : "—";
+  }
+
   async function runOptimizer(){
     if (optRunning) return;
     optRunning = true;
@@ -3776,7 +3834,10 @@
     let cur = startLens;
     let curEval = evalLensMerit(cur, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
-    let flLocked = buildOptPriority(curEval, targets).flInBand;
+    let flLocked = (() => {
+      const p0 = buildOptPriority(curEval, targets);
+      return p0.feasible && p0.flInBand;
+    })();
 
     // annealing-ish
     let temp0 = mode === "wild" ? 3.5 : 1.8;
@@ -3832,6 +3893,11 @@
       }
 
       let accept = false;
+      if (!curPri.feasible && candPri.feasible) {
+        accept = true;
+      } else if (curPri.feasible && !candPri.feasible) {
+        accept = false;
+      } else
       // Once we have entered FL band, never accept candidates outside the 5% band.
       if (flLocked && !candPri.flInBand) {
         accept = false;
@@ -3857,24 +3923,26 @@
       if (accept){
         cur = cand;
         curEval = candEval;
-        flLocked = flLocked || candPri.flInBand;
+        flLocked = flLocked || (candPri.feasible && candPri.flInBand);
       }
 
       if (isEvalBetterByPlan(candEval, best.eval, targets)){
         best = { lens: clone(cand), eval: candEval, iter: i };
         const bp = buildOptPriority(best.eval, targets);
+        const stageStep = fmtStageStep(bp.stage);
 
         // UI update (rare)
         if (ui.optLog){
           setOptLog(
             `best @${i}/${iters}\n` +
             `score ${best.eval.score.toFixed(2)}\n` +
-            `stage ${bp.stage + 1}/4: ${bp.stageName}\n` +
+            `stage ${stageStep}: ${bp.stageName}\n` +
+            `${fmtPhysOpt(best.eval, targets)}\n` +
             `${fmtFlOpt(best.eval, targetEfl)}\n` +
             `${fmtIcOpt(best.eval, targetIC)}\n` +
             `${fmtTOpt(best.eval, targetT)}\n` +
             `Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}%\n` +
-            `INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
+            `INTR ${fmtIntrusion(best.eval)}\n` +
             `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
           );
         }
@@ -3890,7 +3958,7 @@
       if (curMuchWorse && (i % Math.max(40, BATCH / 2) === 0)) {
         cur = clone(best.lens);
         curEval = best.eval;
-        flLocked = flLocked || bestPriPost.flInBand;
+        flLocked = flLocked || (bestPriPost.feasible && bestPriPost.flInBand);
       }
 
       if (i % BATCH === 0){
@@ -3904,10 +3972,11 @@
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
             `current ${curEval.score.toFixed(2)} • best ${best.eval.score.toFixed(2)} @${best.iter}\n` +
             `phase current: ${cp.stageName} • best: ${bp.stageName}${flLocked ? " • FL lock ON" : ""}\n` +
+            `${fmtPhysOpt(curEval, targets)}\n` +
             `current ${fmtFlOpt(curEval, targetEfl)}\n` +
             `current ${fmtIcOpt(curEval, targetIC)}\n` +
             `current ${fmtTOpt(curEval, targetT)}\n` +
-            `best: ${fmtFlOpt(best.eval, targetEfl)} • ${fmtIcOpt(best.eval, targetIC)} • ${fmtTOpt(best.eval, targetT)}\n`
+            `best: ${fmtFlOpt(best.eval, targetEfl)} • ${fmtIcOpt(best.eval, targetIC)} • ${fmtTOpt(best.eval, targetT)} • ${fmtPhysOpt(best.eval, targets)}\n`
           );
         }
         // yield to UI
@@ -3921,16 +3990,18 @@
     const tEnd = performance.now();
     const sec = (tEnd - tStart) / 1000;
     const bp = buildOptPriority(best.eval, targets);
+    const stageStep = fmtStageStep(bp.stage);
     if (ui.optLog){
       setOptLog(
         `done ${best.iter}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
         `BEST score ${best.eval.score.toFixed(2)}\n` +
-        `BEST stage ${bp.stage + 1}/4: ${bp.stageName}\n` +
+        `BEST stage ${stageStep}: ${bp.stageName}\n` +
+        `${fmtPhysOpt(best.eval, targets)}\n` +
         `${fmtFlOpt(best.eval, targetEfl)}\n` +
         `${fmtIcOpt(best.eval, targetIC)}\n` +
         `${fmtTOpt(best.eval, targetT)}\n` +
         `Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}%\n` +
-        `INTR ${best.eval.intrusion.toFixed(2)}mm\n` +
+        `INTR ${fmtIntrusion(best.eval)}\n` +
         `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
         `Click “Apply best” to load.`
       );
@@ -3951,6 +4022,15 @@
 
   function applyBest(){
     if (!optBest?.lens) return toast("No best yet");
+    const targets = {
+      targetEfl: num(ui.optTargetFL?.value, 75),
+      targetIC: Math.max(0, num(ui.optTargetIC?.value, 0)),
+      targetT: num(ui.optTargetT?.value, 2.0),
+    };
+    const p = buildOptPriority(optBest.eval, targets);
+    if (!p.feasible) {
+      return toast("Best is fysiek ongeldig (intrusion/overlap). Eerst verder optimaliseren.");
+    }
     loadLens(optBest.lens);
     // set lensFocus from best
     if (ui.focusMode) ui.focusMode.value = "lens";
