@@ -1278,6 +1278,8 @@
 
   const OPT_STAGE_CFG = {
     flBandRel: 0.05,      // once FL is in +/-5%, keep all accepted updates in this band
+    flStageRel: 0.01,     // do not leave FL phase until within +/-1%
+    flPreferRel: 0.002,   // in later phases, do not accept >0.2% FL degradation
     icPassFrac: 0.95,     // IC phase is "good enough" at >=95% of requested IC
     tGoodAbs: 0.25,       // T phase considered good when absolute T error <= 0.25
   };
@@ -3634,8 +3636,9 @@
     const eflErrRel = Number.isFinite(efl) && targetEfl > 1e-9
       ? Math.abs(efl - targetEfl) / targetEfl
       : Infinity;
-    // Tiny epsilon avoids "47.50mm @ target 50.00" floating-point edge misses.
+    // Tiny epsilon avoids floating-point edge misses.
     const flInBand = eflErrRel <= (OPT_STAGE_CFG.flBandRel + 1e-4);
+    const flReady = eflErrRel <= (OPT_STAGE_CFG.flStageRel + 1e-4);
 
     const icMeasured = Number.isFinite(evalRes?.softIcMm) ? Number(evalRes.softIcMm) : 0;
     const icGoalMm = targetIC > 0 ? (targetIC * OPT_STAGE_CFG.icPassFrac) : 0;
@@ -3655,7 +3658,7 @@
       0.5 * (Number.isFinite(vigFrac) ? vigFrac : 1);
 
     let stage = 0;
-    if (flInBand) {
+    if (flReady) {
       if (!icGood) stage = 1;
       else if (!tGood) stage = 2;
       else stage = 3;
@@ -3668,6 +3671,7 @@
       efl,
       eflErrRel,
       flInBand,
+      flReady,
       icMeasured,
       icGoalMm,
       icNeedMm,
@@ -3683,6 +3687,11 @@
     if (!b) return -1;
     const A = buildOptPriority(a, targets);
     const B = buildOptPriority(b, targets);
+
+    // Across all stages, keep FL as primary anchor unless effectively equal.
+    if (Math.abs(A.eflErrRel - B.eflErrRel) > OPT_STAGE_CFG.flPreferRel) {
+      return A.eflErrRel - B.eflErrRel;
+    }
 
     if (A.stage !== B.stage) return A.stage - B.stage;
 
@@ -3715,7 +3724,8 @@
     const p = buildOptPriority(evalRes, { targetEfl, targetIC: 0, targetT: 0 });
     const eflTxt = Number.isFinite(p.efl) ? p.efl.toFixed(2) : "—";
     const errTxt = Number.isFinite(p.eflErrRel) ? (p.eflErrRel * 100).toFixed(2) : "—";
-    return `FL ${eflTxt}mm (target ${targetEfl.toFixed(2)} • err ${errTxt}%${p.flInBand ? " ✅" : ""})`;
+    const mark = p.flReady ? " ✅ tight" : (p.flInBand ? " ✓ band" : "");
+    return `FL ${eflTxt}mm (target ${targetEfl.toFixed(2)} • err ${errTxt}%${mark})`;
   }
 
   function fmtIcOpt(evalRes, targetIC) {
@@ -3784,16 +3794,16 @@
       const cand = mutateLens(baseLens, mode, topo, { stage: basePri.stage, targetIC, keepFl: flLocked });
       // Keep FL search from hovering around ~5% by adding a small deterministic focal nudge.
       if (basePri.stage === 0) {
-        const nearEdge = Number.isFinite(basePri.eflErrRel) && basePri.eflErrRel <= 0.08;
+        const nearEdge = Number.isFinite(basePri.eflErrRel) && basePri.eflErrRel <= 0.03;
         nudgeLensTowardFocal(
           cand,
           targetEfl,
           wavePreset,
-          nearEdge ? 0.95 : 0.75,
-          nearEdge ? 0.08 : 0.20
+          nearEdge ? 1.0 : 0.82,
+          nearEdge ? 0.06 : 0.18
         );
       } else if (flLocked && Math.random() < 0.85) {
-        nudgeLensTowardFocal(cand, targetEfl, wavePreset, 0.28, 0.04);
+        nudgeLensTowardFocal(cand, targetEfl, wavePreset, 0.36, 0.04);
       }
       const candEval = evalLensMerit(cand, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
       const candPri = buildOptPriority(candEval, targets);
@@ -3801,6 +3811,9 @@
       let accept = false;
       // Once we have entered FL band, never accept candidates outside the 5% band.
       if (flLocked && !candPri.flInBand) {
+        accept = false;
+      } else if (curPri.flInBand && candPri.eflErrRel > curPri.eflErrRel + OPT_STAGE_CFG.flPreferRel) {
+        // In-band: never drift FL away more than a tiny amount.
         accept = false;
       } else if (isEvalBetterByPlan(candEval, curEval, targets)) {
         accept = true;
