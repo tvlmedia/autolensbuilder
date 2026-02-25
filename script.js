@@ -1406,7 +1406,7 @@
     polishFlDriftRel: 0.0008, // in fine tune, keep FL nearly locked while reducing residual distortion
     icStageDriftRel: 0.006, // allow a bit more FL drift during IC growth
     tCoarseAbs: 0.75,     // before IC growth, first reduce too-slow T overshoot
-    icPassFrac: 0.95,     // IC phase is "good enough" at >=95% of requested IC
+    icPassFrac: 1.00,     // IC is only good when measured IC >= requested IC
     tGoodAbs: 0.25,       // T phase considered good when too-slow T overshoot <= 0.25
   };
 
@@ -1446,6 +1446,10 @@
     acceptableTAbs: 0.35,
     acceptableIcNeedMm: 0.60,
     acceptableIcNeedFrac: 0.03,
+    strictDistRmsPct: 1.00,
+    strictDistMaxPct: 2.00,
+    acceptableDistRmsPct: 2.20,
+    acceptableDistMaxPct: 4.20,
     minElements: 3,
     maxElementsHardCap: 14,
   };
@@ -2258,7 +2262,7 @@
     if (!Number.isFinite(efl) || efl <= 1e-9 || !Number.isFinite(idealHalf) || idealHalf < 1e-9) return null;
     const fractions = Array.isArray(fracs) && fracs.length
       ? fracs.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0)
-      : [0.30, 0.60, 0.90, 1.00];
+      : [0.25, 0.55, 0.85, 1.00];
     if (!fractions.length) return null;
 
     let sumSq = 0;
@@ -2345,7 +2349,7 @@
   ) {
     const fractions = Array.isArray(fracs) && fracs.length
       ? fracs.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0)
-      : [0.30, 0.60, 0.90, 1.00];
+      : [0.25, 0.55, 0.85, 1.00];
     const keyObj = {
       wavePreset: String(wavePreset || "d"),
       sensorX: Number(sensorX || 0).toFixed(6),
@@ -2431,43 +2435,68 @@
 
   function distortionPenaltyFromStats(stats, distWeight = 0) {
     const weight = Math.max(0, Number(distWeight || 0));
-    if (!stats || weight <= 0) {
+    if (weight <= 0) {
       return {
         weight,
         baseTerm: 0,
         penalty: 0,
         rmsTerm: 0,
         maxTerm: 0,
+        edgeTerm: 0,
         missingTerm: 0,
+      };
+    }
+    if (!stats) {
+      const baseTerm = Math.max(0, Number(MERIT_CFG.distNoDataTerm || 0));
+      return {
+        weight,
+        baseTerm,
+        penalty: baseTerm * weight,
+        rmsTerm: 0,
+        maxTerm: 0,
+        edgeTerm: 0,
+        missingTerm: baseTerm,
       };
     }
     const rmsPct = Number(stats?.rmsPct);
     const maxPct = Number(stats?.maxPct);
-    if (!Number.isFinite(rmsPct) || !Number.isFinite(maxPct)) {
-      return {
-        weight,
-        baseTerm: 0,
-        penalty: 0,
-        rmsTerm: 0,
-        maxTerm: 0,
-        missingTerm: 0,
-      };
-    }
-    const rmsNorm = Math.max(1e-6, Number(MERIT_CFG.distNormPct || 1.0));
-    const maxNorm = Math.max(1e-6, Number(MERIT_CFG.distMaxNormPct || 1.5));
-    const rmsTerm = Math.pow(rmsPct / rmsNorm, 2);
-    const maxTerm = 0.5 * Math.pow(maxPct / maxNorm, 2);
+    const edgePct = Number(stats?.edgePct);
     const sampleCount = Math.max(1, Number(stats?.sampleCount || 1));
-    const missingSamples = Math.max(0, Number(stats?.missingSamples || 0));
+    const validSamples = Math.max(0, Number(stats?.validSamples || 0));
+    const missingSamples = Math.max(0, sampleCount - validSamples);
     const missFrac = clamp(missingSamples / sampleCount, 0, 1);
     const missingTerm = Number(MERIT_CFG.distMissingWeight || 0) * (missFrac * missFrac);
-    const baseTerm = rmsTerm + maxTerm + missingTerm;
+
+    if (!Number.isFinite(rmsPct) || !Number.isFinite(maxPct)) {
+      const noDataTerm = Math.max(0, Number(MERIT_CFG.distNoDataTerm || 0));
+      const baseTerm = noDataTerm + missingTerm;
+      return {
+        weight,
+        baseTerm,
+        penalty: baseTerm * weight,
+        rmsTerm: 0,
+        maxTerm: 0,
+        edgeTerm: 0,
+        missingTerm,
+      };
+    }
+
+    const rmsNorm = Math.max(1e-6, Number(MERIT_CFG.distNormPct || 1.0));
+    const maxNorm = Math.max(1e-6, Number(MERIT_CFG.distMaxNormPct || 1.5));
+    const edgeNorm = Math.max(1e-6, Number(MERIT_CFG.distEdgeNormPct || maxNorm));
+    const rmsTerm = Math.pow(rmsPct / rmsNorm, 2);
+    const maxTerm = 0.5 * Math.pow(maxPct / maxNorm, 2);
+    const edgeTerm = Number.isFinite(edgePct)
+      ? 0.35 * Math.pow(Math.abs(edgePct) / edgeNorm, 2)
+      : 0;
+    const baseTerm = rmsTerm + maxTerm + edgeTerm + missingTerm;
     return {
       weight,
       baseTerm,
       penalty: baseTerm * weight,
       rmsTerm,
       maxTerm,
+      edgeTerm,
       missingTerm,
     };
   }
@@ -2656,11 +2685,13 @@
     midVigWeight: 60.0,
     intrusionWeight: 16.0,
     fieldWeights: [1.0, 1.5, 2.0],
-    distSampleFracs: [0.30, 0.60, 0.90, 1.00], // chief-ray samples across image height/diag
-    distNormPct: 0.75,        // RMS distortion normalization target
-    distMaxNormPct: 1.25,     // MAX distortion normalization target
-    distMissingWeight: 1.2,   // penalize missing/invalid chief samples
-    distStageWeights: [0.10, 0.30, 0.35, 2.25], // stage 0..3
+    distSampleFracs: [0.25, 0.55, 0.85, 1.00], // chief-ray samples across image height/diag
+    distNormPct: 0.55,        // RMS distortion normalization target
+    distMaxNormPct: 0.95,     // MAX distortion normalization target
+    distEdgeNormPct: 0.60,    // edge distortion normalization target
+    distMissingWeight: 3.0,   // penalize missing/invalid chief samples
+    distNoDataTerm: 30.0,     // heavy penalty when distortion cannot be measured
+    distStageWeights: [0.08, 0.22, 0.55, 6.50], // stage 0..3
     distFastMeasureOnlyInFlBand: true, // keep fast-tier evals lightweight outside FL lock band
     crossPairWeight: 3200.0,  // no internal ray crossing in glass
     crossSegWeight: 900.0,
@@ -4482,8 +4513,8 @@
       p.eflErrRel * 120000 +
       (hasT ? p.tErrAbs * 900 : 0) +
       (hasIC ? p.icNeedMm * 460 : 0) +
-      p.distRmsScore * 90 +
-      p.distMaxScore * 40 +
+      p.distRmsScore * 220 +
+      p.distMaxScore * 100 +
       p.sharpness * 120
     );
   }
@@ -4496,8 +4527,12 @@
       if (!(Number(priority.tErrAbs) <= Math.max(0.20, OPT_STAGE_CFG.tGoodAbs))) return false;
     }
     if (Number(targets?.targetIC || 0) > 0) {
-      if (!(Number(priority.icNeedMm) <= Math.max(0.30, Number(targets.targetIC) * 0.01))) return false;
+      if (!(Number(priority.icNeedMm) <= 1e-4)) return false;
     }
+    const strictDistRms = Number(SCRATCH_CFG.strictDistRmsPct || 1.0);
+    const strictDistMax = Number(SCRATCH_CFG.strictDistMaxPct || 2.0);
+    if (!(Number.isFinite(priority.distRmsScore) && priority.distRmsScore <= strictDistRms)) return false;
+    if (!(Number.isFinite(priority.distMaxScore) && priority.distMaxScore <= strictDistMax)) return false;
     return true;
   }
 
@@ -4509,16 +4544,17 @@
       if (!(Number(priority.tErrAbs) <= Number(SCRATCH_CFG.acceptableTAbs || 0.35))) return false;
     }
     if (Number(targets?.targetIC || 0) > 0) {
-      const icNeedLimit = Math.max(
-        Number(SCRATCH_CFG.acceptableIcNeedMm || 0.60),
-        Number(targets.targetIC || 0) * Number(SCRATCH_CFG.acceptableIcNeedFrac || 0.03)
-      );
-      if (!(Number(priority.icNeedMm) <= icNeedLimit)) return false;
+      if (!(Number(priority.icNeedMm) <= 1e-4)) return false;
     }
+    const okDistRms = Number(SCRATCH_CFG.acceptableDistRmsPct || 2.2);
+    const okDistMax = Number(SCRATCH_CFG.acceptableDistMaxPct || 4.2);
+    if (!(Number.isFinite(priority.distRmsScore) && priority.distRmsScore <= okDistRms)) return false;
+    if (!(Number.isFinite(priority.distMaxScore) && priority.distMaxScore <= okDistMax)) return false;
     return true;
   }
 
   async function runScratchOptimizerPass(pass, targets, aggr, meta = {}) {
+    if (scratchStopRequested) return evaluateCurrentLensPriorityForTargets(targets);
     if (!pass) return evaluateCurrentLensPriorityForTargets(targets);
     if (ui.optTargetFL) ui.optTargetFL.value = Number(targets.targetEfl).toFixed(2);
     if (ui.optTargetT) ui.optTargetT.value = Number(pass.targetT || 0).toFixed(2);
@@ -4551,6 +4587,7 @@
     } finally {
       setOptRunContext(prevRunCtx);
     }
+    if (scratchStopRequested) return evaluateCurrentLensPriorityForTargets(targets);
     let loaded = applyOptimizerBestUnsafe({
       targetEfl: Number(targets.targetEfl || 50),
       targetT: Number(pass.targetT || 0),
@@ -4592,6 +4629,7 @@
     }
 
     scratchBuildRunning = true;
+    scratchStopRequested = false;
     if (ui.btnBuildScratch) ui.btnBuildScratch.disabled = true;
     const prevOptIters = ui.optIters?.value;
     const prevOptPop = ui.optPop?.value;
@@ -4651,6 +4689,11 @@
       let snap = null;
       let bestFeasibleSnapshot = null;
       let earlyStopReason = "";
+      let abortedByUser = false;
+      const markStoppedByUser = () => {
+        abortedByUser = true;
+        if (!earlyStopReason) earlyStopReason = "stopped by user";
+      };
       const storeBestFeasible = (label, resObj) => {
         const pri = resObj?.pri;
         if (!pri?.feasible) return;
@@ -4668,6 +4711,10 @@
       const startSnap = evaluateCurrentLensPriorityForTargets(targets);
       storeBestFeasible("prepared", startSnap);
       for (let i = 0; i < firstPasses.length; i++) {
+        if (scratchStopRequested) {
+          markStoppedByUser();
+          break;
+        }
         runStep++;
         snap = await runScratchOptimizerPass(firstPasses[i], targets, aggr, {
           tag: `pass ${i + 1}/${firstPasses.length}`,
@@ -4675,6 +4722,10 @@
           runIndex: runStep,
           runTotal: runTotalEstimate,
         });
+        if (scratchStopRequested) {
+          markStoppedByUser();
+          break;
+        }
         storeBestFeasible(`pass_${firstPasses[i]?.id || i}`, snap);
         if (stopOnAccept && scratchAcceptableReached(snap?.pri, targets)) {
           earlyStopReason = `accepted in initial pass ${firstPasses[i]?.id || (i + 1)}`;
@@ -4685,8 +4736,13 @@
       let bestPri = snap?.pri || evaluateCurrentLensPriorityForTargets(targets).pri;
       let bestMetric = scratchProgressMetric(bestPri, targets);
       let plateauRun = 0;
+      if (scratchStopRequested && !earlyStopReason) markStoppedByUser();
 
       for (let cycle = 0; cycle < maxGrowCycles && !earlyStopReason; cycle++) {
+        if (scratchStopRequested) {
+          markStoppedByUser();
+          break;
+        }
         const cur = evaluateCurrentLensPriorityForTargets(targets);
         if (scratchTargetsReached(cur.pri, targets)) break;
         if (stopOnAccept && scratchAcceptableReached(cur.pri, targets)) {
@@ -4735,6 +4791,10 @@
           `running staged optimize...`
         );
         for (let i = 0; i < growPasses.length; i++) {
+          if (scratchStopRequested) {
+            markStoppedByUser();
+            break;
+          }
           runStep++;
           snap = await runScratchOptimizerPass(growPasses[i], targets, aggr, {
             tag: `grow ${cycle + 1} • pass ${i + 1}/${growPasses.length}`,
@@ -4742,6 +4802,10 @@
             runIndex: runStep,
             runTotal: runTotalEstimate,
           });
+          if (scratchStopRequested) {
+            markStoppedByUser();
+            break;
+          }
           storeBestFeasible(`grow_${cycle + 1}_${growPasses[i]?.id || i}`, snap);
           if (stopOnAccept && scratchAcceptableReached(snap?.pri, targets)) {
             earlyStopReason = `accepted in grow ${cycle + 1} pass ${growPasses[i]?.id || (i + 1)}`;
@@ -4764,14 +4828,18 @@
         if (plateauRun >= 2 && aggr !== "wild") break;
       }
 
+      if (scratchStopRequested && !earlyStopReason) markStoppedByUser();
       const preFinal = evaluateCurrentLensPriorityForTargets(targets);
-      const shouldSkipFinalPolish = stopOnAccept && scratchAcceptableReached(preFinal.pri, targets);
+      const shouldSkipFinalPolish = abortedByUser || (stopOnAccept && scratchAcceptableReached(preFinal.pri, targets));
       if (shouldSkipFinalPolish) {
-        if (!earlyStopReason) earlyStopReason = "accepted before final polish";
+        if (!earlyStopReason && !abortedByUser) earlyStopReason = "accepted before final polish";
       } else {
+        const distNow = Math.max(0, Number(preFinal?.pri?.distRmsScore || 0));
+        const distOver = Math.max(0, distNow - Number(SCRATCH_CFG.acceptableDistRmsPct || 2.2));
+        const distScale = clamp(1 + distOver * 0.35, 1.0, 2.4);
         const finalPolishIters = Math.max(
           800,
-          Math.round(Number((SCRATCH_CFG.stageIters[aggr] || SCRATCH_CFG.stageIters.normal).D) * 0.75 * effortScale)
+          Math.round(Number((SCRATCH_CFG.stageIters[aggr] || SCRATCH_CFG.stageIters.normal).D) * 0.75 * effortScale * distScale)
         );
         runStep++;
         await runScratchOptimizerPass(
@@ -4808,10 +4876,13 @@
       const p = finalSnap.pri;
       const doneStrict = scratchTargetsReached(p, targets);
       const acceptable = scratchAcceptableReached(p, targets);
-      const done = doneStrict || (stopOnAccept && acceptable);
+      const done = !abortedByUser && (doneStrict || (stopOnAccept && acceptable));
       const finalElems = countLensElements(lens.surfaces);
+      const headline = abortedByUser
+        ? "STOPPED ⏹"
+        : (done ? "DONE ✅" : "DONE (best effort)");
       setOptLog(
-        `Build From Scratch ${done ? "DONE ✅" : "DONE (best effort)"}\n` +
+        `Build From Scratch ${headline}\n` +
         `family ${scratchFamilyLabel(familyResolved)} • aggr ${aggr} • effort x${effortScale.toFixed(2)}\n` +
         `${earlyStopReason ? `stop ${earlyStopReason}\n` : ""}` +
         `${bestFeasibleSnapshot ? `fallback ${bestFeasibleSnapshot.label}\n` : ""}` +
@@ -4827,7 +4898,7 @@
       );
 
       toast(
-        `Build from scratch ${done ? "done" : "ready (best effort)"} • ${scratchFamilyLabel(familyResolved)} • FL ${Number.isFinite(p.efl) ? p.efl.toFixed(1) : "—"}mm`
+        `Build from scratch ${abortedByUser ? "stopped" : (done ? "done" : "ready (best effort)")} • ${scratchFamilyLabel(familyResolved)} • FL ${Number.isFinite(p.efl) ? p.efl.toFixed(1) : "—"}mm`
       );
       scheduleAutosave();
     } catch (err) {
@@ -4839,6 +4910,7 @@
     } finally {
       if (ui.optIters && prevOptIters != null) ui.optIters.value = String(prevOptIters);
       if (ui.optPop && prevOptPop != null) ui.optPop.value = String(prevOptPop);
+      scratchStopRequested = false;
       scratchBuildRunning = false;
       if (ui.btnBuildScratch) ui.btnBuildScratch.disabled = false;
       scheduleRenderAll();
@@ -5043,6 +5115,7 @@
   let optRunning = false;
   let optBest = null; // {lens, score, meta}
   let scratchBuildRunning = false;
+  let scratchStopRequested = false;
   let optimizerRunSerial = 0;
   let optRunContext = null;
 
@@ -6311,8 +6384,11 @@
     if (A.stage === 3) {
       if (Math.abs(A.tErrAbs - B.tErrAbs) > 1e-4) return A.tErrAbs - B.tErrAbs;
       if (Math.abs(A.eflErrRel - B.eflErrRel) > OPT_STAGE_CFG.polishFlDriftRel) return A.eflErrRel - B.eflErrRel;
-      if (Math.abs(A.distRmsScore - B.distRmsScore) > 0.003) return A.distRmsScore - B.distRmsScore;
-      if (Math.abs(A.distMaxScore - B.distMaxScore) > 0.006) return A.distMaxScore - B.distMaxScore;
+      if (Math.abs(A.distRmsScore - B.distRmsScore) > 0.001) return A.distRmsScore - B.distRmsScore;
+      if (Math.abs(A.distMaxScore - B.distMaxScore) > 0.002) return A.distMaxScore - B.distMaxScore;
+      const aEdge = Number.isFinite(A.distEdgePct) ? Math.abs(A.distEdgePct) : 999;
+      const bEdge = Number.isFinite(B.distEdgePct) ? Math.abs(B.distEdgePct) : 999;
+      if (Math.abs(aEdge - bEdge) > 0.003) return aEdge - bEdge;
       if (Math.abs(A.sharpness - B.sharpness) > 1e-5) return A.sharpness - B.sharpness;
     }
 
@@ -6329,7 +6405,7 @@
     const eflW = pri.stage <= 0 ? 360000 : (pri.stage === 1 ? 60000 : 16000);
     const icW = pri.stage === 2 ? 1400 : 260;
     const tW = pri.stage === 1 ? 520 : (pri.stage === 2 ? 260 : 140);
-    const distW = pri.stage >= 3 ? 240 : (pri.stage === 2 ? 55 : 10);
+    const distW = pri.stage >= 3 ? 520 : (pri.stage === 2 ? 85 : 10);
     return (
       stagePenalty * 100000 +
       pri.eflErrRel * eflW +
@@ -6743,6 +6819,19 @@
         // Fine tune (distortion polish): keep FL locked while polishing.
         accept = false;
       } else if (
+        curPri.stage === 3 &&
+        candPri.stage === 3 &&
+        candPri.feasible &&
+        candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
+        candPri.tErrAbs <= curPri.tErrAbs + 0.03 &&
+        (
+          candPri.distRmsScore > curPri.distRmsScore + 0.02 ||
+          candPri.distMaxScore > curPri.distMaxScore + 0.04
+        )
+      ) {
+        // In final polish, avoid drifting toward higher distortion.
+        accept = false;
+      } else if (
         curPri.stage === 1 &&
         candPri.stage === 1 &&
         candPri.feasible &&
@@ -6972,9 +7061,14 @@
   }
 
   function stopOptimizer(){
-    if (!optRunning) return;
-    optRunning = false;
-    toast("Stopping…");
+    const stoppingScratch = !!scratchBuildRunning;
+    const stoppingOpt = !!optRunning;
+    if (!stoppingScratch && !stoppingOpt) return;
+    if (stoppingScratch) scratchStopRequested = true;
+    if (stoppingOpt) optRunning = false;
+    if (stoppingScratch && stoppingOpt) toast("Stopping build + optimizer…");
+    else if (stoppingScratch) toast("Stopping build from scratch…");
+    else toast("Stopping…");
   }
 
   function applyBest(){
