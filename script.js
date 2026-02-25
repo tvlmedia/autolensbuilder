@@ -92,7 +92,9 @@
     btnOptStop: $("#btnOptStop"),
     btnOptApply: $("#btnOptApply"),
     btnOptBench: $("#btnOptBench"),
+    btnBuildScratch: $("#btnBuildScratch"),
 
+    newLensModal: $("#newLensModal"),
     elementModal: $("#elementModal"),
   };
 
@@ -1312,6 +1314,24 @@
     accurateAfCoarseStep: 0.30,
     accurateAfFineHalf: 1.60,
     accurateAfFineStep: 0.08,
+  };
+
+  const SCRATCH_CFG = {
+    autoFamilyWideMaxMm: 35,
+    autoFamilyNormalMaxMm: 85,
+    maxGrowCycles: {
+      safe: 2,
+      normal: 4,
+      wild: 6,
+    },
+    stageIters: {
+      safe:   { A: 800,  B: 900,  C: 1400, D: 1700 },
+      normal: { A: 1100, B: 1300, C: 2300, D: 2800 },
+      wild:   { A: 1500, B: 1900, C: 3400, D: 4200 },
+    },
+    plateauImproveFrac: 0.010,
+    minElements: 3,
+    maxElementsHardCap: 14,
   };
 
   function softIcLabel(cfg = SOFT_IC_CFG) {
@@ -3562,6 +3582,913 @@
     });
   }
 
+  function normalizeScratchFamily(v) {
+    const s = String(v || "auto").trim().toLowerCase();
+    if (s === "double-gauss" || s === "double_gauss" || s === "dg") return "double_gauss";
+    if (s === "retrofocus" || s === "retrofocus wide" || s === "retrofocus_wide" || s === "wide") return "retrofocus_wide";
+    if (s === "tele" || s === "telephoto") return "telephoto";
+    return "auto";
+  }
+
+  function normalizeScratchAggressiveness(v) {
+    const s = String(v || "normal").trim().toLowerCase();
+    if (s === "safe") return "safe";
+    if (s === "wild") return "wild";
+    return "normal";
+  }
+
+  function scratchFamilyLabel(key) {
+    if (key === "double_gauss") return "Double-Gauss";
+    if (key === "retrofocus_wide") return "Retrofocus Wide";
+    if (key === "telephoto") return "Telephoto";
+    return "Auto";
+  }
+
+  function autoScratchFamilyForTargetEfl(targetEfl) {
+    const f = Number(targetEfl || 0);
+    if (!Number.isFinite(f) || f <= 0) return "double_gauss";
+    if (f < Number(SCRATCH_CFG.autoFamilyWideMaxMm || 35)) return "retrofocus_wide";
+    if (f <= Number(SCRATCH_CFG.autoFamilyNormalMaxMm || 85)) return "double_gauss";
+    return "telephoto";
+  }
+
+  function resolveScratchFamily(requestedFamily, targetEfl) {
+    const req = normalizeScratchFamily(requestedFamily);
+    return req === "auto" ? autoScratchFamilyForTargetEfl(targetEfl) : req;
+  }
+
+  function countLensElements(surfaces) {
+    if (!Array.isArray(surfaces)) return 0;
+    let n = 0;
+    for (let i = 0; i < surfaces.length; i++) {
+      const s = surfaces[i];
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      const g = String(resolveGlassName(s?.glass || "AIR")).toUpperCase();
+      if (g !== "AIR") n++;
+    }
+    return n;
+  }
+
+  function clampScratchMaxElements(v) {
+    const raw = Number(v);
+    if (!Number.isFinite(raw)) return 8;
+    const minE = Number(SCRATCH_CFG.minElements || 3);
+    const maxE = Number(SCRATCH_CFG.maxElementsHardCap || 14);
+    return Math.max(minE, Math.min(maxE, Math.round(raw)));
+  }
+
+  function scratchMmFromF(f, rel, lo, hi) {
+    return clamp(Math.abs(Number(f || 50)) * Number(rel || 0.1), Number(lo || 0.1), Number(hi || 999));
+  }
+
+  function scratchRadiusFromF(f, rel, lo, hi, sign = 1) {
+    const r = scratchMmFromF(f, rel, lo, hi);
+    return (Number(sign) >= 0 ? 1 : -1) * r;
+  }
+
+  function scratchMakeElementPair({
+    R1 = 40,
+    R2 = -60,
+    tGlass = 4,
+    tAir = 2,
+    ap = 16,
+    glass = "N-BK7HT",
+  } = {}) {
+    return [
+      {
+        type: "",
+        R: Number(R1),
+        t: Math.max(PHYS_CFG.minThickness, Number(tGlass)),
+        ap: Math.max(PHYS_CFG.minAperture, Number(ap)),
+        glass: resolveGlassName(glass),
+        stop: false,
+      },
+      {
+        type: "",
+        R: Number(R2),
+        t: Math.max(PHYS_CFG.minThickness, Number(tAir)),
+        ap: Math.max(PHYS_CFG.minAperture, Number(ap)),
+        glass: "AIR",
+        stop: false,
+      },
+    ];
+  }
+
+  function setImsApertureForSensor(surfaces, sensorH) {
+    if (!Array.isArray(surfaces) || !surfaces.length) return;
+    const imsIdx = surfaces.findIndex((s) => String(s?.type || "").toUpperCase() === "IMS");
+    if (imsIdx < 0) return;
+    surfaces[imsIdx].ap = Math.max(0.1, Number(sensorH || 24) * 0.5);
+  }
+
+  function enforceSingleStopSurface(surfaces) {
+    if (!Array.isArray(surfaces) || !surfaces.length) return;
+    ensureStopExists(surfaces);
+    let stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 0) return;
+    for (let i = 0; i < surfaces.length; i++) {
+      const s = surfaces[i];
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") {
+        s.stop = false;
+        continue;
+      }
+      const isStop = i === stopIdx;
+      s.stop = isStop;
+      if (isStop) s.type = "STOP";
+      else if (t === "STOP") s.type = "";
+    }
+  }
+
+  function ensureStopInAirBothSides(surfaces) {
+    if (!Array.isArray(surfaces) || !surfaces.length) return;
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 0) return;
+    const stop = surfaces[stopIdx];
+    if (!stop) return;
+    stop.glass = "AIR";
+    stop.stop = true;
+    stop.type = "STOP";
+    if (stopIdx > 0) {
+      const prev = surfaces[stopIdx - 1];
+      const tp = String(prev?.type || "").toUpperCase();
+      if (tp !== "OBJ" && tp !== "IMS") prev.glass = "AIR";
+    }
+  }
+
+  function scaleLensGeometryToTargetEfl(surfaces, targetEfl, wavePreset) {
+    if (!Array.isArray(surfaces) || surfaces.length < 3) return false;
+    const tgt = Number(targetEfl || 0);
+    if (!Number.isFinite(tgt) || tgt <= 1) return false;
+
+    let ok = false;
+    for (let pass = 0; pass < 4; pass++) {
+      computeVertices(surfaces, 0, 0);
+      const p = estimateEflBflParaxial(surfaces, wavePreset);
+      const efl = Number(p?.efl);
+      if (!(Number.isFinite(efl) && efl > 1e-9)) break;
+      const errRel = Math.abs(efl - tgt) / tgt;
+      if (errRel <= 0.008) {
+        ok = true;
+        break;
+      }
+      const kRaw = tgt / efl;
+      if (!Number.isFinite(kRaw) || kRaw <= 0) break;
+      const k = pass === 0
+        ? clamp(kRaw, 0.30, 3.20)
+        : clamp(kRaw, 0.60, 1.70);
+
+      for (let i = 0; i < surfaces.length; i++) {
+        const s = surfaces[i];
+        const t = String(s?.type || "").toUpperCase();
+        if (t === "OBJ" || t === "IMS") continue;
+        s.R = Number(s.R || 0) * k;
+        s.t = Math.max(PHYS_CFG.minThickness, Number(s.t || 0) * k);
+        s.ap = Math.max(PHYS_CFG.minAperture, Number(s.ap || 0) * Math.sqrt(k));
+      }
+      quickSanity(surfaces);
+      ok = true;
+    }
+    return ok;
+  }
+
+  function setStopForTargetTOnSurfaces(surfaces, targetEfl, targetT) {
+    if (!Array.isArray(surfaces) || surfaces.length < 3) return false;
+    enforceSingleStopSurface(surfaces);
+    let stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 0) return false;
+
+    const tTarget = Number(targetT || 0);
+    const fTarget = Number(targetEfl || 0);
+    if (!(Number.isFinite(tTarget) && tTarget > 0.2 && Number.isFinite(fTarget) && fTarget > 1)) {
+      ensureStopInAirBothSides(surfaces);
+      quickSanity(surfaces);
+      return true;
+    }
+
+    const stop = surfaces[stopIdx];
+    const desiredStopAp = clamp(fTarget / (2 * tTarget), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+    stop.ap = desiredStopAp;
+    stop.glass = "AIR";
+    stop.stop = true;
+    stop.type = "STOP";
+    enforceApertureRadiusCoupling(stop, 1.10);
+
+    for (let d = 1; d <= 3; d++) {
+      const need = desiredStopAp * (1 - d * 0.10);
+      for (const idx of [stopIdx - d, stopIdx + d]) {
+        if (idx < 0 || idx >= surfaces.length) continue;
+        const ss = surfaces[idx];
+        const tt = String(ss?.type || "").toUpperCase();
+        if (tt === "OBJ" || tt === "IMS") continue;
+        if (Number(ss.ap || 0) < need) {
+          ss.ap = clamp(need, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        }
+        enforceApertureRadiusCoupling(ss, 1.08);
+      }
+    }
+
+    ensureStopInAirBothSides(surfaces);
+    quickSanity(surfaces);
+    return true;
+  }
+
+  function generateBaseLens(family, targets, sensor, cfg = {}) {
+    const resolvedFamily = resolveScratchFamily(family, targets?.targetEfl);
+    const f = clamp(Math.abs(Number(targets?.targetEfl || 50)), 14, 260);
+    const targetT = (() => {
+      const t = Number(targets?.targetT);
+      if (Number.isFinite(t) && t > 0.25) return t;
+      return 2.0;
+    })();
+    const targetIC = Math.max(0, Number(targets?.targetIC || 0));
+    const sensorW = Math.max(1, Number(sensor?.w || 36));
+    const sensorH = Math.max(1, Number(sensor?.h || 24));
+    const halfDiag = 0.5 * Math.hypot(sensorW, sensorH);
+
+    const stopAp = clamp(f / (2 * targetT), PHYS_CFG.minAperture, Math.min(26, PHYS_CFG.maxAperture * 0.75));
+    const baseAp = clamp(
+      Math.max(
+        stopAp * 1.65,
+        halfDiag * 0.75,
+        targetIC > 0 ? targetIC * 0.34 : 0,
+        8.0
+      ),
+      8.0,
+      30.0
+    );
+    const gC = "N-BK7HT";
+    const gF = "N-SF5";
+    const gHi = "N-LAK9";
+
+    const m = (rel, lo, hi) => scratchMmFromF(f, rel, lo, hi);
+    const r = (rel, lo, hi, sign) => scratchRadiusFromF(f, rel, lo, hi, sign);
+
+    const surfaces = [
+      { type: "OBJ", R: 0.0, t: 0.0, ap: Math.max(60, baseAp * 2.2), glass: "AIR", stop: false },
+    ];
+    const pushPair = (spec) => {
+      const p = scratchMakeElementPair(spec);
+      surfaces.push(p[0], p[1]);
+    };
+
+    if (resolvedFamily === "retrofocus_wide") {
+      pushPair({
+        R1: r(0.56, 8, 180, -1),
+        R2: r(0.48, 8, 160, +1),
+        tGlass: m(0.10, 2.0, 10),
+        tAir: m(0.34, 3.2, 22),
+        ap: clamp(baseAp * 1.48, 9, 34),
+        glass: gF,
+      });
+      pushPair({
+        R1: r(0.86, 10, 220, +1),
+        R2: r(1.14, 14, 280, -1),
+        tGlass: m(0.10, 2.0, 11),
+        tAir: m(0.11, 1.2, 12),
+        ap: clamp(baseAp * 1.30, 8, 32),
+        glass: gC,
+      });
+      surfaces.push({
+        type: "STOP",
+        R: 0,
+        t: m(0.12, 1.2, 14),
+        ap: stopAp,
+        glass: "AIR",
+        stop: true,
+      });
+      pushPair({
+        R1: r(0.96, 10, 240, +1),
+        R2: r(1.34, 14, 320, -1),
+        tGlass: m(0.09, 1.8, 9),
+        tAir: m(0.18, 2.2, 24),
+        ap: clamp(baseAp * 1.18, 7, 30),
+        glass: gHi,
+      });
+    } else if (resolvedFamily === "telephoto") {
+      pushPair({
+        R1: r(0.92, 20, 360, +1),
+        R2: r(1.36, 24, 420, -1),
+        tGlass: m(0.11, 2.4, 18),
+        tAir: m(0.12, 2.0, 14),
+        ap: clamp(baseAp * 1.34, 9, 34),
+        glass: gHi,
+      });
+      surfaces.push({
+        type: "STOP",
+        R: 0,
+        t: m(0.12, 1.5, 18),
+        ap: stopAp,
+        glass: "AIR",
+        stop: true,
+      });
+      pushPair({
+        R1: r(0.74, 16, 280, -1),
+        R2: r(0.62, 14, 240, +1),
+        tGlass: m(0.10, 2.2, 16),
+        tAir: m(0.11, 1.8, 14),
+        ap: clamp(baseAp * 1.22, 8, 31),
+        glass: gF,
+      });
+      pushPair({
+        R1: r(1.20, 22, 380, +1),
+        R2: r(1.62, 24, 460, -1),
+        tGlass: m(0.09, 1.8, 12),
+        tAir: m(0.18, 2.8, 32),
+        ap: clamp(baseAp * 1.15, 7, 30),
+        glass: gC,
+      });
+    } else {
+      pushPair({
+        R1: r(0.94, 14, 260, +1),
+        R2: r(1.24, 16, 320, -1),
+        tGlass: m(0.10, 2.3, 16),
+        tAir: m(0.10, 1.4, 13),
+        ap: clamp(baseAp * 1.34, 9, 34),
+        glass: gC,
+      });
+      surfaces.push({
+        type: "STOP",
+        R: 0,
+        t: m(0.12, 1.2, 16),
+        ap: stopAp,
+        glass: "AIR",
+        stop: true,
+      });
+      pushPair({
+        R1: r(0.82, 12, 240, -1),
+        R2: r(1.06, 14, 300, +1),
+        tGlass: m(0.09, 2.0, 14),
+        tAir: m(0.15, 2.2, 26),
+        ap: clamp(baseAp * 1.20, 8, 32),
+        glass: gF,
+      });
+    }
+
+    surfaces.push({
+      type: "IMS",
+      R: 0.0,
+      t: 0.0,
+      ap: Math.max(0.1, sensorH * 0.5),
+      glass: "AIR",
+      stop: false,
+    });
+
+    const made = sanitizeLens({
+      name: `Scratch ${scratchFamilyLabel(resolvedFamily)} ${f.toFixed(0)}mm`,
+      notes: [
+        `Generated from scratch (${scratchFamilyLabel(resolvedFamily)}).`,
+        `Aggressiveness: ${normalizeScratchAggressiveness(cfg?.aggressiveness || "normal")}`,
+      ],
+      surfaces,
+    });
+    return made;
+  }
+
+  function prepareScratchLensForTargets(lensObj, targets, sensor, opts = {}) {
+    const wavePreset = String(opts?.wavePreset || ui.wavePreset?.value || "d");
+    const work = sanitizeLens(clone(lensObj));
+    const surfaces = work.surfaces;
+    setImsApertureForSensor(surfaces, Number(sensor?.h || 24));
+    enforceSingleStopSurface(surfaces);
+    ensureStopInAirBothSides(surfaces);
+    quickSanity(surfaces);
+    scaleLensGeometryToTargetEfl(surfaces, Number(targets?.targetEfl || 50), wavePreset);
+    setStopForTargetTOnSurfaces(surfaces, Number(targets?.targetEfl || 50), Number(targets?.targetT || 0));
+    promoteElementDiameters(surfaces, {
+      targetEfl: Number(targets?.targetEfl || 50),
+      targetT: Number(targets?.targetT || 0),
+      targetIC: Number(targets?.targetIC || 0),
+      stage: 1,
+      strength: 0.82,
+      keepFl: false,
+    });
+    enforcePupilHealthFloors(surfaces, {
+      targetEfl: Number(targets?.targetEfl || 50),
+      targetT: Number(targets?.targetT || 0),
+      targetIC: Number(targets?.targetIC || 0),
+      stage: 1,
+      keepFl: false,
+    });
+    setImsApertureForSensor(surfaces, Number(sensor?.h || 24));
+    ensureStopInAirBothSides(surfaces);
+    quickSanity(surfaces);
+    return sanitizeLens(work);
+  }
+
+  function scratchGrowReasonElementCost(reason) {
+    const r = String(reason || "").toLowerCase();
+    if (r === "achromat_corrector") return 2;
+    return 1;
+  }
+
+  function pickScratchGrowReason(priority, targets, cycleIdx = 0) {
+    const p = priority || {};
+    const icNeed = Math.max(0, Number(p.icNeedMm || 0));
+    const distRms = Number.isFinite(p.distRmsScore) ? Number(p.distRmsScore) : 999;
+    const distMax = Number.isFinite(p.distMaxScore) ? Number(p.distMaxScore) : 999;
+    const sharp = Number.isFinite(p.sharpness) ? Number(p.sharpness) : 999;
+    const targetIC = Math.max(0, Number(targets?.targetIC || 0));
+
+    if (targetIC > 0 && icNeed > Math.max(0.55, targetIC * 0.02)) return "rear_expander";
+    if (distRms > 0.90 || distMax > 1.80) return "distortion_corrector";
+    if (sharp > 1.15 || distRms > 0.60) return (cycleIdx % 2 === 0) ? "achromat_corrector" : "field_flattener";
+    return "field_flattener";
+  }
+
+  function growLensByOneBlock(lensObj, reason, ctx = {}) {
+    const why = String(reason || "").toLowerCase();
+    const work = sanitizeLens(clone(lensObj));
+    const surfaces = work.surfaces;
+    const imsIdx = surfaces.findIndex((s) => String(s?.type || "").toUpperCase() === "IMS");
+    if (imsIdx < 0) return null;
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    const targets = ctx?.targets || {};
+    const sensor = ctx?.sensor || getSensorWH();
+    const targetEfl = clamp(Math.abs(Number(targets.targetEfl || 50)), 14, 260);
+    const targetT = Math.max(0.7, Number(targets.targetT || 2.0));
+    const targetIC = Math.max(0, Number(targets.targetIC || 0));
+    const distEdge = Number(ctx?.priority?.distEdgePct || 0);
+
+    const m = (rel, lo, hi) => scratchMmFromF(targetEfl, rel, lo, hi);
+    const r = (rel, lo, hi, sign) => scratchRadiusFromF(targetEfl, rel, lo, hi, sign);
+    const stopAp = stopIdx >= 0
+      ? Math.max(PHYS_CFG.minAperture, Number(surfaces[stopIdx]?.ap || 0))
+      : clamp(targetEfl / (2 * targetT), PHYS_CFG.minAperture, 26);
+    const halfDiag = 0.5 * Math.hypot(Number(sensor?.w || 36), Number(sensor?.h || 24));
+    const baseAp = clamp(Math.max(stopAp * 1.12, halfDiag * 0.85, targetIC > 0 ? targetIC * 0.30 : 0, 6.0), 6.0, 33.0);
+
+    const clampInsert = (at) => Math.max(1, Math.min(Math.max(1, imsIdx), at | 0));
+    const insertBlock = (at, block) => {
+      const idx = clampInsert(at);
+      surfaces.splice(idx, 0, ...block);
+      return idx;
+    };
+
+    if (why === "rear_expander") {
+      const at = clampInsert(Math.max(stopIdx + 1, imsIdx - 1));
+      insertBlock(at, scratchMakeElementPair({
+        R1: r(1.04, 18, 380, +1),
+        R2: r(1.46, 20, 460, -1),
+        tGlass: m(0.08, 1.8, 11),
+        tAir: m(0.14, 2.2, 18),
+        ap: clamp(baseAp * 1.18, 8, 35),
+        glass: "N-LAK9",
+      }));
+    } else if (why === "distortion_corrector") {
+      let at = stopIdx >= 0 ? (stopIdx + 1) : (imsIdx - 1);
+      if (at >= imsIdx) at = Math.max(1, imsIdx - 1);
+      const sign = distEdge >= 0 ? -1 : +1;
+      insertBlock(at, scratchMakeElementPair({
+        R1: r(2.80, 30, 640, sign),
+        R2: r(1.90, 22, 520, sign),
+        tGlass: m(0.05, 0.9, 5.8),
+        tAir: m(0.06, 1.0, 6.5),
+        ap: clamp(baseAp * 1.08, 6, 30),
+        glass: "N-BK7HT",
+      }));
+    } else if (why === "achromat_corrector") {
+      const at = stopIdx >= 0 ? Math.min(imsIdx, stopIdx + 1) : Math.max(1, imsIdx - 1);
+      const pairA = scratchMakeElementPair({
+        R1: r(1.25, 18, 420, +1),
+        R2: r(1.54, 18, 420, -1),
+        tGlass: m(0.05, 1.0, 6.4),
+        tAir: m(0.03, 0.35, 1.8),
+        ap: clamp(baseAp * 1.04, 6, 30),
+        glass: "N-BK7HT",
+      });
+      const pairB = scratchMakeElementPair({
+        R1: r(1.10, 16, 360, -1),
+        R2: r(1.80, 20, 460, +1),
+        tGlass: m(0.05, 1.0, 6.0),
+        tAir: m(0.10, 1.0, 9.5),
+        ap: clamp(baseAp * 1.04, 6, 30),
+        glass: "N-SF5",
+      });
+      insertBlock(at, [...pairA, ...pairB]);
+    } else {
+      // field_flattener default
+      const at = clampInsert(imsIdx);
+      insertBlock(at, scratchMakeElementPair({
+        R1: r(2.90, 28, 660, +1),
+        R2: r(4.50, 46, 900, -1),
+        tGlass: m(0.04, 0.7, 4.6),
+        tAir: m(0.06, 0.8, 5.8),
+        ap: clamp(Math.max(baseAp * 0.98, halfDiag * 0.95), 5.5, 28),
+        glass: "N-BK7HT",
+      }));
+    }
+
+    enforceSingleStopSurface(surfaces);
+    ensureStopInAirBothSides(surfaces);
+    setImsApertureForSensor(surfaces, Number(sensor?.h || 24));
+    quickSanity(surfaces);
+    return sanitizeLens(work);
+  }
+
+  function scratchPassesForAggressiveness(aggr, targets, growthCycle = false) {
+    const profile = SCRATCH_CFG.stageIters[normalizeScratchAggressiveness(aggr)] || SCRATCH_CFG.stageIters.normal;
+    const hasIC = Number(targets?.targetIC || 0) > 0;
+    const scale = growthCycle ? 0.78 : 1.0;
+    const passes = [
+      { id: "A", label: "FL acquire", targetT: 0, targetIC: 0, iters: Math.max(300, Math.round(profile.A * scale)) },
+      { id: "B", label: "T tune", targetT: Number(targets?.targetT || 0), targetIC: 0, iters: Math.max(300, Math.round(profile.B * scale)) },
+    ];
+    if (hasIC) {
+      passes.push({
+        id: "C",
+        label: "IC growth",
+        targetT: Number(targets?.targetT || 0),
+        targetIC: Number(targets?.targetIC || 0),
+        iters: Math.max(600, Math.round(profile.C * scale)),
+      });
+    }
+    passes.push({
+      id: "D",
+      label: "Polish",
+      targetT: Number(targets?.targetT || 0),
+      targetIC: Number(targets?.targetIC || 0),
+      iters: Math.max(700, Math.round(profile.D * scale)),
+    });
+    return passes;
+  }
+
+  function scratchOptModeForPass(aggr, passId) {
+    const a = normalizeScratchAggressiveness(aggr);
+    if (a === "wild") return "wild";
+    if (a === "normal" && (passId === "C" || passId === "D")) return "wild";
+    return "safe";
+  }
+
+  function applyOptimizerBestUnsafe() {
+    if (!optBest?.lens) return false;
+    loadLens(optBest.lens);
+    if (ui.focusMode) ui.focusMode.value = "lens";
+    if (ui.sensorOffset) ui.sensorOffset.value = "0";
+    if (ui.lensFocus) ui.lensFocus.value = Number(optBest?.eval?.lensShift || 0).toFixed(2);
+    renderAll();
+    return true;
+  }
+
+  function evaluateCurrentLensPriorityForTargets(targets) {
+    const sensor = getSensorWH();
+    const fieldAngle = num(ui.fieldAngle?.value, 0);
+    const rayCount = Math.max(9, Math.min(61, (num(ui.rayCount?.value, 31) | 0)));
+    const wavePreset = ui.wavePreset?.value || "d";
+    const evalRes = evalLensMerit(lens, {
+      targetEfl: Number(targets?.targetEfl || 50),
+      targetT: Number(targets?.targetT || 0),
+      targetIC: Math.max(0, Number(targets?.targetIC || 0)),
+      fieldAngle,
+      rayCount,
+      wavePreset,
+      sensorW: sensor.w,
+      sensorH: sensor.h,
+      evalTier: "accurate",
+      icOptions: Number(targets?.targetIC || 0) > 0 ? { mode: "lut", cfg: OPT_IC_CFG } : { mode: "skip" },
+    });
+    const pri = buildOptPriority(evalRes, {
+      targetEfl: Number(targets?.targetEfl || 50),
+      targetIC: Math.max(0, Number(targets?.targetIC || 0)),
+      targetT: Number(targets?.targetT || 0),
+    });
+    return { evalRes, pri };
+  }
+
+  function scratchProgressMetric(priority, targets) {
+    const p = priority;
+    if (!p) return Infinity;
+    if (!p.feasible) {
+      return 1e9 + p.feasibilityDebt * 120 + p.eflErrRel * 1e5;
+    }
+    const hasT = Number(targets?.targetT || 0) > 0;
+    const hasIC = Number(targets?.targetIC || 0) > 0;
+    return (
+      p.eflErrRel * 120000 +
+      (hasT ? p.tErrAbs * 900 : 0) +
+      (hasIC ? p.icNeedMm * 460 : 0) +
+      p.distRmsScore * 90 +
+      p.distMaxScore * 40 +
+      p.sharpness * 120
+    );
+  }
+
+  function scratchTargetsReached(priority, targets) {
+    if (!priority?.feasible) return false;
+    if (!(Number(priority.eflErrRel) <= (OPT_STAGE_CFG.flStageRel + 1e-4))) return false;
+    if (Number(targets?.targetT || 0) > 0) {
+      if (!(Number(priority.tErrAbs) <= Math.max(0.20, OPT_STAGE_CFG.tGoodAbs))) return false;
+    }
+    if (Number(targets?.targetIC || 0) > 0) {
+      if (!(Number(priority.icNeedMm) <= Math.max(0.30, Number(targets.targetIC) * 0.01))) return false;
+    }
+    return true;
+  }
+
+  async function runScratchOptimizerPass(pass, targets, aggr, meta = {}) {
+    if (!pass) return evaluateCurrentLensPriorityForTargets(targets);
+    if (ui.optTargetFL) ui.optTargetFL.value = Number(targets.targetEfl).toFixed(2);
+    if (ui.optTargetT) ui.optTargetT.value = Number(pass.targetT || 0).toFixed(2);
+    if (ui.optTargetIC) ui.optTargetIC.value = Math.max(0, Number(pass.targetIC || 0)).toFixed(2);
+    if (ui.optIters) ui.optIters.value = String(Math.max(60, Number(pass.iters || 600) | 0));
+    if (ui.optPop) ui.optPop.value = scratchOptModeForPass(aggr, pass.id);
+
+    const tag = meta?.tag ? `${meta.tag} • ` : "";
+    setOptLog(
+      `Build From Scratch\n` +
+      `${tag}stage ${pass.id}: ${pass.label}\n` +
+      `targets FL ${Number(targets.targetEfl).toFixed(2)} • T ${Number(pass.targetT || 0).toFixed(2)} • IC ${Math.max(0, Number(pass.targetIC || 0)).toFixed(2)}\n` +
+      `optimizer ${ui.optPop?.value || "safe"} • ${ui.optIters?.value || pass.iters} iters`
+    );
+    await runOptimizer();
+    applyOptimizerBestUnsafe();
+    return evaluateCurrentLensPriorityForTargets(targets);
+  }
+
+  async function buildFromScratchPipeline({
+    targetEfl,
+    targetT,
+    targetIC = 0,
+    family = "auto",
+    maxElements = 8,
+    aggressiveness = "normal",
+  } = {}) {
+    if (scratchBuildRunning) return;
+    if (optRunning) {
+      toast("Stop optimizer first before Build From Scratch.");
+      return;
+    }
+
+    scratchBuildRunning = true;
+    if (ui.btnBuildScratch) ui.btnBuildScratch.disabled = true;
+    const prevOptIters = ui.optIters?.value;
+    const prevOptPop = ui.optPop?.value;
+
+    try {
+      const sensor = getSensorWH();
+      const wavePreset = ui.wavePreset?.value || "d";
+      const tRaw = Number(targetT ?? num(ui.optTargetT?.value, 2.0));
+      const targets = {
+        targetEfl: clamp(Math.abs(Number(targetEfl || num(ui.optTargetFL?.value, 50))), 12, 320),
+        targetT: (Number.isFinite(tRaw) && tRaw > 0.25) ? tRaw : 2.0,
+        targetIC: Math.max(0, Number(targetIC ?? num(ui.optTargetIC?.value, 0))),
+      };
+      const aggr = normalizeScratchAggressiveness(aggressiveness);
+      const familyResolved = resolveScratchFamily(family, targets.targetEfl);
+      const maxElems = clampScratchMaxElements(maxElements);
+
+      if (ui.optTargetFL) ui.optTargetFL.value = targets.targetEfl.toFixed(2);
+      if (ui.optTargetT) ui.optTargetT.value = targets.targetT.toFixed(2);
+      if (ui.optTargetIC) ui.optTargetIC.value = targets.targetIC.toFixed(2);
+
+      const baseLens = generateBaseLens(
+        familyResolved,
+        targets,
+        { w: sensor.w, h: sensor.h },
+        { aggressiveness: aggr }
+      );
+      const prepared = prepareScratchLensForTargets(
+        baseLens,
+        targets,
+        { w: sensor.w, h: sensor.h },
+        { wavePreset }
+      );
+      loadLens(prepared);
+      if (ui.focusMode) ui.focusMode.value = "lens";
+      if (ui.sensorOffset) ui.sensorOffset.value = "0";
+      autoFocus();
+
+      const startElements = countLensElements(lens.surfaces);
+      setOptLog(
+        `Build From Scratch\n` +
+        `family ${scratchFamilyLabel(familyResolved)} • aggr ${aggr}\n` +
+        `targets FL ${targets.targetEfl.toFixed(2)} • T ${targets.targetT.toFixed(2)} • IC ${targets.targetIC.toFixed(2)}\n` +
+        `elements ${startElements}/${maxElems}`
+      );
+
+      const firstPasses = scratchPassesForAggressiveness(aggr, targets, false);
+      let snap = null;
+      for (let i = 0; i < firstPasses.length; i++) {
+        snap = await runScratchOptimizerPass(firstPasses[i], targets, aggr, {
+          tag: `pass ${i + 1}/${firstPasses.length}`,
+        });
+      }
+
+      let bestPri = snap?.pri || evaluateCurrentLensPriorityForTargets(targets).pri;
+      let bestMetric = scratchProgressMetric(bestPri, targets);
+      let plateauRun = 0;
+      const maxGrowCycles = Number(SCRATCH_CFG.maxGrowCycles[aggr] || 4);
+
+      for (let cycle = 0; cycle < maxGrowCycles; cycle++) {
+        const cur = evaluateCurrentLensPriorityForTargets(targets);
+        if (scratchTargetsReached(cur.pri, targets)) break;
+
+        const curElements = countLensElements(lens.surfaces);
+        if (curElements >= maxElems) break;
+
+        let reason = pickScratchGrowReason(cur.pri, targets, cycle);
+        let cost = scratchGrowReasonElementCost(reason);
+        if (curElements + cost > maxElems) {
+          const fallback = (curElements + 1 <= maxElems)
+            ? (cur.pri.icNeedMm > 0.5 ? "rear_expander" : "field_flattener")
+            : null;
+          if (!fallback) break;
+          reason = fallback;
+          cost = 1;
+        }
+
+        const grown = growLensByOneBlock(lens, reason, {
+          targets,
+          sensor: { w: sensor.w, h: sensor.h },
+          family: familyResolved,
+          priority: cur.pri,
+          aggressiveness: aggr,
+        });
+        if (!grown) break;
+        const preparedGrow = prepareScratchLensForTargets(
+          grown,
+          targets,
+          { w: sensor.w, h: sensor.h },
+          { wavePreset }
+        );
+        loadLens(preparedGrow);
+        if (ui.focusMode) ui.focusMode.value = "lens";
+        if (ui.sensorOffset) ui.sensorOffset.value = "0";
+        autoFocus();
+
+        const growPasses = scratchPassesForAggressiveness(aggr, targets, true);
+        setOptLog(
+          `Build From Scratch\n` +
+          `grow ${cycle + 1}/${maxGrowCycles}: ${reason} (+${cost} elem)\n` +
+          `elements ${countLensElements(lens.surfaces)}/${maxElems}\n` +
+          `running staged optimize...`
+        );
+        for (let i = 0; i < growPasses.length; i++) {
+          snap = await runScratchOptimizerPass(growPasses[i], targets, aggr, {
+            tag: `grow ${cycle + 1} • pass ${i + 1}/${growPasses.length}`,
+          });
+        }
+
+        const after = evaluateCurrentLensPriorityForTargets(targets);
+        const metric = scratchProgressMetric(after.pri, targets);
+        const relImprove = (bestMetric - metric) / Math.max(1e-6, Math.abs(bestMetric));
+        if (metric < bestMetric) {
+          bestMetric = metric;
+          bestPri = after.pri;
+        }
+        if (relImprove <= Number(SCRATCH_CFG.plateauImproveFrac || 0.01)) plateauRun++;
+        else plateauRun = 0;
+
+        if (plateauRun >= 2 && aggr !== "wild") break;
+      }
+
+      const finalPolishIters = Math.max(800, Math.round(Number((SCRATCH_CFG.stageIters[aggr] || SCRATCH_CFG.stageIters.normal).D) * 0.75));
+      await runScratchOptimizerPass(
+        {
+          id: "D",
+          label: "Final polish",
+          targetT: targets.targetT,
+          targetIC: targets.targetIC,
+          iters: finalPolishIters,
+        },
+        targets,
+        aggr,
+        { tag: "final" }
+      );
+
+      const final = evaluateCurrentLensPriorityForTargets(targets);
+      const p = final.pri;
+      const done = scratchTargetsReached(p, targets);
+      const finalElems = countLensElements(lens.surfaces);
+      setOptLog(
+        `Build From Scratch ${done ? "DONE ✅" : "DONE (best effort)"}\n` +
+        `family ${scratchFamilyLabel(familyResolved)} • aggr ${aggr}\n` +
+        `elements ${finalElems}/${maxElems}\n` +
+        `FL err ${(Number(p.eflErrRel || 0) * 100).toFixed(2)}%\n` +
+        `T err ${Number.isFinite(p.tErrAbs) ? p.tErrAbs.toFixed(2) : "—"}\n` +
+        `IC short ${Number.isFinite(p.icNeedMm) ? p.icNeedMm.toFixed(2) : "—"}mm\n` +
+        `Dist RMS ${Number.isFinite(p.distRmsPct) ? Math.abs(p.distRmsPct).toFixed(2) : "—"}% • MAX ${Number.isFinite(p.distMaxPct) ? Math.abs(p.distMaxPct).toFixed(2) : "—"}%\n` +
+        `${fmtPhysOpt(final.evalRes, targets)}\n` +
+        `stage ${p.stageName}`
+      );
+
+      toast(
+        `Build from scratch ${done ? "done" : "ready (best effort)"} • ${scratchFamilyLabel(familyResolved)} • FL ${Number.isFinite(p.efl) ? p.efl.toFixed(1) : "—"}mm`
+      );
+      scheduleAutosave();
+    } catch (err) {
+      console.error(err);
+      setOptLog(
+        `Build From Scratch failed\n${String(err?.message || err)}`
+      );
+      toast("Build From Scratch failed. Check console/log.");
+    } finally {
+      if (ui.optIters && prevOptIters != null) ui.optIters.value = String(prevOptIters);
+      if (ui.optPop && prevOptPop != null) ui.optPop.value = String(prevOptPop);
+      scratchBuildRunning = false;
+      if (ui.btnBuildScratch) ui.btnBuildScratch.disabled = false;
+      scheduleRenderAll();
+    }
+  }
+
+  function openBuildScratchModal() {
+    if (!ui.newLensModal) return;
+    if (scratchBuildRunning || optRunning) {
+      toast("Wait for current build/optimizer run to finish.");
+      return;
+    }
+
+    const curSensor = getSensorWH();
+    const curFamily = resolveScratchFamily("auto", num(ui.optTargetFL?.value, 50));
+    ui.newLensModal.innerHTML = `
+      <div class="modalCard" role="dialog" aria-modal="true" aria-label="Build From Scratch">
+        <div class="modalTop">
+          <div>
+            <div class="modalTitle">Build From Scratch</div>
+            <div class="modalSub">Generate topology + staged optimize + auto-grow blocks until targets or max elements.</div>
+          </div>
+          <button class="modalX" id="bfClose" type="button">✕</button>
+        </div>
+        <div class="modalScroll">
+          <div class="modalGrid">
+            <div class="field">
+              <label>Target FL (mm)</label>
+              <input id="bfTargetFL" type="number" step="0.1" value="${num(ui.optTargetFL?.value, 50).toFixed(2)}" />
+            </div>
+            <div class="field">
+              <label>Target T</label>
+              <input id="bfTargetT" type="number" step="0.05" value="${num(ui.optTargetT?.value, 2.0).toFixed(2)}" />
+            </div>
+            <div class="field">
+              <label>Target IC (mm)</label>
+              <input id="bfTargetIC" type="number" step="0.1" min="0" value="${Math.max(0, num(ui.optTargetIC?.value, 0)).toFixed(2)}" />
+            </div>
+            <div class="field">
+              <label>Family</label>
+              <select id="bfFamily">
+                <option value="auto" selected>Auto (${scratchFamilyLabel(curFamily)} now)</option>
+                <option value="double_gauss">Double-Gauss</option>
+                <option value="retrofocus_wide">Retrofocus Wide</option>
+                <option value="telephoto">Telephoto</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Max elements</label>
+              <input id="bfMaxElements" type="number" step="1" min="3" max="14" value="8" />
+            </div>
+            <div class="field">
+              <label>Aggressiveness</label>
+              <select id="bfAggro">
+                <option value="safe">safe</option>
+                <option value="normal" selected>normal</option>
+                <option value="wild">wild</option>
+              </select>
+            </div>
+            <div class="fieldFull">
+              <div class="hint">
+                Sensor currently: ${curSensor.w.toFixed(2)}×${curSensor.h.toFixed(2)}mm.
+                Build uses existing mount/physics constraints (PL intrusion/throat, stop in AIR, min CT/gaps).
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="modalBottom">
+          <button class="btn" id="bfCancel" type="button">Cancel</button>
+          <button class="btn btnPrimary" id="bfRun" type="button">Build</button>
+        </div>
+      </div>
+    `;
+
+    ui.newLensModal.classList.remove("hidden");
+    ui.newLensModal.setAttribute("aria-hidden", "false");
+
+    const close = () => {
+      ui.newLensModal.classList.add("hidden");
+      ui.newLensModal.setAttribute("aria-hidden", "true");
+      ui.newLensModal.innerHTML = "";
+    };
+
+    ui.newLensModal.querySelector("#bfClose")?.addEventListener("click", close);
+    ui.newLensModal.querySelector("#bfCancel")?.addEventListener("click", close);
+    ui.newLensModal.addEventListener("click", (e) => {
+      if (e.target === ui.newLensModal) close();
+    });
+
+    ui.newLensModal.querySelector("#bfRun")?.addEventListener("click", () => {
+      const payload = {
+        targetEfl: num($("#bfTargetFL")?.value, num(ui.optTargetFL?.value, 50)),
+        targetT: Math.max(0, num($("#bfTargetT")?.value, num(ui.optTargetT?.value, 2.0))),
+        targetIC: Math.max(0, num($("#bfTargetIC")?.value, num(ui.optTargetIC?.value, 0))),
+        family: normalizeScratchFamily($("#bfFamily")?.value || "auto"),
+        maxElements: clampScratchMaxElements($("#bfMaxElements")?.value),
+        aggressiveness: normalizeScratchAggressiveness($("#bfAggro")?.value || "normal"),
+      };
+      close();
+      buildFromScratchPipeline(payload);
+    });
+  }
+
   // -------------------- Scale → FL + Set T --------------------
   function scaleToFocal() {
     const target = num(prompt("Target focal length (mm)?", String(ui.optTargetFL?.value || "75")), NaN);
@@ -3648,6 +4575,7 @@
   // ===========================
   let optRunning = false;
   let optBest = null; // {lens, score, meta}
+  let scratchBuildRunning = false;
 
   function setOptLog(lines){
     if (!ui.optLog) return;
@@ -5533,6 +6461,7 @@
     ui.btnRaysFS?.addEventListener("click", () => toggleFullscreen(ui.raysPane));
 
     // optimizer
+    ui.btnBuildScratch?.addEventListener("click", openBuildScratchModal);
     ui.btnOptStart?.addEventListener("click", runOptimizer);
     ui.btnOptStop?.addEventListener("click", stopOptimizer);
     ui.btnOptApply?.addEventListener("click", applyBest);
