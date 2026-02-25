@@ -1319,6 +1319,9 @@
   const SCRATCH_CFG = {
     autoFamilyWideMaxMm: 35,
     autoFamilyNormalMaxMm: 85,
+    effortMin: 0.60,
+    effortMax: 4.00,
+    effortDefault: 1.00,
     maxGrowCycles: {
       safe: 2,
       normal: 4,
@@ -1330,6 +1333,10 @@
       wild:   { A: 1500, B: 1900, C: 3400, D: 4200 },
     },
     plateauImproveFrac: 0.010,
+    acceptableFlRel: 0.020,
+    acceptableTAbs: 0.35,
+    acceptableIcNeedMm: 0.60,
+    acceptableIcNeedFrac: 0.03,
     minElements: 3,
     maxElementsHardCap: 14,
   };
@@ -3638,6 +3645,15 @@
     return Math.max(minE, Math.min(maxE, Math.round(raw)));
   }
 
+  function clampScratchEffort(v) {
+    const raw = Number(v);
+    const lo = Number(SCRATCH_CFG.effortMin || 0.6);
+    const hi = Number(SCRATCH_CFG.effortMax || 4.0);
+    const def = Number(SCRATCH_CFG.effortDefault || 1.0);
+    if (!Number.isFinite(raw)) return clamp(def, lo, hi);
+    return clamp(raw, lo, hi);
+  }
+
   function scratchMmFromF(f, rel, lo, hi) {
     return clamp(Math.abs(Number(f || 50)) * Number(rel || 0.1), Number(lo || 0.1), Number(hi || 999));
   }
@@ -4171,10 +4187,11 @@
     return sanitizeLens(work);
   }
 
-  function scratchPassesForAggressiveness(aggr, targets, growthCycle = false) {
+  function scratchPassesForAggressiveness(aggr, targets, growthCycle = false, effort = 1.0) {
     const profile = SCRATCH_CFG.stageIters[normalizeScratchAggressiveness(aggr)] || SCRATCH_CFG.stageIters.normal;
     const hasIC = Number(targets?.targetIC || 0) > 0;
-    const scale = growthCycle ? 0.78 : 1.0;
+    const effortScale = clampScratchEffort(effort);
+    const scale = (growthCycle ? 0.78 : 1.0) * effortScale;
     const passes = [
       { id: "A", label: "FL acquire", targetT: 0, targetIC: 0, iters: Math.max(300, Math.round(profile.A * scale)) },
       { id: "B", label: "T tune", targetT: Number(targets?.targetT || 0), targetIC: 0, iters: Math.max(300, Math.round(profile.B * scale)) },
@@ -4278,6 +4295,22 @@
     return true;
   }
 
+  function scratchAcceptableReached(priority, targets) {
+    if (!priority?.feasible) return false;
+    if (!(Number(priority.eflErrRel) <= Number(SCRATCH_CFG.acceptableFlRel || 0.02))) return false;
+    if (Number(targets?.targetT || 0) > 0) {
+      if (!(Number(priority.tErrAbs) <= Number(SCRATCH_CFG.acceptableTAbs || 0.35))) return false;
+    }
+    if (Number(targets?.targetIC || 0) > 0) {
+      const icNeedLimit = Math.max(
+        Number(SCRATCH_CFG.acceptableIcNeedMm || 0.60),
+        Number(targets.targetIC || 0) * Number(SCRATCH_CFG.acceptableIcNeedFrac || 0.03)
+      );
+      if (!(Number(priority.icNeedMm) <= icNeedLimit)) return false;
+    }
+    return true;
+  }
+
   async function runScratchOptimizerPass(pass, targets, aggr, meta = {}) {
     if (!pass) return evaluateCurrentLensPriorityForTargets(targets);
     if (ui.optTargetFL) ui.optTargetFL.value = Number(targets.targetEfl).toFixed(2);
@@ -4325,6 +4358,8 @@
     family = "auto",
     maxElements = 8,
     aggressiveness = "normal",
+    effort = 1.0,
+    stopWhenAcceptable = true,
   } = {}) {
     if (scratchBuildRunning) return;
     if (optRunning) {
@@ -4347,6 +4382,8 @@
         targetIC: Math.max(0, Number(targetIC ?? num(ui.optTargetIC?.value, 0))),
       };
       const aggr = normalizeScratchAggressiveness(aggressiveness);
+      const effortScale = clampScratchEffort(effort);
+      const stopOnAccept = stopWhenAcceptable !== false;
       const familyResolved = resolveScratchFamily(family, targets.targetEfl);
       const maxElems = clampScratchMaxElements(maxElements);
 
@@ -4374,14 +4411,15 @@
       const startElements = countLensElements(lens.surfaces);
       setOptLog(
         `Build From Scratch\n` +
-        `family ${scratchFamilyLabel(familyResolved)} • aggr ${aggr}\n` +
+        `family ${scratchFamilyLabel(familyResolved)} • aggr ${aggr} • effort x${effortScale.toFixed(2)} • stopOnAccept ${stopOnAccept ? "ON" : "OFF"}\n` +
         `targets FL ${targets.targetEfl.toFixed(2)} • T ${targets.targetT.toFixed(2)} • IC ${targets.targetIC.toFixed(2)}\n` +
         `elements ${startElements}/${maxElems}`
       );
 
-      const firstPasses = scratchPassesForAggressiveness(aggr, targets, false);
+      const firstPasses = scratchPassesForAggressiveness(aggr, targets, false, effortScale);
       let snap = null;
       let bestFeasibleSnapshot = null;
+      let earlyStopReason = "";
       const storeBestFeasible = (label, resObj) => {
         const pri = resObj?.pri;
         if (!pri?.feasible) return;
@@ -4403,16 +4441,25 @@
           tag: `pass ${i + 1}/${firstPasses.length}`,
         });
         storeBestFeasible(`pass_${firstPasses[i]?.id || i}`, snap);
+        if (stopOnAccept && scratchAcceptableReached(snap?.pri, targets)) {
+          earlyStopReason = `accepted in initial pass ${firstPasses[i]?.id || (i + 1)}`;
+          break;
+        }
       }
 
       let bestPri = snap?.pri || evaluateCurrentLensPriorityForTargets(targets).pri;
       let bestMetric = scratchProgressMetric(bestPri, targets);
       let plateauRun = 0;
-      const maxGrowCycles = Number(SCRATCH_CFG.maxGrowCycles[aggr] || 4);
+      const maxGrowCyclesBase = Number(SCRATCH_CFG.maxGrowCycles[aggr] || 4);
+      const maxGrowCycles = Math.max(1, Math.round(maxGrowCyclesBase * effortScale));
 
-      for (let cycle = 0; cycle < maxGrowCycles; cycle++) {
+      for (let cycle = 0; cycle < maxGrowCycles && !earlyStopReason; cycle++) {
         const cur = evaluateCurrentLensPriorityForTargets(targets);
         if (scratchTargetsReached(cur.pri, targets)) break;
+        if (stopOnAccept && scratchAcceptableReached(cur.pri, targets)) {
+          earlyStopReason = `accepted before grow cycle ${cycle + 1}`;
+          break;
+        }
 
         const curElements = countLensElements(lens.surfaces);
         if (curElements >= maxElems) break;
@@ -4447,7 +4494,7 @@
         if (ui.sensorOffset) ui.sensorOffset.value = "0";
         autoFocus();
 
-        const growPasses = scratchPassesForAggressiveness(aggr, targets, true);
+        const growPasses = scratchPassesForAggressiveness(aggr, targets, true, effortScale);
         setOptLog(
           `Build From Scratch\n` +
           `grow ${cycle + 1}/${maxGrowCycles}: ${reason} (+${cost} elem)\n` +
@@ -4458,7 +4505,13 @@
           snap = await runScratchOptimizerPass(growPasses[i], targets, aggr, {
             tag: `grow ${cycle + 1} • pass ${i + 1}/${growPasses.length}`,
           });
+          storeBestFeasible(`grow_${cycle + 1}_${growPasses[i]?.id || i}`, snap);
+          if (stopOnAccept && scratchAcceptableReached(snap?.pri, targets)) {
+            earlyStopReason = `accepted in grow ${cycle + 1} pass ${growPasses[i]?.id || (i + 1)}`;
+            break;
+          }
         }
+        if (earlyStopReason) break;
 
         const after = evaluateCurrentLensPriorityForTargets(targets);
         storeBestFeasible(`grow_${cycle + 1}`, after);
@@ -4474,19 +4527,28 @@
         if (plateauRun >= 2 && aggr !== "wild") break;
       }
 
-      const finalPolishIters = Math.max(800, Math.round(Number((SCRATCH_CFG.stageIters[aggr] || SCRATCH_CFG.stageIters.normal).D) * 0.75));
-      await runScratchOptimizerPass(
-        {
-          id: "D",
-          label: "Final polish",
-          targetT: targets.targetT,
-          targetIC: targets.targetIC,
-          iters: finalPolishIters,
-        },
-        targets,
-        aggr,
-        { tag: "final" }
-      );
+      const preFinal = evaluateCurrentLensPriorityForTargets(targets);
+      const shouldSkipFinalPolish = stopOnAccept && scratchAcceptableReached(preFinal.pri, targets);
+      if (shouldSkipFinalPolish) {
+        if (!earlyStopReason) earlyStopReason = "accepted before final polish";
+      } else {
+        const finalPolishIters = Math.max(
+          800,
+          Math.round(Number((SCRATCH_CFG.stageIters[aggr] || SCRATCH_CFG.stageIters.normal).D) * 0.75 * effortScale)
+        );
+        await runScratchOptimizerPass(
+          {
+            id: "D",
+            label: "Final polish",
+            targetT: targets.targetT,
+            targetIC: targets.targetIC,
+            iters: finalPolishIters,
+          },
+          targets,
+          aggr,
+          { tag: "final" }
+        );
+      }
 
       const final = evaluateCurrentLensPriorityForTargets(targets);
       let finalSnap = final;
@@ -4501,16 +4563,20 @@
         finalSnap = evaluateCurrentLensPriorityForTargets(targets);
       }
       const p = finalSnap.pri;
-      const done = scratchTargetsReached(p, targets);
+      const doneStrict = scratchTargetsReached(p, targets);
+      const acceptable = scratchAcceptableReached(p, targets);
+      const done = doneStrict || (stopOnAccept && acceptable);
       const finalElems = countLensElements(lens.surfaces);
       setOptLog(
         `Build From Scratch ${done ? "DONE ✅" : "DONE (best effort)"}\n` +
-        `family ${scratchFamilyLabel(familyResolved)} • aggr ${aggr}\n` +
+        `family ${scratchFamilyLabel(familyResolved)} • aggr ${aggr} • effort x${effortScale.toFixed(2)}\n` +
+        `${earlyStopReason ? `stop ${earlyStopReason}\n` : ""}` +
         `${bestFeasibleSnapshot ? `fallback ${bestFeasibleSnapshot.label}\n` : ""}` +
         `elements ${finalElems}/${maxElems}\n` +
         `FL err ${(Number(p.eflErrRel || 0) * 100).toFixed(2)}%\n` +
         `T err ${Number.isFinite(p.tErrAbs) ? p.tErrAbs.toFixed(2) : "—"}\n` +
         `IC short ${Number.isFinite(p.icNeedMm) ? p.icNeedMm.toFixed(2) : "—"}mm\n` +
+        `acceptable ${acceptable ? "YES" : "NO"} • strict ${doneStrict ? "YES" : "NO"}\n` +
         `Dist RMS ${Number.isFinite(p.distRmsPct) ? Math.abs(p.distRmsPct).toFixed(2) : "—"}% • MAX ${Number.isFinite(p.distMaxPct) ? Math.abs(p.distMaxPct).toFixed(2) : "—"}%\n` +
         `${fmtPhysOpt(finalSnap.evalRes, targets)}\n` +
         `stage ${p.stageName}`
@@ -4588,10 +4654,22 @@
                 <option value="wild">wild</option>
               </select>
             </div>
+            <div class="field">
+              <label>Build effort (x)</label>
+              <input id="bfEffort" type="number" step="0.1" min="${Number(SCRATCH_CFG.effortMin || 0.6).toFixed(1)}" max="${Number(SCRATCH_CFG.effortMax || 4.0).toFixed(1)}" value="${Number(SCRATCH_CFG.effortDefault || 1.0).toFixed(1)}" />
+            </div>
+            <div class="field">
+              <label>Stop when acceptable</label>
+              <select id="bfStopAccept">
+                <option value="1" selected>Yes (recommended)</option>
+                <option value="0">No (always polish)</option>
+              </select>
+            </div>
             <div class="fieldFull">
               <div class="hint">
                 Sensor currently: ${curSensor.w.toFixed(2)}×${curSensor.h.toFixed(2)}mm.
                 Build uses existing mount/physics constraints (PL intrusion/throat, stop in AIR, min CT/gaps).
+                Effort > 1.0 gives longer runs and more grow cycles.
               </div>
             </div>
           </div>
@@ -4626,6 +4704,8 @@
         family: normalizeScratchFamily($("#bfFamily")?.value || "auto"),
         maxElements: clampScratchMaxElements($("#bfMaxElements")?.value),
         aggressiveness: normalizeScratchAggressiveness($("#bfAggro")?.value || "normal"),
+        effort: clampScratchEffort($("#bfEffort")?.value),
+        stopWhenAcceptable: String($("#bfStopAccept")?.value || "1") !== "0",
       };
       close();
       buildFromScratchPipeline(payload);
@@ -6256,10 +6336,14 @@
         return candAccEval;
       };
 
+      const auditEveryBase = Math.max(20, Number(OPT_EVAL_CFG.accurateAuditEvery || 90) | 0);
+      const auditEvery = (stallIters > 280)
+        ? Math.max(10, Math.round(auditEveryBase * 0.35))
+        : auditEveryBase;
       const shouldAccurateCheck =
         isEvalBetterByPlan(candEval, curEval, targets) ||
         isEvalBetterByPlan(candEval, best.eval, targets) ||
-        (i % Math.max(20, Number(OPT_EVAL_CFG.accurateAuditEvery || 90) | 0) === 0);
+        (i % auditEvery === 0);
       if (shouldAccurateCheck) promoteCandAccurate();
 
       let accept = false;
@@ -6330,13 +6414,16 @@
             accept =
               candPri.feasible &&
               candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
-              candPri.tErrAbs <= curPri.tErrAbs + 1e-4;
+              candPri.tErrAbs <= curPri.tErrAbs + 0.03 &&
+              candPri.icNeedMm <= curPri.icNeedMm + 0.25;
           } else if (curPri.stage === 2) {
             // IC growth stays target-dominant: do not accept worse IC shortfall.
+            const icTol = stallIters > 220 ? 0.35 : 0.18;
             accept =
               candPri.feasible &&
               candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
-              candPri.icNeedMm <= curPri.icNeedMm + 0.01;
+              candPri.icNeedMm <= curPri.icNeedMm + icTol &&
+              candPri.tErrAbs <= curPri.tErrAbs + 0.12;
           } else {
             const dE = planEnergy(candPri) - planEnergy(curPri);
             const tempScale = (curPri.stage === 2 ? 520 : 300) * Math.max(0.10, temp);
@@ -6351,8 +6438,29 @@
       }
       if (accept && !candAccurate) {
         promoteCandAccurate();
+        const stage1PlateauOk =
+          curPri.stage === 1 &&
+          candPri.stage === 1 &&
+          candPri.feasible &&
+          candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
+          candPri.tErrAbs <= curPri.tErrAbs + 0.03 &&
+          candPri.icNeedMm <= curPri.icNeedMm + 0.25;
+        const stage2PlateauOk =
+          curPri.stage === 2 &&
+          candPri.stage === 2 &&
+          candPri.feasible &&
+          candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
+          candPri.icNeedMm <= curPri.icNeedMm + (stallIters > 220 ? 0.35 : 0.18) &&
+          candPri.tErrAbs <= curPri.tErrAbs + 0.12;
+        const stage0PlateauOk =
+          curPri.stage === 0 &&
+          candPri.stage === 0 &&
+          candPri.eflErrRel <= curPri.eflErrRel + 1e-6;
         const accStillGood =
           isEvalBetterByPlan(candEval, curEval, targets) ||
+          stage0PlateauOk ||
+          stage1PlateauOk ||
+          stage2PlateauOk ||
           (
             curPri.stage === 1 &&
             candPri.stage === 1 &&
