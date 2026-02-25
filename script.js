@@ -3793,6 +3793,62 @@
     }
   }
 
+  function recenterScratchStopSurface(surfaces, opts = {}) {
+    if (!Array.isArray(surfaces) || surfaces.length < 5) return false;
+    const imsIdx = surfaces.findIndex((s) => String(s?.type || "").toUpperCase() === "IMS");
+    if (imsIdx < 3) return false;
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 1 || stopIdx >= imsIdx) return false;
+
+    computeVertices(surfaces, 0, 0);
+    const firstX = firstPhysicalVertexX(surfaces);
+    const lastX = lastPhysicalVertexX(surfaces);
+    if (!(Number.isFinite(firstX) && Number.isFinite(lastX) && lastX > firstX + 1e-6)) return false;
+
+    const centerFrac = clamp(Number(opts?.centerFrac ?? 0.50), 0.20, 0.80);
+    const targetX = firstX + (lastX - firstX) * centerFrac;
+    const currentX = Number(surfaces[stopIdx]?.vx);
+
+    const candidates = [];
+    for (let ins = 2; ins <= imsIdx - 1; ins++) {
+      const prev = surfaces[ins - 1];
+      const next = surfaces[ins];
+      const tp = String(prev?.type || "").toUpperCase();
+      const tn = String(next?.type || "").toUpperCase();
+      if (tp === "OBJ" || tp === "IMS" || tn === "OBJ" || tn === "IMS") continue;
+      const prevMedium = String(resolveGlassName(prev?.glass || "AIR")).toUpperCase();
+      if (prevMedium !== "AIR") continue;
+      const x = Number(next?.vx);
+      if (!Number.isFinite(x)) continue;
+      candidates.push({ ins, x, dist: Math.abs(x - targetX) });
+    }
+    if (!candidates.length) return false;
+    candidates.sort((a, b) => a.dist - b.dist);
+    const best = candidates[0];
+    const minMoveMm = Math.max(0.5, Number(opts?.minMoveMm ?? 2.0));
+    if (Number.isFinite(currentX) && Math.abs(best.x - currentX) < minMoveMm) return false;
+
+    const stopSurf = surfaces.splice(stopIdx, 1)[0];
+    let insertIdx = best.ins;
+    if (insertIdx > stopIdx) insertIdx--;
+
+    const movedStop = stopSurf || {};
+    movedStop.type = "STOP";
+    movedStop.stop = true;
+    movedStop.glass = "AIR";
+    movedStop.R = 0;
+    movedStop.t = clamp(
+      Math.max(PHYS_CFG.minAirGap, Number(movedStop.t || opts?.defaultStopGapMm || 2.0)),
+      PHYS_CFG.minAirGap,
+      24
+    );
+
+    surfaces.splice(insertIdx, 0, movedStop);
+    enforceSingleStopSurface(surfaces);
+    ensureStopInAirBothSides(surfaces);
+    return true;
+  }
+
   function scaleLensGeometryToTargetEfl(surfaces, targetEfl, wavePreset) {
     if (!Array.isArray(surfaces) || surfaces.length < 3) return false;
     const tgt = Number(targetEfl || 0);
@@ -4020,6 +4076,7 @@
       stop: false,
     });
 
+    recenterScratchStopSurface(surfaces);
     enforceRearMountStart(surfaces);
     quickSanity(surfaces);
 
@@ -4041,6 +4098,7 @@
     enforceRearMountStart(surfaces);
     setImsApertureForSensor(surfaces, Number(sensor?.h || 24));
     enforceSingleStopSurface(surfaces);
+    recenterScratchStopSurface(surfaces);
     ensureStopInAirBothSides(surfaces);
     quickSanity(surfaces);
     scaleLensGeometryToTargetEfl(surfaces, Number(targets?.targetEfl || 50), wavePreset);
@@ -4060,6 +4118,7 @@
       stage: 1,
       keepFl: false,
     });
+    recenterScratchStopSurface(surfaces);
     setImsApertureForSensor(surfaces, Number(sensor?.h || 24));
     ensureStopInAirBothSides(surfaces);
     enforceRearMountStart(surfaces);
@@ -4088,7 +4147,7 @@
     if (!p.feasible && (intrusion > 0.15 || overlap > 0.01)) {
       return (cycleIdx % 2 === 0) ? "distortion_corrector" : "achromat_corrector";
     }
-    if (!p.feasible && bflShort > 0.8) return "rear_expander";
+    if (bflShort > 0.8) return "rear_expander";
 
     if (targetIC > 0 && icNeed > Math.max(0.55, targetIC * 0.02)) return "rear_expander";
     if (distRms > 0.90 || distMax > 1.80) return "distortion_corrector";
@@ -4179,6 +4238,7 @@
       }));
     }
 
+    recenterScratchStopSurface(surfaces);
     enforceSingleStopSurface(surfaces);
     ensureStopInAirBothSides(surfaces);
     setImsApertureForSensor(surfaces, Number(sensor?.h || 24));
@@ -4285,6 +4345,7 @@
 
   function scratchTargetsReached(priority, targets) {
     if (!priority?.feasible) return false;
+    if (Number(priority.bflShortMm || 0) > 0.8) return false;
     if (!(Number(priority.eflErrRel) <= (OPT_STAGE_CFG.flStageRel + 1e-4))) return false;
     if (Number(targets?.targetT || 0) > 0) {
       if (!(Number(priority.tErrAbs) <= Math.max(0.20, OPT_STAGE_CFG.tGoodAbs))) return false;
@@ -4297,6 +4358,7 @@
 
   function scratchAcceptableReached(priority, targets) {
     if (!priority?.feasible) return false;
+    if (Number(priority.bflShortMm || 0) > 1.0) return false;
     if (!(Number(priority.eflErrRel) <= Number(SCRATCH_CFG.acceptableFlRel || 0.02))) return false;
     if (Number(targets?.targetT || 0) > 0) {
       if (!(Number(priority.tErrAbs) <= Number(SCRATCH_CFG.acceptableTAbs || 0.35))) return false;
@@ -5136,7 +5198,9 @@
     if (s.length) s[s.length-1].type = "IMS";
 
     if (topo) enforceTopology(s, topo);
+    enforceRearMountStart(s);
     quickSanity(s);
+    enforceRearMountStart(s);
     if (topo) enforceTopology(s, topo);
     return sanitizeLens(L);
   }
@@ -5444,6 +5508,8 @@
 
     quickSanity(c.surfaces);
     if (topo) enforceTopology(c.surfaces, topo);
+    enforceRearMountStart(c.surfaces);
+    quickSanity(c.surfaces);
     return c;
   }
 
@@ -5465,13 +5531,20 @@
     const k = clamp(1 + (kRaw - 1) * s, 1 - cap, 1 + cap);
     if (!Number.isFinite(k) || Math.abs(k - 1) < 1e-6) return false;
 
+    const rearIdx = findScratchRearSurfaceIndex(surfaces);
     for (let i = 0; i < surfaces.length; i++) {
       const ss = surfaces[i];
       if (surfaceIsLocked(ss)) continue;
       const t = String(ss?.type || "").toUpperCase();
       if (t === "OBJ" || t === "IMS") continue;
       ss.R = Number(ss.R || 0) * k;
-      ss.t = clamp(Number(ss.t || 0) * k, PHYS_CFG.minThickness, 42);
+      if (i === rearIdx) {
+        // Keep image-space gap tied to mount geometry during FL nudges.
+        ss.t = Math.max(PHYS_CFG.minAirGap, Number(ss.t || 0));
+        ss.glass = "AIR";
+      } else {
+        ss.t = clamp(Number(ss.t || 0) * k, PHYS_CFG.minThickness, 42);
+      }
       const ap0 = Number(ss.ap || 0);
       if (keepAperture) {
         const kAp = (k >= 1)
@@ -5483,6 +5556,7 @@
         ss.ap = clamp(ap0 * k, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
       }
     }
+    enforceRearMountStart(surfaces);
     quickSanity(surfaces);
     return true;
   }
@@ -5815,7 +5889,7 @@
     const physPenalty = Math.max(0, Number(evalRes?.physPenalty || 0));
     const bflShortMm = Number.isFinite(bfl) ? Math.max(0, MERIT_CFG.bflMin - bfl) : MERIT_CFG.bflMin;
     const bflBad = bflShortMm > 0.5;
-    const feasible = !hardInvalid && intrusionMm <= 1e-3 && overlapMm <= 1e-3 && !bflBad;
+    const feasible = !hardInvalid && intrusionMm <= 1e-3 && overlapMm <= 1e-3;
     const feasibilityDebt =
       (hardInvalid ? 5000 : 0) +
       intrusionMm * 1200 +
@@ -5881,6 +5955,7 @@
       physPenalty,
       bfl,
       bflShortMm,
+      bflBad,
       efl,
       eflErrRel,
       flInBand,
