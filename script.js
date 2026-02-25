@@ -1292,6 +1292,7 @@
     flStageRel: 0.01,     // do not leave FL phase until within +/-1%
     flPreferRel: 0.002,   // in later phases, do not accept >0.2% FL degradation
     flHoldRel: 0.05,      // hard FL hold after lock (within +/-5%)
+    polishFlDriftRel: 0.0008, // in fine tune, keep FL nearly locked while reducing residual distortion
     icStageDriftRel: 0.006, // allow a bit more FL drift during IC growth
     tCoarseAbs: 0.75,     // before IC growth, first pull T close enough
     icPassFrac: 0.95,     // IC phase is "good enough" at >=95% of requested IC
@@ -1320,6 +1321,8 @@
 
   let _softIcCacheKey = "";
   let _softIcCacheVal = null;
+  let _distCacheKey = "";
+  let _distCacheVal = null;
 
   function chiefRadiusAtFieldDeg(workSurfaces, fieldDeg, wavePreset, sensorX) {
     const chief = buildChiefRay(workSurfaces, fieldDeg);
@@ -2097,21 +2100,240 @@
     return val;
   }
 
-  function estimateDistortionPct(surfaces, wavePreset, sensorX, sensorW, sensorH, efl, mode = "d") {
-    const req = requiredHalfFieldDeg(efl, sensorW, sensorH, mode);
+  function distortionFlavorFromEdgePct(edgePct) {
+    const v = Number(edgePct);
+    if (!Number.isFinite(v)) return "unknown";
+    if (v <= -0.05) return "barrel";
+    if (v >= 0.05) return "pincushion";
+    return "neutral";
+  }
+
+  function measureDistortionChiefSamples(
+    surfaces,
+    wavePreset,
+    sensorX,
+    sensorW,
+    sensorH,
+    efl,
+    mode = "d",
+    fracs = null
+  ) {
     const idealHalf = coverageHalfSizeMm(sensorW, sensorH, mode);
-    if (!Number.isFinite(req) || !Number.isFinite(idealHalf) || idealHalf < 1e-9) return null;
+    if (!Number.isFinite(efl) || efl <= 1e-9 || !Number.isFinite(idealHalf) || idealHalf < 1e-9) return null;
+    const fractions = Array.isArray(fracs) && fracs.length
+      ? fracs.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0)
+      : [0.30, 0.60, 0.90, 1.00];
+    if (!fractions.length) return null;
 
-    const chief = buildChiefRay(surfaces, req);
-    const tr = traceRayForward(clone(chief), surfaces, wavePreset);
-    if (!tr || tr.vignetted || tr.tir) return null;
+    let sumSq = 0;
+    let maxAbs = 0;
+    let validSamples = 0;
+    const samples = [];
+    for (let i = 0; i < fractions.length; i++) {
+      const frac = clamp(fractions[i], 1e-4, 1.25);
+      const rIdeal = idealHalf * frac;
+      if (!(Number.isFinite(rIdeal) && rIdeal > 1e-9)) continue;
+      const thetaRad = Math.atan(rIdeal / efl);
+      const thetaDeg = thetaRad * (180 / Math.PI);
+      const chief = buildChiefRay(surfaces, thetaDeg);
+      const tr = traceRayForward(clone(chief), surfaces, wavePreset);
+      if (!tr || tr.vignetted || tr.tir || !tr.endRay) {
+        samples.push({
+          frac,
+          thetaDeg,
+          rIdeal,
+          rActual: null,
+          distRel: null,
+          distPct: null,
+          ok: false,
+        });
+        continue;
+      }
+      const y = rayHitYAtX(tr.endRay, sensorX);
+      if (!Number.isFinite(y)) {
+        samples.push({
+          frac,
+          thetaDeg,
+          rIdeal,
+          rActual: null,
+          distRel: null,
+          distPct: null,
+          ok: false,
+        });
+        continue;
+      }
+      const rActual = Math.abs(y);
+      const distRel = (rActual - rIdeal) / rIdeal;
+      const distAbs = Math.abs(distRel);
+      validSamples += 1;
+      sumSq += distRel * distRel;
+      if (distAbs > maxAbs) maxAbs = distAbs;
+      samples.push({
+        frac,
+        thetaDeg,
+        rIdeal,
+        rActual,
+        distRel,
+        distPct: distRel * 100,
+        ok: true,
+      });
+    }
+    if (validSamples <= 0) return null;
+    const rmsPct = Math.sqrt(sumSq / validSamples) * 100;
+    const edgeSample = [...samples].reverse().find((s) => Number.isFinite(s?.distPct));
+    const edgePct = Number.isFinite(edgeSample?.distPct) ? Number(edgeSample.distPct) : null;
+    const sampleCount = fractions.length;
+    const missingSamples = Math.max(0, sampleCount - validSamples);
+    return {
+      mode,
+      sampleCount,
+      validSamples,
+      missingSamples,
+      rmsPct,
+      maxPct: maxAbs * 100,
+      edgePct,
+      flavor: distortionFlavorFromEdgePct(edgePct),
+      samples,
+    };
+  }
 
-    const y = rayHitYAtX(tr.endRay, sensorX);
-    if (!Number.isFinite(y)) return null;
+  function getDistortionChiefStatsCached(
+    surfaces,
+    wavePreset,
+    sensorX,
+    sensorW,
+    sensorH,
+    efl,
+    mode = "d",
+    fracs = null
+  ) {
+    const fractions = Array.isArray(fracs) && fracs.length
+      ? fracs.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0)
+      : [0.30, 0.60, 0.90, 1.00];
+    const keyObj = {
+      wavePreset: String(wavePreset || "d"),
+      sensorX: Number(sensorX || 0).toFixed(6),
+      sensorW: Number(sensorW || 0).toFixed(4),
+      sensorH: Number(sensorH || 0).toFixed(4),
+      efl: Number(efl || 0).toFixed(6),
+      mode: String(mode || "d"),
+      fracs: fractions.map((x) => Number(x).toFixed(4)),
+      surfaces: (surfaces || []).map((s) => ({
+        type: String(s?.type || ""),
+        R: Number(s?.R || 0).toFixed(6),
+        ap: Number(s?.ap || 0).toFixed(6),
+        t: Number(s?.t || 0).toFixed(6),
+        vx: Number(s?.vx || 0).toFixed(6),
+        glass: String(s?.glass || "AIR"),
+        stop: !!s?.stop,
+      })),
+    };
+    const key = JSON.stringify(keyObj);
+    if (key === _distCacheKey) return _distCacheVal;
+    const val = measureDistortionChiefSamples(
+      surfaces,
+      wavePreset,
+      sensorX,
+      sensorW,
+      sensorH,
+      efl,
+      mode,
+      fractions
+    );
+    _distCacheKey = key;
+    _distCacheVal = val;
+    return val;
+  }
 
-    const actualHalf = Math.abs(y);
-    const dist = ((actualHalf - idealHalf) / idealHalf) * 100;
-    return Number.isFinite(dist) ? dist : null;
+  function estimateDistortionPct(surfaces, wavePreset, sensorX, sensorW, sensorH, efl, mode = "d") {
+    const stats = getDistortionChiefStatsCached(
+      surfaces,
+      wavePreset,
+      sensorX,
+      sensorW,
+      sensorH,
+      efl,
+      mode
+    );
+    return Number.isFinite(stats?.edgePct) ? Number(stats.edgePct) : null;
+  }
+
+  function formatDistortionBadgeText(stats, compact = false) {
+    if (!stats || !Number.isFinite(stats?.rmsPct) || !Number.isFinite(stats?.maxPct)) {
+      return compact ? "Dist RMS — • MAX —" : "Dist RMS: — • MAX: —";
+    }
+    const rmsTxt = `${Number(stats.rmsPct).toFixed(2)}%`;
+    const maxTxt = `${Number(stats.maxPct).toFixed(2)}%`;
+    const flavor = String(stats?.flavor || "neutral");
+    const tail = (flavor === "barrel" || flavor === "pincushion") ? ` • ${flavor}` : "";
+    return compact
+      ? `Dist RMS ${rmsTxt} • MAX ${maxTxt}${tail}`
+      : `Dist RMS: ${rmsTxt} • MAX: ${maxTxt}${tail}`;
+  }
+
+  function distortionWeightForStage(stage) {
+    const st = Number(stage);
+    if (st === 0) return Number(MERIT_CFG.distStageWeights?.[0] || 0);
+    if (st === 1) return Number(MERIT_CFG.distStageWeights?.[1] || 0);
+    if (st === 2) return Number(MERIT_CFG.distStageWeights?.[2] || 0);
+    if (st >= 3) return Number(MERIT_CFG.distStageWeights?.[3] || 0);
+    return 0;
+  }
+
+  function distortionWeightForPriority(pri) {
+    if (!pri || !pri.feasible) return 0;
+    let w = distortionWeightForStage(pri.stage);
+    if (!pri.flInBand) {
+      w = Math.min(w, Number(MERIT_CFG.distStageWeights?.[0] || 0));
+    }
+    if (pri.stage >= 3 && !pri.tGood) {
+      // Keep distortion gentle until T is also within its good band.
+      w = Math.min(w, Number(MERIT_CFG.distStageWeights?.[1] || w));
+    }
+    return Math.max(0, w);
+  }
+
+  function distortionPenaltyFromStats(stats, distWeight = 0) {
+    const weight = Math.max(0, Number(distWeight || 0));
+    if (!stats || weight <= 0) {
+      return {
+        weight,
+        baseTerm: 0,
+        penalty: 0,
+        rmsTerm: 0,
+        maxTerm: 0,
+        missingTerm: 0,
+      };
+    }
+    const rmsPct = Number(stats?.rmsPct);
+    const maxPct = Number(stats?.maxPct);
+    if (!Number.isFinite(rmsPct) || !Number.isFinite(maxPct)) {
+      return {
+        weight,
+        baseTerm: 0,
+        penalty: 0,
+        rmsTerm: 0,
+        maxTerm: 0,
+        missingTerm: 0,
+      };
+    }
+    const rmsNorm = Math.max(1e-6, Number(MERIT_CFG.distNormPct || 1.0));
+    const maxNorm = Math.max(1e-6, Number(MERIT_CFG.distMaxNormPct || 1.5));
+    const rmsTerm = Math.pow(rmsPct / rmsNorm, 2);
+    const maxTerm = 0.5 * Math.pow(maxPct / maxNorm, 2);
+    const sampleCount = Math.max(1, Number(stats?.sampleCount || 1));
+    const missingSamples = Math.max(0, Number(stats?.missingSamples || 0));
+    const missFrac = clamp(missingSamples / sampleCount, 0, 1);
+    const missingTerm = Number(MERIT_CFG.distMissingWeight || 0) * (missFrac * missFrac);
+    const baseTerm = rmsTerm + maxTerm + missingTerm;
+    return {
+      weight,
+      baseTerm,
+      penalty: baseTerm * weight,
+      rmsTerm,
+      maxTerm,
+      missingTerm,
+    };
   }
 
   function collectUiSnapshot() {
@@ -2298,6 +2520,12 @@
     midVigWeight: 60.0,
     intrusionWeight: 16.0,
     fieldWeights: [1.0, 1.5, 2.0],
+    distSampleFracs: [0.30, 0.60, 0.90, 1.00], // chief-ray samples across image height/diag
+    distNormPct: 0.75,        // RMS distortion normalization target
+    distMaxNormPct: 1.25,     // MAX distortion normalization target
+    distMissingWeight: 1.2,   // penalize missing/invalid chief samples
+    distStageWeights: [0.10, 0.30, 0.35, 2.25], // stage 0..3
+    distFastMeasureOnlyInFlBand: true, // keep fast-tier evals lightweight outside FL lock band
 
     // target terms (optimizer uses these)
     eflWeight: 0.35,          // penalty per mm error (squared)
@@ -2343,6 +2571,9 @@
     targetT = null,
     physPenalty = 0,
     hardInvalid = false,
+    distortionStats = null,
+    distortionPenalty = 0,
+    distortionWeight = 0,
   }){
     const edge = Number.isFinite(fov?.dfov) ? clamp(fov.dfov * 0.5, 4, 60) : 15;
     const f0 = 0;
@@ -2420,6 +2651,7 @@
 
     if (Number.isFinite(physPenalty) && physPenalty > 0) merit += physPenalty;
     if (hardInvalid) merit += MERIT_CFG.hardInvalidPenalty;
+    if (Number.isFinite(distortionPenalty) && distortionPenalty > 0) merit += distortionPenalty;
 
     const breakdown = {
       rmsCenter, rmsEdge,
@@ -2430,6 +2662,14 @@
       vigMidPct: Math.round(vigMid * 100),
       physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
       hardInvalid: !!hardInvalid,
+      distRmsPct: Number.isFinite(distortionStats?.rmsPct) ? Number(distortionStats.rmsPct) : null,
+      distMaxPct: Number.isFinite(distortionStats?.maxPct) ? Number(distortionStats.maxPct) : null,
+      distEdgePct: Number.isFinite(distortionStats?.edgePct) ? Number(distortionStats.edgePct) : null,
+      distFlavor: String(distortionStats?.flavor || "unknown"),
+      distPenalty: Number.isFinite(distortionPenalty) ? Number(distortionPenalty) : 0,
+      distWeight: Number.isFinite(distortionWeight) ? Number(distortionWeight) : 0,
+      distSampleCount: Number.isFinite(distortionStats?.sampleCount) ? Number(distortionStats.sampleCount) : 0,
+      distValidSamples: Number.isFinite(distortionStats?.validSamples) ? Number(distortionStats.validSamples) : 0,
     };
 
     return { merit, breakdown };
@@ -2941,11 +3181,44 @@
       ? `Image Circle: Ø${icDiameterMm.toFixed(1)}mm (IC${Math.round(Number(softIc?.thresholdRel || SOFT_IC_CFG.thresholdRel || 0.35) * 100)}%)`
       : "Image Circle: —";
 
-    const distPct = estimateDistortionPct(lens.surfaces, wavePreset, sensorX, sensorW, sensorH, efl, "d");
-
     const rearVx = lastPhysicalVertexX(lens.surfaces);
     const intrusion = rearVx - plX;
     const phys = evaluatePhysicalConstraints(lens.surfaces);
+    const targetEflUi = num(ui.optTargetFL?.value, NaN);
+    const targetTUi = num(ui.optTargetT?.value, NaN);
+    const targetICUi = Math.max(0, num(ui.optTargetIC?.value, 0));
+    const distStats = getDistortionChiefStatsCached(
+      lens.surfaces,
+      wavePreset,
+      sensorX,
+      sensorW,
+      sensorH,
+      efl,
+      "d",
+      MERIT_CFG.distSampleFracs
+    );
+    const previewPri = buildOptPriority(
+      {
+        score: 0,
+        efl,
+        T,
+        softIcMm: softIcValid ? icDiameterMm : 0,
+        intrusion,
+        hardInvalid: !!phys.hardFail,
+        physPenalty: Number(phys.penalty || 0),
+        worstOverlap: Number(phys.worstOverlap || 0),
+        worstPinch: Number(phys.worstPinch || 0),
+      },
+      {
+        targetEfl: targetEflUi,
+        targetIC: targetICUi,
+        targetT: targetTUi,
+      }
+    );
+    const distWeight = distortionWeightForPriority(previewPri);
+    const distPenaltyRes = distortionPenaltyFromStats(distStats, distWeight);
+    const distBadgeText = formatDistortionBadgeText(distStats, false);
+    const distBadgeTopText = formatDistortionBadgeText(distStats, true);
 
     const meritRes = computeMeritV1({
       surfaces: lens.surfaces,
@@ -2955,10 +3228,13 @@
       fov,
       intrusion,
       efl, T, bfl,
-      targetEfl: num(ui.optTargetFL?.value, NaN),
-      targetT: num(ui.optTargetT?.value, NaN),
+      targetEfl: targetEflUi,
+      targetT: targetTUi,
       physPenalty: phys.penalty,
       hardInvalid: phys.hardFail,
+      distortionStats: distStats,
+      distortionPenalty: distPenaltyRes.penalty,
+      distortionWeight: distPenaltyRes.weight,
     });
 
     const m = meritRes.merit;
@@ -2969,6 +3245,8 @@
       `(RMS0 ${bd.rmsCenter?.toFixed?.(3) ?? "—"}mm • RMSedge ${bd.rmsEdge?.toFixed?.(3) ?? "—"}mm • Vig ${bd.vigPct}%` +
       `${Number.isFinite(bd.vigCenterPct) ? ` • V0 ${bd.vigCenterPct}%` : ""}` +
       `${Number.isFinite(bd.vigMidPct) ? ` • Vmid ${bd.vigMidPct}%` : ""}` +
+      `${Number.isFinite(bd.distRmsPct) ? ` • DistRMS ${bd.distRmsPct.toFixed(2)}%` : ""}` +
+      `${Number.isFinite(bd.distMaxPct) ? ` • DistMAX ${bd.distMaxPct.toFixed(2)}%` : ""}` +
       `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""}` +
       `${bd.physPenalty > 0 ? ` • PHYS +${bd.physPenalty.toFixed(1)}` : ""}` +
       `${bd.hardInvalid ? " • INVALID ❌" : ""})`;
@@ -2994,7 +3272,7 @@
     }
     if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
     if (ui.softIC) ui.softIC.textContent = softIcDetailTxt;
-    if (ui.dist) ui.dist.textContent = `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
+    if (ui.dist) ui.dist.textContent = distBadgeText;
     if (ui.fov) ui.fov.textContent = fovTxt;
 
     if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
@@ -3002,7 +3280,7 @@
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T_eff≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
     if (ui.softICTop) ui.softICTop.textContent = softIcTxt;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
-    if (ui.distTop) ui.distTop.textContent = ui.dist?.textContent || `Dist: ${Number.isFinite(distPct) ? `${distPct >= 0 ? "+" : ""}${distPct.toFixed(2)}%` : "—"}`;
+    if (ui.distTop) ui.distTop.textContent = distBadgeTopText;
 
     if (phys.hardFail && ui.footerWarn) {
       ui.footerWarn.textContent =
@@ -3057,6 +3335,7 @@
       tGeomTxt,
       tpTxt,
       softIcTxt,
+      distBadgeTopText,
       fovTxt,
       rearTxt,
       lenTxt,
@@ -4177,6 +4456,12 @@
         lensShift,
         rms0: null,
         rmsE: null,
+        distRmsPct: null,
+        distMaxPct: null,
+        distEdgePct: null,
+        distFlavor: "unknown",
+        distPenalty: 0,
+        distWeight: 0,
         afOk,
         breakdown: {
           rmsCenter: null,
@@ -4186,6 +4471,14 @@
           fields: [0, 0, 0],
           physPenalty: Number(phys.penalty || 0),
           hardInvalid: true,
+          distRmsPct: null,
+          distMaxPct: null,
+          distEdgePct: null,
+          distFlavor: "unknown",
+          distPenalty: 0,
+          distWeight: 0,
+          distSampleCount: 0,
+          distValidSamples: 0,
         },
       });
     }
@@ -4208,26 +4501,9 @@
     const T = estimateEffectiveT(Tgeom, centerTp.goodFrac);
 
     const fov = computeFovDeg(efl, sensorW, sensorH);
-
-    const meritRes = computeMeritV1({
-      surfaces,
-      wavePreset,
-      sensorX,
-      rayCount: evalRayCount,
-      fov,
-      intrusion,
-      efl, T, bfl,
-      targetEfl,
-      targetT,
-      physPenalty: phys.penalty,
-      hardInvalid: phys.hardFail,
-    });
-    tTraceMs += (performance.now() - trace0);
-
-    // tiny extra: hard fail if NaNs
-    const score = Number.isFinite(meritRes.merit) ? meritRes.merit : 1e9;
     let softIcMm = null;
     let icShortfallMm = 0;
+    let icEvalMs = 0;
     if (Number.isFinite(targetIC) && targetIC > 0) {
       const ic0 = performance.now();
       const icMode = String(icOptions?.mode || (evalTierNorm === "fast" ? "proxy" : "lut")).toLowerCase();
@@ -4259,8 +4535,80 @@
         softIcMm = Number.isFinite(measured) ? measured : 0;
       }
       icShortfallMm = Math.max(0, Number(targetIC) - softIcMm);
-      tIcMs += (performance.now() - ic0);
+      icEvalMs = performance.now() - ic0;
     }
+    tIcMs += icEvalMs;
+
+    const provisionalPriority = buildOptPriority(
+      {
+        score: 0,
+        efl,
+        T,
+        softIcMm: Number.isFinite(softIcMm) ? Number(softIcMm) : 0,
+        intrusion,
+        hardInvalid: !!phys.hardFail,
+        physPenalty: Number(phys.penalty || 0),
+        worstOverlap: Number(phys.worstOverlap || 0),
+        worstPinch: Number(phys.worstPinch || 0),
+      },
+      { targetEfl, targetIC, targetT }
+    );
+    const shouldMeasureDistortion =
+      (evalTierNorm !== "fast") ||
+      !MERIT_CFG.distFastMeasureOnlyInFlBand ||
+      provisionalPriority.flInBand;
+    const distortionStats = shouldMeasureDistortion
+      ? (
+        evalTierNorm === "fast"
+          ? measureDistortionChiefSamples(
+              surfaces,
+              wavePreset,
+              sensorX,
+              sensorW,
+              sensorH,
+              efl,
+              "d",
+              MERIT_CFG.distSampleFracs
+            )
+          : getDistortionChiefStatsCached(
+              surfaces,
+              wavePreset,
+              sensorX,
+              sensorW,
+              sensorH,
+              efl,
+              "d",
+              MERIT_CFG.distSampleFracs
+            )
+      )
+      : null;
+    const distortionWeight = shouldMeasureDistortion
+      ? distortionWeightForPriority(provisionalPriority)
+      : 0;
+    const distPenaltyRes = distortionPenaltyFromStats(distortionStats, distortionWeight);
+
+    const meritRes = computeMeritV1({
+      surfaces,
+      wavePreset,
+      sensorX,
+      rayCount: evalRayCount,
+      fov,
+      intrusion,
+      efl,
+      T,
+      bfl,
+      targetEfl,
+      targetT,
+      physPenalty: phys.penalty,
+      hardInvalid: phys.hardFail,
+      distortionStats,
+      distortionPenalty: distPenaltyRes.penalty,
+      distortionWeight: distPenaltyRes.weight,
+    });
+    tTraceMs += Math.max(0, performance.now() - trace0 - icEvalMs);
+
+    // tiny extra: hard fail if NaNs
+    const score = Number.isFinite(meritRes.merit) ? meritRes.merit : 1e9;
 
     return finishEval({
       score,
@@ -4280,6 +4628,12 @@
       afOk,
       rms0: meritRes.breakdown.rmsCenter,
       rmsE: meritRes.breakdown.rmsEdge,
+      distRmsPct: meritRes.breakdown.distRmsPct,
+      distMaxPct: meritRes.breakdown.distMaxPct,
+      distEdgePct: meritRes.breakdown.distEdgePct,
+      distFlavor: meritRes.breakdown.distFlavor,
+      distPenalty: meritRes.breakdown.distPenalty,
+      distWeight: meritRes.breakdown.distWeight,
       breakdown: meritRes.breakdown,
     });
   }
@@ -4332,6 +4686,15 @@
     const sharpness = (Number.isFinite(rms0) ? rms0 : 999) +
       1.7 * (Number.isFinite(rmsE) ? rmsE : 999) +
       0.5 * (Number.isFinite(vigFrac) ? vigFrac : 1);
+    const distRmsPctRaw = Number(evalRes?.distRmsPct);
+    const distMaxPctRaw = Number(evalRes?.distMaxPct);
+    const distEdgePct = Number(evalRes?.distEdgePct);
+    const distFlavor = String(evalRes?.distFlavor || distortionFlavorFromEdgePct(distEdgePct));
+    const distPenalty = Math.max(0, Number(evalRes?.distPenalty || 0));
+    const distWeight = Math.max(0, Number(evalRes?.distWeight || 0));
+    const distRmsScore = Number.isFinite(distRmsPctRaw) ? Math.abs(distRmsPctRaw) : 999;
+    const distMaxScore = Number.isFinite(distMaxPctRaw) ? Math.abs(distMaxPctRaw) : 999;
+    const distortionScore = distRmsScore + 0.45 * distMaxScore;
 
     let stage = feasible ? 0 : -1;
     // Stage flow: FL acquire -> T coarse -> IC growth -> fine tune.
@@ -4367,6 +4730,15 @@
       tErrAbs,
       tGood,
       sharpness,
+      distRmsPct: Number.isFinite(distRmsPctRaw) ? distRmsPctRaw : null,
+      distMaxPct: Number.isFinite(distMaxPctRaw) ? distMaxPctRaw : null,
+      distEdgePct: Number.isFinite(distEdgePct) ? distEdgePct : null,
+      distFlavor,
+      distPenalty,
+      distWeight,
+      distRmsScore,
+      distMaxScore,
+      distortionScore,
     };
   }
 
@@ -4419,6 +4791,9 @@
 
     if (A.stage === 3) {
       if (Math.abs(A.tErrAbs - B.tErrAbs) > 1e-4) return A.tErrAbs - B.tErrAbs;
+      if (Math.abs(A.eflErrRel - B.eflErrRel) > OPT_STAGE_CFG.polishFlDriftRel) return A.eflErrRel - B.eflErrRel;
+      if (Math.abs(A.distRmsScore - B.distRmsScore) > 0.003) return A.distRmsScore - B.distRmsScore;
+      if (Math.abs(A.distMaxScore - B.distMaxScore) > 0.006) return A.distMaxScore - B.distMaxScore;
       if (Math.abs(A.sharpness - B.sharpness) > 1e-5) return A.sharpness - B.sharpness;
     }
 
@@ -4435,12 +4810,15 @@
     const eflW = pri.stage <= 0 ? 360000 : (pri.stage === 1 ? 60000 : 16000);
     const icW = pri.stage === 2 ? 1400 : 260;
     const tW = pri.stage === 1 ? 520 : (pri.stage === 2 ? 260 : 140);
+    const distW = pri.stage >= 3 ? 240 : (pri.stage === 2 ? 55 : 10);
     return (
       stagePenalty * 100000 +
       pri.eflErrRel * eflW +
       pri.icNeedMm * icW +
       pri.tErrAbs * tW +
-      pri.sharpness * 15
+      pri.sharpness * 15 +
+      pri.distRmsScore * distW +
+      pri.distMaxScore * distW * 0.45
     );
   }
 
@@ -4468,6 +4846,14 @@
     const tTxt = Number.isFinite(p.T) ? p.T.toFixed(2) : "—";
     const eTxt = Number.isFinite(p.tErrAbs) ? p.tErrAbs.toFixed(2) : "—";
     return `T ${tTxt} (target ${targetT.toFixed(2)} • err ${eTxt}${p.tGood ? " ✅" : ""})`;
+  }
+
+  function fmtDistOpt(evalRes) {
+    const p = buildOptPriority(evalRes, { targetEfl: 1, targetIC: 0, targetT: 0 });
+    const rmsTxt = Number.isFinite(p.distRmsPct) ? `${Math.abs(p.distRmsPct).toFixed(2)}%` : "—";
+    const maxTxt = Number.isFinite(p.distMaxPct) ? `${Math.abs(p.distMaxPct).toFixed(2)}%` : "—";
+    const flavor = (p.distFlavor === "barrel" || p.distFlavor === "pincushion") ? ` • ${p.distFlavor}` : "";
+    return `Dist RMS ${rmsTxt} • MAX ${maxTxt}${flavor}`;
   }
 
   function fmtPhysOpt(evalRes, targets) {
@@ -4824,8 +5210,8 @@
       } else if (curPri.flInBand && curPri.stage === 2 && candPri.eflErrRel > OPT_STAGE_CFG.flHoldRel) {
         // IC phase may move inside FL hold band, but never outside hard hold.
         accept = false;
-      } else if (curPri.flInBand && curPri.stage === 3 && candPri.eflErrRel > curPri.eflErrRel + OPT_STAGE_CFG.flPreferRel) {
-        // Fine tune keeps FL very tight.
+      } else if (curPri.flInBand && curPri.stage === 3 && candPri.eflErrRel > curPri.eflErrRel + OPT_STAGE_CFG.polishFlDriftRel) {
+        // Fine tune (distortion polish): keep FL locked while polishing.
         accept = false;
       } else if (
         curPri.stage === 1 &&
@@ -4926,6 +5312,7 @@
             `${fmtFlOpt(best.eval, targetEfl)}\n` +
             `${fmtIcOpt(best.eval, targetIC)}\n` +
             `${fmtTOpt(best.eval, targetT)}\n` +
+            `${fmtDistOpt(best.eval)}\n` +
             `Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}%\n` +
             `INTR ${fmtIntrusion(best.eval)}\n` +
             `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
@@ -4983,7 +5370,8 @@
             `current ${fmtFlOpt(curEval, targetEfl)}\n` +
             `current ${fmtIcOpt(curEval, targetIC)}\n` +
             `current ${fmtTOpt(curEval, targetT)}\n` +
-            `best: ${fmtFlOpt(best.eval, targetEfl)} • ${fmtIcOpt(best.eval, targetIC)} • ${fmtTOpt(best.eval, targetT)} • ${fmtPhysOpt(best.eval, targets)}\n` +
+            `current ${fmtDistOpt(curEval)}\n` +
+            `best: ${fmtFlOpt(best.eval, targetEfl)} • ${fmtIcOpt(best.eval, targetIC)} • ${fmtTOpt(best.eval, targetT)} • ${fmtDistOpt(best.eval)} • ${fmtPhysOpt(best.eval, targets)}\n` +
             `${fmtEvalPerf("perf fast", perf.fast)}\n` +
             `${fmtEvalPerf("perf acc", perf.accurate)}\n`
           );
@@ -5010,6 +5398,7 @@
         `${fmtFlOpt(best.eval, targetEfl)}\n` +
         `${fmtIcOpt(best.eval, targetIC)}\n` +
         `${fmtTOpt(best.eval, targetT)}\n` +
+        `${fmtDistOpt(best.eval)}\n` +
         `Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}%\n` +
         `INTR ${fmtIntrusion(best.eval)}\n` +
         `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
