@@ -3483,9 +3483,9 @@
     const stopIdx = findStopSurfaceIndex(surfaces);
     const need = Math.max(0, Number(icNeedMm || 0));
     const growth = clamp(
-      1.10 + 0.06 * Math.random() + Math.min(0.22, need * 0.012),
-      1.08,
-      keepFl ? 1.28 : 1.35
+      1.14 + 0.08 * Math.random() + Math.min(0.34, need * 0.016),
+      1.10,
+      keepFl ? 1.42 : 1.58
     );
 
     for (let i = 0; i < surfaces.length; i++) {
@@ -3495,7 +3495,7 @@
       if (t === "OBJ" || t === "IMS") continue;
 
       const rear = (stopIdx >= 0 && i > stopIdx && i < surfaces.length - 1);
-      const localGrow = growth * (rear ? (1.04 + Math.random() * 0.08) : 1.0);
+      const localGrow = growth * (rear ? (1.07 + Math.random() * 0.12) : 1.0);
       let ap = Number(s.ap || 0) * localGrow;
 
       // Keep aperture growth physically reachable by growing radius together.
@@ -3509,7 +3509,7 @@
       s.R = signR * clamp(absR, PHYS_CFG.minRadius, 600);
 
       s.ap = clamp(ap, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
-      const tGrow = rear ? (1.02 + Math.random() * 0.08) : (1.01 + Math.random() * 0.05);
+      const tGrow = rear ? (1.04 + Math.random() * 0.12) : (1.02 + Math.random() * 0.08);
       s.t = clamp(Number(s.t || 0) * tGrow, PHYS_CFG.minThickness, 42);
     }
 
@@ -3543,7 +3543,7 @@
 
     // Coverage floor by target IC (kept moderate to avoid instant hard-fails).
     if (targetIC > 0) {
-      const floorBase = clamp(targetIC * (keepFl ? 0.36 : 0.40), 8.0, 30.0);
+      const floorBase = clamp(targetIC * (keepFl ? 0.44 : 0.50), 10.0, 34.0);
       for (let i = 0; i < surfaces.length; i++) {
         const s = surfaces[i];
         if (surfaceIsLocked(s)) continue;
@@ -3827,9 +3827,11 @@
       else if (!tGood) stage = 2;
       else stage = 3;
     }
+    const stageRank = stage < 0 ? 0 : (stage + 1); // 0=invalid, 1..4 better as objectives complete
 
     return {
       stage,
+      stageRank,
       stageName: stageName(stage),
       score,
       feasible,
@@ -3869,12 +3871,15 @@
       return A.score - B.score;
     }
 
-    // Across all stages, keep FL as primary anchor unless effectively equal.
-    if (Math.abs(A.eflErrRel - B.eflErrRel) > OPT_STAGE_CFG.flPreferRel) {
+    const flGap = Math.abs(A.eflErrRel - B.eflErrRel);
+    // FL is dominant while still acquiring FL or when either candidate drifts outside the hold band.
+    const flDominant = (A.stage <= 0 && B.stage <= 0) || !A.flInBand || !B.flInBand;
+    if (flDominant && flGap > OPT_STAGE_CFG.flPreferRel) {
       return A.eflErrRel - B.eflErrRel;
     }
 
-    if (A.stage !== B.stage) return A.stage - B.stage;
+    // Higher stage rank is better: Physics fix < FL acquire < IC growth < T tune < Sharpness.
+    if (A.stageRank !== B.stageRank) return B.stageRank - A.stageRank;
 
     if (A.stage === 0 && Math.abs(A.eflErrRel - B.eflErrRel) > 1e-6) {
       return A.eflErrRel - B.eflErrRel;
@@ -3902,11 +3907,15 @@
     if (!pri.feasible) {
       return 1e9 + pri.feasibilityDebt * 100 + pri.eflErrRel * 1e5;
     }
+    const stagePenalty = Math.max(0, 5 - Number(pri.stageRank || 0));
+    const eflW = pri.stage <= 0 ? 22000 : (pri.stage === 1 ? 2800 : 9000);
+    const icW = pri.stage === 1 ? 340 : 220;
+    const tW = pri.stage === 2 ? 120 : 95;
     return (
-      pri.stage * 100000 +
-      pri.eflErrRel * 10000 +
-      pri.icNeedMm * 220 +
-      pri.tErrAbs * 95 +
+      stagePenalty * 100000 +
+      pri.eflErrRel * eflW +
+      pri.icNeedMm * icW +
+      pri.tErrAbs * tW +
       pri.sharpness * 15
     );
   }
@@ -4003,8 +4012,8 @@
       const tries = (curPri.stage === 0)
         ? (curPri.eflErrRel > 0.20 ? 10 : 6)
         : (curPri.stage === 1)
-        ? (flLocked ? (curPri.icNeedMm > 9 ? 8 : 6) : 4)
-        : (flLocked ? 3 : 2);
+        ? (flLocked ? (curPri.icNeedMm > 9 ? 12 : 9) : 6)
+        : (flLocked ? 5 : 3);
       let cand = null;
       let candEval = null;
       let candPri = null;
@@ -4037,12 +4046,12 @@
         const baseLens = useBestBase ? best.lens : cur;
         const basePri = useBestBase ? bestPriPre : curPri;
         const c = mutateLens(baseLens, mode, topo, { stage: basePri.stage, targetIC, keepFl: flLocked });
-        if (basePri.stage === 1 && basePri.icNeedMm > 2.5 && Math.random() < 0.78) {
+        if (basePri.stage === 1 && basePri.icNeedMm > 1.0 && Math.random() < 0.92) {
           applyCoverageBoostMutation(c.surfaces, {
             targetIC,
             targetEfl,
             targetT,
-            icNeedMm: basePri.icNeedMm,
+            icNeedMm: basePri.icNeedMm + (stallIters > 220 ? 2.5 : 0),
             keepFl: flLocked,
           });
           quickSanity(c.surfaces);
@@ -4128,7 +4137,7 @@
       }
       stallIters = improvedBest ? 0 : (stallIters + 1);
 
-      if (stallIters > 520 && (i % Math.max(40, BATCH / 2) === 0)) {
+      if (stallIters > 220 && (i % Math.max(40, BATCH / 2) === 0)) {
         const bpKick = buildOptPriority(best.eval, targets);
         const kick = buildGuidedCandidate(best.lens, bpKick, targets, wavePreset, topo, true);
         const kickEval = evalLensMerit(kick, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
@@ -4151,7 +4160,7 @@
       const bestPriPost = buildOptPriority(best.eval, targets);
       const curPriPost = buildOptPriority(curEval, targets);
       const curMuchWorse =
-        (curPriPost.stage > bestPriPost.stage) ||
+        (curPriPost.stageRank < bestPriPost.stageRank) ||
         (curPriPost.eflErrRel > bestPriPost.eflErrRel + 0.08) ||
         (curEval.score > best.eval.score * 2.4);
       if (curMuchWorse && (i % Math.max(40, BATCH / 2) === 0)) {
