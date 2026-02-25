@@ -359,8 +359,28 @@
       stop: Boolean(s?.stop ?? false),
     }));
 
+    // Hard fallback: never allow an empty/broken lens model into runtime.
+    if (safe.surfaces.length < 2) {
+      const fallback = omit50ConceptV1();
+      safe.name = String(fallback?.name || "OMIT 50mm fallback");
+      safe.notes = Array.isArray(fallback?.notes) ? fallback.notes.map(String) : [];
+      safe.surfaces = (fallback?.surfaces || []).map((s) => ({
+        type: String(s?.type ?? ""),
+        R: Number(s?.R ?? 0),
+        t: Number(s?.t ?? 0),
+        ap: Number(s?.ap ?? 10),
+        glass: String(s?.glass ?? "AIR"),
+        stop: Boolean(s?.stop ?? false),
+      }));
+    }
+
     const firstStop = safe.surfaces.findIndex((s) => s.stop);
     if (firstStop >= 0) safe.surfaces.forEach((s, i) => { if (i !== firstStop) s.stop = false; });
+    if (firstStop < 0 && safe.surfaces.length >= 3) {
+      const mid = Math.max(1, Math.min(safe.surfaces.length - 2, (safe.surfaces.length / 2) | 0));
+      safe.surfaces[mid].stop = true;
+      safe.surfaces[mid].type = "STOP";
+    }
 
     safe.surfaces.forEach((s, i) => { if (!s.type || !s.type.trim()) s.type = String(i); });
 
@@ -2395,6 +2415,7 @@
       if (!raw) return false;
       const payload = JSON.parse(raw);
       if (!payload || !payload.lens) return false;
+      if (!Array.isArray(payload.lens?.surfaces) || payload.lens.surfaces.length < 2) return false;
       applyUiSnapshot(payload.ui);
       lens = sanitizeLens(payload.lens);
       selectedIndex = 0;
@@ -3148,10 +3169,15 @@
       ? "FOV: —"
       : `FOV: H ${fov.hfov.toFixed(1)}° • V ${fov.vfov.toFixed(1)}° • D ${fov.dfov.toFixed(1)}°`;
 
-    const softIc = getSoftIcForCurrentLens(lens.surfaces, sensorW, sensorH, wavePreset, rayCount);
-    const icDiameterMm = Number(
-      softIc?.usableCircleDiameterMm ?? softIc?.softICmm ?? 0
-    );
+    let softIc = null;
+    try {
+      softIc = getSoftIcForCurrentLens(lens.surfaces, sensorW, sensorH, wavePreset, rayCount);
+    } catch (err) {
+      console.error("soft-IC failed:", err);
+      softIc = { usableCircleDiameterMm: 0, thresholdRel: SOFT_IC_CFG.thresholdRel };
+      if (ui.footerWarn) ui.footerWarn.textContent = "IC calc error; using fallback.";
+    }
+    const icDiameterMm = Number(softIc?.usableCircleDiameterMm ?? softIc?.softICmm ?? 0);
     const softIcValid = Number.isFinite(icDiameterMm) && icDiameterMm > 0.1;
     const softIcTxt = softIcValid ? `IC: Ø${icDiameterMm.toFixed(1)}mm` : "IC: —";
     const softIcDetailTxt = softIcValid
@@ -3164,19 +3190,29 @@
     const intrusion = rearVx - plX;
     const phys = evaluatePhysicalConstraints(lens.surfaces);
 
-    const meritRes = computeMeritV1({
-      surfaces: lens.surfaces,
-      wavePreset,
-      sensorX,
-      rayCount,
-      fov,
-      intrusion,
-      efl, T, bfl,
-      targetEfl: num(ui.optTargetFL?.value, NaN),
-      targetT: num(ui.optTargetT?.value, NaN),
-      physPenalty: phys.penalty,
-      hardInvalid: phys.hardFail,
-    });
+    let meritRes;
+    try {
+      meritRes = computeMeritV1({
+        surfaces: lens.surfaces,
+        wavePreset,
+        sensorX,
+        rayCount,
+        fov,
+        intrusion,
+        efl, T, bfl,
+        targetEfl: num(ui.optTargetFL?.value, NaN),
+        targetT: num(ui.optTargetT?.value, NaN),
+        physPenalty: phys.penalty,
+        hardInvalid: phys.hardFail,
+      });
+    } catch (err) {
+      console.error("merit failed:", err);
+      meritRes = {
+        merit: 1e9,
+        breakdown: { rmsCenter: null, rmsEdge: null, vigPct: 100, intrusion: null, fields: [0, 0, 0], physPenalty: 0, hardInvalid: true },
+      };
+      if (ui.footerWarn) ui.footerWarn.textContent = "Merit calc error; check lens geometry.";
+    }
 
     const m = meritRes.merit;
     const bd = meritRes.breakdown;
