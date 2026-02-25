@@ -91,11 +91,14 @@
     optTargetT: $("#optTargetT"),
     optTargetIC: $("#optTargetIC"),
     optIters: $("#optIters"),
+    distOptIters: $("#distOptIters"),
     optPop: $("#optPop"),
+    optAutoApply: $("#optAutoApply"),
     optLog: $("#optLog"),
 
     btnOptStart: $("#btnOptStart"),
     btnOptDist: $("#btnOptDist"),
+    btnOptDistApply: $("#btnOptDistApply"),
     btnOptSharp: $("#btnOptSharp"),
     btnOptStop: $("#btnOptStop"),
     btnOptApply: $("#btnOptApply"),
@@ -1534,7 +1537,7 @@
     maxTDriftAbsReject: 0.45,
     maxBflShortMm: 1.0,
     iterationsMin: 800,
-    iterationsMax: 12000,
+    iterationsMax: 100000,
     progressBatch: 80,
     annealTempStart: 6.0,
     annealTempEnd: 0.4,
@@ -3447,7 +3450,9 @@
       optTargetT: ui.optTargetT?.value || "2.0",
       optTargetIC: ui.optTargetIC?.value || "0",
       optIters: ui.optIters?.value || "2000",
+      distOptIters: ui.distOptIters?.value || "12000",
       optPop: ui.optPop?.value || "safe",
+      optAutoApply: !!ui.optAutoApply?.checked,
     };
   }
 
@@ -3468,7 +3473,11 @@
     set(ui.optTargetT, snap.optTargetT);
     set(ui.optTargetIC, snap.optTargetIC);
     set(ui.optIters, snap.optIters);
+    set(ui.distOptIters, snap.distOptIters);
     set(ui.optPop, snap.optPop);
+    if (ui.optAutoApply && Object.prototype.hasOwnProperty.call(snap, "optAutoApply")) {
+      ui.optAutoApply.checked = !!snap.optAutoApply;
+    }
   }
 
   let _autosaveTimer = 0;
@@ -6163,6 +6172,7 @@
   let optRunning = false;
   let distOptRunning = false;
   let distOptStopRequested = false;
+  let distOptBest = null;
   let sharpOptRunning = false;
   let sharpOptStopRequested = false;
   let optBest = null; // {lens, score, meta}
@@ -6199,6 +6209,102 @@
     const stepTxt = (c.stepIndex && c.stepTotal) ? ` • Step ${c.stepIndex}/${c.stepTotal}` : "";
     const labelTxt = c.label ? ` • ${c.label}` : "";
     return `${base}${modeTxt}${stepTxt}${labelTxt}`;
+  }
+
+  function postOptAutoApplyEnabled() {
+    return !!ui.optAutoApply?.checked;
+  }
+
+  function queueManualBestFromState(bestLens, state, meta = {}) {
+    if (!bestLens?.surfaces || !Array.isArray(bestLens.surfaces)) return false;
+    const phys = state?.phys || {};
+    const cross = state?.cross || {};
+    const focusMode = String(meta?.focusMode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
+    const sensorX = Number(meta?.sensorX ?? state?.focus?.sensorX ?? num(ui.sensorOffset?.value, 0));
+    const lensShift = Number(meta?.lensShift ?? state?.focus?.lensShift ?? num(ui.lensFocus?.value, 0));
+    const scoreGuess =
+      Number(state?.sharp?.score) ||
+      Number(state?.distScore) ||
+      Number(state?.score) ||
+      0;
+    optBest = {
+      lens: sanitizeLens(clone(bestLens)),
+      eval: {
+        score: Number.isFinite(scoreGuess) ? scoreGuess : 0,
+        efl: Number.isFinite(Number(state?.efl)) ? Number(state.efl) : null,
+        T: Number.isFinite(Number(state?.T)) ? Number(state.T) : null,
+        bfl: Number.isFinite(Number(state?.bfl)) ? Number(state.bfl) : null,
+        intrusion: Number.isFinite(Number(state?.intrusion)) ? Number(state.intrusion) : 0,
+        physPenalty: Number.isFinite(Number(phys?.penalty)) ? Number(phys.penalty) : 0,
+        worstOverlap: Number.isFinite(Number(phys?.worstOverlap)) ? Number(phys.worstOverlap) : 0,
+        worstPinch: Number.isFinite(Number(phys?.worstPinch)) ? Number(phys.worstPinch) : 0,
+        hardInvalid: false,
+        internalCrossPairs: Math.max(0, Number(cross?.crossPairs || 0)),
+        internalCrossSegments: Math.max(0, Number(cross?.crossSegments || 0)),
+        lensShift,
+        softIcMm: Number.isFinite(Number(meta?.softIcMm)) ? Number(meta.softIcMm) : 0,
+        rms0: Number.isFinite(Number(state?.sharp?.centerRmsMm)) ? Number(state.sharp.centerRmsMm) : null,
+        rmsE: Number.isFinite(Number(state?.sharp?.edgeRmsMm)) ? Number(state.sharp.edgeRmsMm) : null,
+        distEdgePct: Number.isFinite(Number(state?.dist70Pct)) ? Number(state.dist70Pct) : null,
+      },
+      iter: Number(meta?.iter || 0),
+      meta: {
+        source: String(meta?.source || "post-opt"),
+        focusMode,
+        sensorX: Number.isFinite(sensorX) ? sensorX : 0,
+        lensShift: Number.isFinite(lensShift) ? lensShift : 0,
+      },
+    };
+    return true;
+  }
+
+  function queueDistortionBest(bestLens, state, meta = {}) {
+    if (!bestLens?.surfaces || !Array.isArray(bestLens.surfaces)) return false;
+    const focusMode = String(meta?.focusMode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
+    const sensorX = Number(meta?.sensorX ?? 0);
+    const lensShift = Number(meta?.lensShift ?? 0);
+    distOptBest = {
+      lens: sanitizeLens(clone(bestLens)),
+      meta: {
+        focusMode,
+        sensorX: Number.isFinite(sensorX) ? sensorX : 0,
+        lensShift: Number.isFinite(lensShift) ? lensShift : 0,
+        runNo: Number(meta?.runNo || 0),
+      },
+      state: {
+        efl: Number.isFinite(Number(state?.efl)) ? Number(state.efl) : null,
+        T: Number.isFinite(Number(state?.T)) ? Number(state.T) : null,
+        dist70Pct: Number.isFinite(Number(state?.dist?.distPctAt70))
+          ? Number(state.dist.distPctAt70)
+          : (Number.isFinite(Number(state?.dist70Pct)) ? Number(state.dist70Pct) : null),
+        rmsDistPct: Number.isFinite(Number(state?.dist?.rmsDistPct))
+          ? Number(state.dist.rmsDistPct)
+          : null,
+      },
+    };
+    return true;
+  }
+
+  function applyDistortionBest() {
+    if (!distOptBest?.lens?.surfaces) return toast("No distortion best yet");
+    if (optRunning || distOptRunning || sharpOptRunning || scratchBuildRunning) {
+      return toast("Stop running optimizer/build first.");
+    }
+    loadLens(distOptBest.lens);
+    const m = distOptBest.meta || {};
+    const fm = String(m.focusMode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
+    if (ui.focusMode) ui.focusMode.value = fm;
+    if (ui.sensorOffset) ui.sensorOffset.value = Number.isFinite(Number(m.sensorX))
+      ? Number(m.sensorX).toFixed(3)
+      : "0";
+    if (ui.lensFocus) ui.lensFocus.value = Number.isFinite(Number(m.lensShift))
+      ? Number(m.lensShift).toFixed(3)
+      : "0";
+    renderAll();
+    scheduleRenderPreviewIfAvailable();
+    scheduleAutosave();
+    const d70 = Number(distOptBest?.state?.dist70Pct);
+    toast(`Applied Dist best${Number.isFinite(d70) ? ` (@0.7D ${d70.toFixed(2)}%)` : ""}`);
   }
 
   function makeEvalPerfBucket() {
@@ -8705,20 +8811,14 @@
       const focusMode = String(ui.focusMode?.value || "lens").toLowerCase() === "cam" ? "cam" : "lens";
       const sensorX0 = focusMode === "cam" ? num(ui.sensorOffset?.value, 0) : 0;
       const lensShift0 = focusMode === "lens" ? num(ui.lensFocus?.value, 0) : 0;
-      const popMode = String(ui.optPop?.value || "safe").toLowerCase();
+      const autoApply = postOptAutoApplyEnabled();
       const rayCount = clamp(
         num(ui.rayCount?.value, 31) | 0,
         Number(SHARP_OPT_CFG.rayCountMin || 11),
         Number(SHARP_OPT_CFG.rayCountMax || 41)
       );
-      const baseIters = clamp(
-        num(ui.optIters?.value, 3000),
-        SHARP_OPT_CFG.iterationsMin,
-        SHARP_OPT_CFG.iterationsMax
-      );
-      const modeScale = popMode === "wild" ? 1.45 : 1.0;
       const iters = clamp(
-        Math.round(baseIters * modeScale),
+        num(ui.optIters?.value, 3000),
         SHARP_OPT_CFG.iterationsMin,
         SHARP_OPT_CFG.iterationsMax
       );
@@ -8786,6 +8886,7 @@
       setOptLog(
         `${runHeader}\n` +
         `running… 0/${iters}\n` +
+        `apply mode: ${autoApply ? "auto" : "manual (Apply best)"}\n` +
         `baseline RMS C/E ${Number(baseState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(baseState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm\n` +
         `baseline score ${Number(baseState?.sharp?.score || 0).toFixed(4)} • EFL ${baseState.efl.toFixed(2)}mm • T ${baseState.T.toFixed(2)} • field ${baseState.maxFieldDeg.toFixed(2)}°`
       );
@@ -8878,7 +8979,10 @@
         Number.isFinite(baseScore?.merit) &&
         bestScore.merit + 1e-6 < baseScore.merit;
 
-      if (improved) {
+      const appliedNow = improved && autoApply;
+      const queuedManual = improved && !autoApply;
+
+      if (appliedNow) {
         loadLens(bestLens);
         if (ui.focusMode) ui.focusMode.value = focusMode;
         if (focusMode === "cam") {
@@ -8894,6 +8998,15 @@
         renderAll();
         scheduleRenderPreviewIfAvailable();
         scheduleAutosave();
+      } else if (queuedManual) {
+        queueManualBestFromState(bestLens, bestState, {
+          source: "sharpness",
+          iter: bestIter,
+          focusMode,
+          sensorX: Number(bestState?.focus?.sensorX ?? sensorX0),
+          lensShift: Number(bestState?.focus?.lensShift ?? lensShift0),
+        });
+        renderAll();
       } else {
         renderAll();
       }
@@ -8901,10 +9014,12 @@
       const eflDrift = Number(bestState?.efl || 0) - Number(baseState?.efl || 0);
       const tDrift = Number(bestState?.T || 0) - Number(baseState?.T || 0);
       const fieldDrop = Math.max(0, Number(baseState?.maxFieldDeg || 0) - Number(bestState?.maxFieldDeg || 0));
+      const bestIterTxt = (bestIter > 0) ? `${bestIter}/${Math.max(1, iters)}` : "baseline (0)";
       setOptLog(
         `${runHeader}\n` +
         `${sharpOptStopRequested ? "stopped" : "done"} ${itersRan}/${iters}\n` +
-        `${improved ? "APPLIED ✅" : "no better candidate (kept original)"}\n` +
+        `best iteration ${bestIterTxt}\n` +
+        `${appliedNow ? "APPLIED ✅" : (queuedManual ? "QUEUED (click Apply best) ⏳" : "no better candidate (kept original)")}\n` +
         `sharp before RMS C/E ${Number(baseState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(baseState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm • score ${Number(baseState?.sharp?.score || 0).toFixed(4)}\n` +
         `sharp after  RMS C/E ${Number(bestState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(bestState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm • score ${Number(bestState?.sharp?.score || 0).toFixed(4)}\n` +
         `focus ${focusMode === "cam" ? `sensorOffset ${Number(bestState?.focus?.sensorX || 0).toFixed(3)}mm` : `lensFocus ${Number(bestState?.focus?.lensShift || 0).toFixed(3)}mm`}\n` +
@@ -8913,7 +9028,9 @@
       );
       toast(
         improved
-          ? `Sharpness optimized: C/E ${Number(bestState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(bestState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm`
+          ? (appliedNow
+            ? `Sharpness optimized: C/E ${Number(bestState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(bestState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm`
+            : "Sharpness optimized: candidate queued, click Apply best")
           : "Sharpness optimizer: no better lens within guards"
       );
     } finally {
@@ -8956,15 +9073,9 @@
       const focusMode = String(ui.focusMode?.value || "lens").toLowerCase();
       const sensorX = focusMode === "cam" ? num(ui.sensorOffset?.value, 0) : 0;
       const lensShift = focusMode === "lens" ? num(ui.lensFocus?.value, 0) : 0;
-      const popMode = String(ui.optPop?.value || "safe").toLowerCase();
-      const baseIters = clamp(
-        num(ui.optIters?.value, 3200),
-        DIST_OPT_CFG.iterationsMin,
-        DIST_OPT_CFG.iterationsMax
-      );
-      const modeScale = popMode === "wild" ? 1.7 : 1.0;
+      const autoApply = postOptAutoApplyEnabled();
       const iters = clamp(
-        Math.round(baseIters * modeScale),
+        num(ui.distOptIters?.value, num(ui.optIters?.value, 12000)),
         DIST_OPT_CFG.iterationsMin,
         DIST_OPT_CFG.iterationsMax
       );
@@ -9033,6 +9144,7 @@
       setOptLog(
         `${runHeader}\n` +
         `running… 0/${iters}\n` +
+        `apply mode: ${autoApply ? "auto" : "manual (Apply best)"}\n` +
         `baseline DIST@0.7D ${Number.isFinite(baseDist70) ? baseDist70.toFixed(2) : "—"}% • RMS ${Number.isFinite(baseRms) ? baseRms.toFixed(2) : "—"}%\n` +
         `baseline EFL ${baseState.efl.toFixed(2)}mm • T ${baseState.T.toFixed(2)} • field ${baseState.maxFieldDeg.toFixed(2)}° • stop #${baseState.stopIdx}`
       );
@@ -9127,6 +9239,18 @@
         bestScore.merit + 1e-6 < baseScore.merit;
 
       if (improved) {
+        queueDistortionBest(bestLens, bestState, {
+          focusMode: focusMode === "cam" ? "cam" : "lens",
+          sensorX,
+          lensShift,
+          runNo,
+        });
+      }
+
+      const appliedNow = improved && autoApply;
+      const queuedManual = improved && !autoApply;
+
+      if (appliedNow) {
         loadLens(bestLens);
         if (ui.focusMode) ui.focusMode.value = focusMode === "cam" ? "cam" : "lens";
         if (ui.sensorOffset) ui.sensorOffset.value = Number(sensorX).toFixed(2);
@@ -9134,6 +9258,15 @@
         renderAll();
         scheduleRenderPreviewIfAvailable();
         scheduleAutosave();
+      } else if (queuedManual) {
+        queueManualBestFromState(bestLens, bestState, {
+          source: "distortion",
+          iter: bestIter,
+          focusMode: focusMode === "cam" ? "cam" : "lens",
+          sensorX,
+          lensShift,
+        });
+        renderAll();
       } else {
         renderAll();
       }
@@ -9143,10 +9276,12 @@
       const eflDrift = Number(bestState?.efl || 0) - Number(baseState?.efl || 0);
       const tDrift = Number(bestState?.T || 0) - Number(baseState?.T || 0);
       const fieldDrop = Math.max(0, Number(baseState?.maxFieldDeg || 0) - Number(bestState?.maxFieldDeg || 0));
+      const bestIterTxt = (bestIter > 0) ? `${bestIter}/${Math.max(1, iters)}` : "baseline (0)";
       setOptLog(
         `${runHeader}\n` +
         `${distOptStopRequested ? "stopped" : "done"} ${itersRan}/${iters}\n` +
-        `${improved ? "APPLIED ✅" : "no better candidate (kept original)"}\n` +
+        `best iteration ${bestIterTxt}\n` +
+        `${appliedNow ? "APPLIED ✅" : (queuedManual ? "QUEUED (click Apply best) ⏳" : "no better candidate (kept original)")}\n` +
         `dist before DIST@0.7D ${Number.isFinite(baseDist70) ? baseDist70.toFixed(2) : "—"}% • RMS ${Number.isFinite(baseRms) ? baseRms.toFixed(2) : "—"}%\n` +
         `dist after  DIST@0.7D ${Number.isFinite(after70) ? after70.toFixed(2) : "—"}% • RMS ${Number.isFinite(afterRms) ? afterRms.toFixed(2) : "—"}%\n` +
         `drift EFL ${eflDrift.toFixed(3)}mm • T ${tDrift.toFixed(3)} • field drop ${fieldDrop.toFixed(2)}°\n` +
@@ -9155,7 +9290,9 @@
       );
       toast(
         improved
-          ? `Distortion optimized: @0.7D ${Number.isFinite(after70) ? after70.toFixed(2) : "—"}% (was ${Number.isFinite(baseDist70) ? baseDist70.toFixed(2) : "—"}%)`
+          ? (appliedNow
+            ? `Distortion optimized: @0.7D ${Number.isFinite(after70) ? after70.toFixed(2) : "—"}% (was ${Number.isFinite(baseDist70) ? baseDist70.toFixed(2) : "—"}%)`
+            : "Distortion optimized: candidate queued, click Apply best")
           : "Distortion optimizer: no better lens within guards"
       );
     } finally {
@@ -9801,12 +9938,26 @@
       return toast("Best is fysiek ongeldig (intrusion/overlap/BFL). Eerst verder optimaliseren.");
     }
     loadLens(optBest.lens);
-    // set lensFocus from best
-    if (ui.focusMode) ui.focusMode.value = "lens";
-    if (ui.sensorOffset) ui.sensorOffset.value = "0";
-    if (ui.lensFocus) ui.lensFocus.value = Number(optBest.eval.lensShift || 0).toFixed(2);
+    const m = optBest?.meta || {};
+    const fm = String(m.focusMode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
+    if (ui.focusMode) ui.focusMode.value = fm;
+    if (fm === "cam") {
+      if (ui.sensorOffset) ui.sensorOffset.value = Number.isFinite(Number(m.sensorX))
+        ? Number(m.sensorX).toFixed(3)
+        : "0";
+      if (ui.lensFocus) ui.lensFocus.value = Number.isFinite(Number(m.lensShift))
+        ? Number(m.lensShift).toFixed(3)
+        : Number(optBest.eval.lensShift || 0).toFixed(3);
+    } else {
+      if (ui.sensorOffset) ui.sensorOffset.value = Number.isFinite(Number(m.sensorX))
+        ? Number(m.sensorX).toFixed(3)
+        : "0";
+      if (ui.lensFocus) ui.lensFocus.value = Number.isFinite(Number(m.lensShift))
+        ? Number(m.lensShift).toFixed(3)
+        : Number(optBest.eval.lensShift || 0).toFixed(3);
+    }
     renderAll();
-    toast("Applied best");
+    toast(`Applied best${m?.source ? ` (${String(m.source)})` : ""}`);
   }
 
   function benchOptimizer(){
@@ -9899,12 +10050,13 @@
     ui.btnBuildScratch?.addEventListener("click", openBuildScratchModal);
     ui.btnOptStart?.addEventListener("click", runOptimizer);
     ui.btnOptDist?.addEventListener("click", runDistortionOptimizer);
+    ui.btnOptDistApply?.addEventListener("click", applyDistortionBest);
     ui.btnOptSharp?.addEventListener("click", runSharpnessOptimizer);
     ui.btnOptStop?.addEventListener("click", stopOptimizer);
     ui.btnOptApply?.addEventListener("click", applyBest);
     ui.btnOptBench?.addEventListener("click", benchOptimizer);
 
-    ["optTargetFL","optTargetT","optTargetIC","optIters","optPop"].forEach((id)=>{
+    ["optTargetFL","optTargetT","optTargetIC","optIters","distOptIters","optPop","optAutoApply"].forEach((id)=>{
       ui[id]?.addEventListener("change", () => { scheduleRenderAll(); scheduleAutosave(); });
       ui[id]?.addEventListener("input", () => {
         // don't rerender constantly for iters/preset; but update merit targets

@@ -46,6 +46,7 @@
       <button id="btnBuildScratch" class="btn btnPrimary" type="button">Build From Scratch</button>
       <button id="btnOptStart" class="btn btnPrimary" type="button">Optimize</button>
       <button id="btnOptDist" class="btn" type="button">Optimize Distortion</button>
+      <button id="btnOptDistApply" class="btn" type="button">Apply Dist best</button>
       <button id="btnOptSharp" class="btn" type="button">Optimize Sharpness</button>
       <button id="btnOptStop" class="btn" type="button">Stop</button>
       <button id="btnOptApply" class="btn" type="button">Apply best</button>
@@ -159,11 +160,21 @@
             </div>
 
             <div class="ctrl">
+              <label for="distOptIters">Distortion iterations</label>
+              <input id="distOptIters" type="number" step="1" value="12000" min="50" />
+            </div>
+
+            <div class="ctrl">
               <label for="optPop">Exploration</label>
               <select id="optPop">
                 <option value="safe" selected>Safe</option>
                 <option value="wild">Wild</option>
               </select>
+            </div>
+
+            <div class="ctrl">
+              <label for="optAutoApply">Auto-apply Dist/Sharp</label>
+              <input id="optAutoApply" type="checkbox" />
             </div>
 
             <div class="ctrl two">
