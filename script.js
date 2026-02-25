@@ -3349,17 +3349,21 @@
     L.name = baseLens.name;
     const stage = Number(opt?.stage ?? 0);
     const targetIC = Math.max(0, Number(opt?.targetIC || 0));
+    const icNeedMm = Math.max(0, Number(opt?.icNeedMm || 0));
     const icStage = (stage === 1 && targetIC > 0);
     const keepFl = !!opt?.keepFl;
 
     const s = L.surfaces;
 
-    // occasionally: add/remove a surface (wild mode)
-    if (!topo && mode === "wild" && Math.random() < 0.03){
+    // occasionally add/remove a surface.
+    // During heavy IC shortfall, allow this even in safe mode to escape local minima.
+    const allowStructureJump = (!topo && mode === "wild") || (icStage && icNeedMm > 8.0);
+    const structureProb = (!topo && mode === "wild") ? 0.03 : (icStage ? 0.08 : 0.0);
+    if (allowStructureJump && Math.random() < structureProb){
       const imsIdx = s.findIndex(x => String(x.type).toUpperCase()==="IMS");
       const canRemove = s.length > 6;
 
-      if (canRemove && Math.random() < 0.5){
+      if (canRemove && Math.random() < 0.35){
         // remove a random non-locked surface
         const idxs = s.map((x,i)=>({x,i})).filter(o=>!surfaceIsLocked(o.x));
         if (idxs.length){
@@ -3369,13 +3373,22 @@
       } else {
         // insert a random surface before IMS
         const at = Math.max(1, Math.min(imsIdx >= 0 ? imsIdx : s.length-1, 1 + ((Math.random()*Math.max(1,(s.length-2)))|0)));
-        s.splice(at,0,{ type:"", R: (Math.random()<0.5?1:-1)*(16+Math.random()*160), t: 0.4+Math.random()*8, ap: 4+Math.random()*20, glass: (Math.random()<0.15?"AIR":pick(GLASS_LIST)), stop:false });
+        const baseAp = icStage ? clamp(targetIC * (0.22 + Math.random() * 0.20), 8, 30) : (4 + Math.random() * 20);
+        const baseR = Math.max(16, (baseAp / AP_SAFETY) * (1.06 + Math.random() * 0.24));
+        s.splice(at,0,{
+          type:"",
+          R: (Math.random()<0.5?1:-1) * baseR,
+          t: 0.6 + Math.random() * 10,
+          ap: baseAp,
+          glass: (Math.random()<0.12 ? "AIR" : pick(GLASS_LIST)),
+          stop:false
+        });
       }
     }
 
     // main: perturb a few parameters
     let kChanges = mode === "wild" ? 6 : 3;
-    if (icStage) kChanges += (mode === "wild" ? 5 : 4);
+    if (icStage) kChanges += (mode === "wild" ? 6 : 5);
     if (icStage && keepFl) kChanges += 2;
 
     const radiusScale = icStage
@@ -3858,7 +3871,8 @@
       0.5 * (Number.isFinite(vigFrac) ? vigFrac : 1);
 
     let stage = feasible ? 0 : -1;
-    if (feasible && flReady) {
+    // Stage flow should use the locked FL band (+/-5%), not only the tighter 1% mark.
+    if (feasible && flInBand) {
       if (!icGood) stage = 1;
       else if (!tGood) stage = 2;
       else stage = 3;
@@ -4086,7 +4100,12 @@
         const unlockForIC = (basePri.stage === 1 && basePri.icNeedMm > 10);
         const mutMode = (unlockForIC && Math.random() < 0.40) ? "wild" : mode;
         const topoUse = (unlockForIC && mutMode === "wild" && Math.random() < 0.55) ? null : topo;
-        const c = mutateLens(baseLens, mutMode, topoUse, { stage: basePri.stage, targetIC, keepFl: flLocked });
+        const c = mutateLens(baseLens, mutMode, topoUse, {
+          stage: basePri.stage,
+          targetIC,
+          icNeedMm: basePri.icNeedMm,
+          keepFl: flLocked
+        });
         if (basePri.stage === 1 && basePri.icNeedMm > 1.0 && Math.random() < 0.92) {
           applyCoverageBoostMutation(c.surfaces, {
             targetIC,
