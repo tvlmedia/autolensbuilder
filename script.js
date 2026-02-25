@@ -1280,7 +1280,7 @@
     flBandRel: 0.05,      // once FL is in +/-5%, keep all accepted updates in this band
     flStageRel: 0.01,     // do not leave FL phase until within +/-1%
     flPreferRel: 0.002,   // in later phases, do not accept >0.2% FL degradation
-    flHoldRel: 0.013,     // hard FL hold after lock (about +/-1.3%)
+    flHoldRel: 0.05,      // hard FL hold after lock (within +/-5%)
     icStageDriftRel: 0.006, // allow a bit more FL drift during IC growth
     icPassFrac: 0.95,     // IC phase is "good enough" at >=95% of requested IC
     tGoodAbs: 0.25,       // T phase considered good when absolute T error <= 0.25
@@ -3476,6 +3476,22 @@
       }
     }
 
+    if (icStage && Math.random() < 0.22) {
+      // Rare macro step to escape local minima: grow clear apertures + matching radii globally.
+      const macro = keepFl ? (1.06 + Math.random() * 0.08) : (1.10 + Math.random() * 0.14);
+      for (let i = 0; i < s.length; i++) {
+        const ss = s[i];
+        if (surfaceIsLocked(ss)) continue;
+        const t = String(ss?.type || "").toUpperCase();
+        if (t === "OBJ" || t === "IMS") continue;
+        ss.ap = clamp(Number(ss.ap || 0) * macro, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        const signR = Math.sign(Number(ss.R || 1)) || 1;
+        const absR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(ss.R || 0)));
+        const needAbsR = (Number(ss.ap || 0) / AP_SAFETY) * 1.08;
+        ss.R = signR * clamp(Math.max(absR * (1.02 + Math.random() * 0.06), needAbsR), PHYS_CFG.minRadius, 600);
+      }
+    }
+
     ensureStopExists(s);
     // enforce single stop
     const firstStop = s.findIndex(x => !!x.stop);
@@ -3906,8 +3922,8 @@
     }
 
     if (A.stage === 1) {
-      if (Math.abs(A.icNeedMm - B.icNeedMm) > 0.02) return A.icNeedMm - B.icNeedMm;
-      if (Math.abs(A.icMeasured - B.icMeasured) > 0.02) return B.icMeasured - A.icMeasured;
+      if (Math.abs(A.icNeedMm - B.icNeedMm) > 0.005) return A.icNeedMm - B.icNeedMm;
+      if (Math.abs(A.icMeasured - B.icMeasured) > 0.005) return B.icMeasured - A.icMeasured;
     }
 
     if (A.stage === 2 && Math.abs(A.tErrAbs - B.tErrAbs) > 1e-4) {
@@ -4020,9 +4036,11 @@
     const tStart = performance.now();
 
     const BATCH = 60;
+    let itersRan = 0;
 
     for (let i = 1; i <= iters; i++){
       if (!optRunning) break;
+      itersRan = i;
 
       const a = i / iters;
       const temp = temp0 * (1 - a) + temp1 * a;
@@ -4032,7 +4050,7 @@
       const tries = (curPri.stage === 0)
         ? (curPri.eflErrRel > 0.20 ? 10 : 6)
         : (curPri.stage === 1)
-        ? (flLocked ? (curPri.icNeedMm > 9 ? 12 : 9) : 6)
+        ? (flLocked ? (curPri.icNeedMm > 9 ? 18 : 14) : 10)
         : (flLocked ? 5 : 3);
       let cand = null;
       let candEval = null;
@@ -4065,7 +4083,10 @@
         );
         const baseLens = useBestBase ? best.lens : cur;
         const basePri = useBestBase ? bestPriPre : curPri;
-        const c = mutateLens(baseLens, mode, topo, { stage: basePri.stage, targetIC, keepFl: flLocked });
+        const unlockForIC = (basePri.stage === 1 && basePri.icNeedMm > 10);
+        const mutMode = (unlockForIC && Math.random() < 0.40) ? "wild" : mode;
+        const topoUse = (unlockForIC && mutMode === "wild" && Math.random() < 0.55) ? null : topo;
+        const c = mutateLens(baseLens, mutMode, topoUse, { stage: basePri.stage, targetIC, keepFl: flLocked });
         if (basePri.stage === 1 && basePri.icNeedMm > 1.0 && Math.random() < 0.92) {
           applyCoverageBoostMutation(c.surfaces, {
             targetIC,
@@ -4084,7 +4105,7 @@
             });
           }
           quickSanity(c.surfaces);
-          if (topo) enforceTopology(c.surfaces, topo);
+          if (topoUse) enforceTopology(c.surfaces, topoUse);
         }
         // Keep FL search from hovering around ~5% by adding a small deterministic focal nudge.
         if (basePri.stage === 0) {
@@ -4111,7 +4132,18 @@
       if (!curPri.feasible && candPri.feasible) {
         accept = true;
       } else if (curPri.feasible && !candPri.feasible) {
-        accept = false;
+        if (
+          curPri.stage === 1 &&
+          candPri.stage <= 1 &&
+          candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
+          candPri.icMeasured > curPri.icMeasured + 0.8 &&
+          candPri.feasibilityDebt < 3500
+        ) {
+          // Allow temporary controlled infeasible jumps to escape IC plateaus.
+          accept = Math.random() < 0.22;
+        } else {
+          accept = false;
+        }
       } else
       // Once we have entered FL band, never accept candidates outside the 5% band.
       if (flLocked && candPri.eflErrRel > OPT_STAGE_CFG.flHoldRel) {
@@ -4127,7 +4159,7 @@
         candPri.stage === 1 &&
         candPri.feasible &&
         candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
-        candPri.icMeasured > curPri.icMeasured + 0.03
+        candPri.icMeasured > curPri.icMeasured + 0.005
       ) {
         // Explicitly keep climbing IC when FL remains inside lock band.
         accept = true;
@@ -4242,8 +4274,9 @@
     const stageStep = fmtStageStep(bp.stage);
     if (ui.optLog){
       setOptLog(
-        `done ${best.iter}/${iters}  (${(iters/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
+        `done ${itersRan}/${iters}  (${(Math.max(1, itersRan)/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
         `BEST score ${best.eval.score.toFixed(2)}\n` +
+        `BEST @${best.iter}\n` +
         `BEST stage ${stageStep}: ${bp.stageName}\n` +
         `${fmtPhysOpt(best.eval, targets)}\n` +
         `${fmtFlOpt(best.eval, targetEfl)}\n` +
