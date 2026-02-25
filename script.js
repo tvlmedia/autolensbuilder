@@ -1276,15 +1276,41 @@
     smoothingHalfWindow: 2,
   };
 
+  // Very cheap IC settings for fast-tier candidate ranking.
+  const FAST_OPT_IC_CFG = {
+    bgLutSamples: 40,
+    bgPupilSqrt: 3,
+    smoothingHalfWindow: 1,
+    minSamplesForCurve: 4,
+    thetaStepDeg: 2.0,
+    maxFieldDeg: 42,
+    bgObjDistMm: 1400,
+  };
+
   const OPT_STAGE_CFG = {
     flBandRel: 0.05,      // once FL is in +/-5%, keep all accepted updates in this band
     flStageRel: 0.01,     // do not leave FL phase until within +/-1%
     flPreferRel: 0.002,   // in later phases, do not accept >0.2% FL degradation
     flHoldRel: 0.05,      // hard FL hold after lock (within +/-5%)
     icStageDriftRel: 0.006, // allow a bit more FL drift during IC growth
-    tCoarseAbs: 0.85,     // before IC growth, first pull T close enough
+    tCoarseAbs: 0.75,     // before IC growth, first pull T close enough
     icPassFrac: 0.95,     // IC phase is "good enough" at >=95% of requested IC
     tGoodAbs: 0.25,       // T phase considered good when absolute T error <= 0.25
+  };
+
+  const OPT_EVAL_CFG = {
+    fastRayCount: 15,
+    fastAutofocusEvery: 120,
+    fastIcEvery: 10,
+    accurateAuditEvery: 90,
+    fastAfRange: 3.0,
+    fastAfCoarseStep: 0.60,
+    fastAfFineHalf: 0.90,
+    fastAfFineStep: 0.20,
+    accurateAfRange: 6.0,
+    accurateAfCoarseStep: 0.30,
+    accurateAfFineHalf: 1.60,
+    accurateAfFineStep: 0.08,
   };
 
   function softIcLabel(cfg = SOFT_IC_CFG) {
@@ -1497,8 +1523,10 @@
       };
     }
 
-    const lutN = Math.max(96, Math.min(1200, Number(cfg.bgLutSamples || 900) | 0));
-    const pupilSqrt = Math.max(4, Math.min(28, Number(cfg.bgPupilSqrt || 14) | 0));
+    const lutMin = Math.max(8, Number(cfg.bgLutMin || 24) | 0);
+    const pupilMin = Math.max(2, Number(cfg.bgPupilMin || 2) | 0);
+    const lutN = Math.max(lutMin, Math.min(1200, Number(cfg.bgLutSamples || 900) | 0));
+    const pupilSqrt = Math.max(pupilMin, Math.min(28, Number(cfg.bgPupilSqrt || 14) | 0));
     const startX = sensorX + Number(cfg.bgStartEpsMm || 0.05);
     const xObjPlane = (work[0]?.vx ?? 0) - Math.max(100, Number(cfg.bgObjDistMm || 2000));
     const sensorWv = Number(sensorW) * ov;
@@ -1625,6 +1653,86 @@
       rChief: Number.isFinite(rChief) ? rChief : null,
       yHits,
       valid: true,
+    };
+  }
+
+  function estimateUsableCircleFastProxy(
+    surfaces,
+    sensorW,
+    sensorH,
+    wavePreset,
+    rayCount,
+    cfgOverride = null
+  ) {
+    const cfg = { ...SOFT_IC_CFG, ...(cfgOverride || {}) };
+    const sensorX = 0;
+    const halfDiag = 0.5 * Math.hypot(sensorW, sensorH);
+    const raysPerBundle = Math.max(7, Math.min(21, Number(rayCount || 15) | 0));
+    const stepDeg = Math.max(0.5, Number(cfg.thetaStepDeg || 2.0));
+    const maxFieldDeg = Math.max(stepDeg, Number(cfg.maxFieldDeg || 42));
+    const eps = Math.max(1e-6, Number(cfg.eps || 1e-6));
+
+    const centerPack = traceBundleAtFieldForSoftIc(surfaces, 0, wavePreset, sensorX, raysPerBundle);
+    const centerGood = Math.max(eps, Number(centerPack.goodFrac || 0));
+    if (!(centerGood > eps)) {
+      return {
+        softICmm: 0,
+        usableCircleDiameterMm: 0,
+        usableCircleRadiusMm: 0,
+        thresholdRel: Number(cfg.thresholdRel || 0.35),
+        centerGoodFrac: 0,
+        samples: [],
+      };
+    }
+
+    const radial = [];
+    const gain = [];
+    let beyondRun = 0;
+
+    for (let th = 0; th <= maxFieldDeg + 1e-9; th += stepDeg) {
+      const pack = th <= 1e-9
+        ? centerPack
+        : traceBundleAtFieldForSoftIc(surfaces, th, wavePreset, sensorX, raysPerBundle);
+      if (!pack?.valid) continue;
+      const rMm = Number(pack.rChief);
+      if (!Number.isFinite(rMm)) continue;
+      const natural = naturalCos4AtSensorRadius(surfaces, sensorX, rMm);
+      radial.push(Math.max(0, rMm));
+      gain.push(clamp(Number(pack.goodFrac || 0) * natural, 0, 1));
+      if (rMm > halfDiag + 1.2) beyondRun++;
+      else beyondRun = 0;
+      if (beyondRun >= 2 && gain[gain.length - 1] < centerGood * 0.4) break;
+    }
+
+    if (radial.length < 4) {
+      return {
+        softICmm: 0,
+        usableCircleDiameterMm: 0,
+        usableCircleRadiusMm: 0,
+        thresholdRel: Number(cfg.thresholdRel || 0.35),
+        centerGoodFrac: centerGood,
+        samples: [],
+      };
+    }
+
+    const uc = computeUsableCircleFromRadialCurve(radial, gain, {
+      ...cfg,
+      minSamplesForCurve: 4,
+      smoothingHalfWindow: Math.min(1, Number(cfg.smoothingHalfWindow || 1) | 0),
+    });
+
+    const rEdge = uc.valid ? clamp(Number(uc.radiusMm || 0), 0, halfDiag) : 0;
+    const softICmm = uc.valid ? clamp(Number(uc.diameterMm || 0), 0, 2 * halfDiag) : 0;
+    return {
+      softICmm,
+      usableCircleDiameterMm: softICmm,
+      usableCircleRadiusMm: rEdge,
+      thresholdRel: Number(uc.thresholdRel || cfg.thresholdRel || 0.35),
+      centerGoodFrac: centerGood,
+      samples: radial.map((rMm, i) => ({
+        rMm,
+        gain: gain[i],
+      })),
     };
   }
 
@@ -2122,18 +2230,21 @@
     return { rms: st.rms, n: st.n };
   }
 
-  function bestLensShiftForDesign(surfaces, fieldAngle, rayCount, wavePreset) {
+  function bestLensShiftForDesign(surfaces, fieldAngle, rayCount, wavePreset, opts = null) {
+    const o = opts || {};
     const sensorX = 0.0;
-    const x0 = 0;
-    const range = 22;
-    const coarseStep = 0.35;
-    const fineStep = 0.07;
+    const x0 = Number.isFinite(o.centerShift) ? Number(o.centerShift) : 0;
+    const range = Math.max(0.4, Number.isFinite(o.coarseHalfRange) ? Number(o.coarseHalfRange) : 22);
+    const coarseStep = Math.max(0.02, Number.isFinite(o.coarseStep) ? Number(o.coarseStep) : 0.35);
+    const fineHalfRange = Math.max(0.08, Number.isFinite(o.fineHalfRange) ? Number(o.fineHalfRange) : 2.4);
+    const fineStep = Math.max(0.02, Number.isFinite(o.fineStep) ? Number(o.fineStep) : 0.07);
+    const afRayCount = Math.max(5, Math.min(61, Number.isFinite(o.rayCount) ? (Number(o.rayCount) | 0) : (rayCount | 0)));
 
     let best = { shift: x0, rms: Infinity, n: 0 };
 
     function evalShift(shift) {
       computeVertices(surfaces, shift, sensorX);
-      const rays = buildRays(surfaces, fieldAngle, rayCount);
+      const rays = buildRays(surfaces, fieldAngle, afRayCount);
       const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
       return spotRmsAtSensorX(traces, sensorX);
     }
@@ -2149,7 +2260,7 @@
     }
 
     scan(x0, range, coarseStep);
-    if (Number.isFinite(best.rms)) scan(best.shift, 2.4, fineStep);
+    if (Number.isFinite(best.rms)) scan(best.shift, fineHalfRange, fineStep);
     if (!Number.isFinite(best.rms) || best.n < 5) return { shift: 0, ok: false, rms: null };
     return { shift: best.shift, ok: true, rms: best.rms };
   }
@@ -2190,7 +2301,12 @@
 
     // target terms (optimizer uses these)
     eflWeight: 0.35,          // penalty per mm error (squared)
+    eflRelWeight: 6000.0,     // relative EFL penalty (dominant vs absolute mm)
+    eflBarrierRel: 0.05,      // beyond 5% FL error, apply hard barrier
+    eflBarrierWeight: 280000.0,
     tWeight: 10.0,            // penalty per T error (squared)
+    tBarrierAbs: 0.50,        // beyond 0.5 T-error, apply hard barrier
+    tBarrierWeight: 5200.0,
     bflMin: 52.0,             // for PL: discourage too-short backfocus
     bflWeight: 6.0,
     lowValidPenalty: 450.0,
@@ -2276,13 +2392,24 @@
     }
 
     // Targets (optional)
-    if (Number.isFinite(targetEfl) && Number.isFinite(efl)){
+    if (Number.isFinite(targetEfl) && targetEfl > 1e-9 && Number.isFinite(efl)){
       const d = (efl - targetEfl);
+      const dRel = Math.abs(d) / targetEfl;
       merit += MERIT_CFG.eflWeight * (d * d);
+      merit += MERIT_CFG.eflRelWeight * (dRel * dRel);
+      if (dRel > MERIT_CFG.eflBarrierRel) {
+        const x = dRel - MERIT_CFG.eflBarrierRel;
+        merit += MERIT_CFG.eflBarrierWeight * (x * x);
+      }
     }
     if (Number.isFinite(targetT) && Number.isFinite(T)){
       const d = (T - targetT);
       merit += MERIT_CFG.tWeight * (d * d);
+      const dAbs = Math.abs(d);
+      if (dAbs > MERIT_CFG.tBarrierAbs) {
+        const x = dAbs - MERIT_CFG.tBarrierAbs;
+        merit += MERIT_CFG.tBarrierWeight * (x * x);
+      }
     }
 
     const minValidTarget = Math.max(7, Math.floor(rayCount * 0.45));
@@ -3248,6 +3375,29 @@
     ui.optLog.value = String(lines || "");
   }
 
+  function makeEvalPerfBucket() {
+    return {
+      evals: 0,
+      totalMs: 0,
+      afMs: 0,
+      traceMs: 0,
+      icMs: 0,
+      physMs: 0,
+    };
+  }
+
+  function fmtEvalPerf(label, b) {
+    const n = Math.max(0, Number(b?.evals || 0));
+    if (n <= 0) return `${label}: 0`;
+    const inv = 1 / n;
+    const total = Number(b.totalMs || 0) * inv;
+    const af = Number(b.afMs || 0) * inv;
+    const tr = Number(b.traceMs || 0) * inv;
+    const ic = Number(b.icMs || 0) * inv;
+    const ph = Number(b.physMs || 0) * inv;
+    return `${label}: ${n} • ${total.toFixed(2)}ms/e (AF ${af.toFixed(2)} • trace ${tr.toFixed(2)} • IC ${ic.toFixed(2)} • phys ${ph.toFixed(2)})`;
+  }
+
   function randn(){
     // Box–Muller
     let u = 0, v = 0;
@@ -3354,14 +3504,15 @@
     const targetT = Math.max(0, Number(opt?.targetT || 0));
     const icNeedMm = Math.max(0, Number(opt?.icNeedMm || 0));
     const icStage = (stage === 2 && targetIC > 0);
+    const fineTuneStage = stage >= 3;
     const keepFl = !!opt?.keepFl;
 
     const s = L.surfaces;
 
     // occasionally add/remove a surface.
     // During heavy IC shortfall, allow this even in safe mode to escape local minima.
-    const allowStructureJump = (!topo && mode === "wild") || (icStage && icNeedMm > 8.0);
-    const structureProb = (!topo && mode === "wild") ? 0.03 : (icStage ? 0.08 : 0.0);
+    const allowStructureJump = (!topo && mode === "wild" && !fineTuneStage) || (icStage && icNeedMm > 8.0);
+    const structureProb = (!topo && mode === "wild" && !fineTuneStage) ? 0.03 : (icStage ? 0.08 : 0.0);
     if (allowStructureJump && Math.random() < structureProb){
       const imsIdx = s.findIndex(x => String(x.type).toUpperCase()==="IMS");
       const canRemove = s.length > 6;
@@ -3393,17 +3544,32 @@
     let kChanges = mode === "wild" ? 6 : 3;
     if (icStage) kChanges += (mode === "wild" ? 6 : 5);
     if (icStage && keepFl) kChanges += 2;
+    if (fineTuneStage) {
+      kChanges = Math.max(2, Math.min(kChanges, mode === "wild" ? 3 : 2));
+    }
 
-    const radiusScale = icStage
+    let radiusScale = icStage
       ? (keepFl ? (mode === "wild" ? 0.20 : 0.12) : (mode === "wild" ? 0.42 : 0.24))
       : (keepFl ? (mode === "wild" ? 0.12 : 0.06) : (mode === "wild" ? 0.35 : 0.18));
-    const thickScale  = icStage
+    let thickScale  = icStage
       ? (keepFl ? (mode === "wild" ? 0.24 : 0.16) : (mode === "wild" ? 0.62 : 0.30))
       : (keepFl ? (mode === "wild" ? 0.18 : 0.08) : (mode === "wild" ? 0.55 : 0.25));
+    if (fineTuneStage) {
+      radiusScale *= 0.42;
+      thickScale *= 0.40;
+    }
 
-    const rThresh = (!icStage ? 0.45 : (keepFl ? 0.28 : 0.35));
-    const tThresh = (!icStage ? 0.70 : (keepFl ? 0.48 : 0.58));
-    const aThresh = (!icStage ? 0.88 : 0.98);
+    const rThresh = fineTuneStage ? 0.36 : (!icStage ? 0.45 : (keepFl ? 0.28 : 0.35));
+    let tThresh = fineTuneStage ? 0.62 : (!icStage ? 0.70 : (keepFl ? 0.48 : 0.58));
+    let aThresh = fineTuneStage ? 0.92 : (!icStage ? 0.88 : 0.98);
+    if (!fineTuneStage && stage >= 1) {
+      // In T/IC phases, bias mutations away from random thickness-only tweaks and toward aperture growth.
+      tThresh = Math.max(rThresh + 0.12, tThresh - 0.06);
+      aThresh = Math.min(0.995, aThresh + 0.05);
+    } else if (!fineTuneStage && stage === 0 && targetIC > 0) {
+      // Even in FL acquire, keep enough aperture exploration alive to avoid tiny-glass local minima.
+      aThresh = Math.min(0.95, aThresh + 0.03);
+    }
 
     for (let c=0;c<kChanges;c++){
       const idxs = s.map((x,i)=>({x,i})).filter(o=>!surfaceIsLocked(o.x));
@@ -3508,10 +3674,27 @@
       }
     }
 
-    // In IC stage always keep pupil/stop health in sync; otherwise IC cannot move.
-    if (icStage && targetEfl > 1 && targetT > 0) {
-      nudgeStopTowardTargetT(s, targetEfl, targetT, keepFl ? 0.52 : 0.70);
+    // Keep stop/pupil health alive in every stage; stronger in IC stage.
+    if (targetEfl > 1 && targetT > 0) {
+      const stopStrength = icStage ? (keepFl ? 0.52 : 0.70) : (stage === 1 ? 0.62 : 0.40);
+      nudgeStopTowardTargetT(s, targetEfl, targetT, stopStrength);
     }
+
+    promoteElementDiameters(s, {
+      targetEfl,
+      targetT,
+      targetIC,
+      stage,
+      strength: icStage ? 1.0 : 0.72,
+      keepFl,
+    });
+    enforcePupilHealthFloors(s, {
+      targetEfl,
+      targetT,
+      targetIC,
+      stage,
+      keepFl,
+    });
 
     ensureStopExists(s);
     // enforce single stop
@@ -3649,6 +3832,134 @@
     }
   }
 
+  function enforceApertureRadiusCoupling(surface, margin = 1.06) {
+    if (!surface) return;
+    const t = String(surface?.type || "").toUpperCase();
+    if (t === "OBJ" || t === "IMS") return;
+    const ap = Math.max(PHYS_CFG.minAperture, Number(surface.ap || 0));
+    const signR = Math.sign(Number(surface.R || 1)) || 1;
+    const absR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(surface.R || 0)));
+    const needAbsR = (ap / AP_SAFETY) * Math.max(1.0, Number(margin || 1.06));
+    surface.R = signR * clamp(Math.max(absR, needAbsR), PHYS_CFG.minRadius, 600);
+  }
+
+  function promoteElementDiameters(
+    surfaces,
+    { targetEfl = 50, targetT = 0, targetIC = 0, stage = 0, strength = 0.8, keepFl = false } = {}
+  ) {
+    if (!Array.isArray(surfaces) || surfaces.length < 3) return;
+    const st = Number(stage || 0);
+    const sGain = clamp(Number(strength || 0.8), 0.2, 1.5);
+    const stopIdx = findStopSurfaceIndex(surfaces);
+
+    if (stopIdx >= 0 && Number.isFinite(targetEfl) && targetEfl > 1 && Number.isFinite(targetT) && targetT > 0.2) {
+      const stop = surfaces[stopIdx];
+      const stopNeed = clamp(targetEfl / (2 * targetT), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+      const f = st >= 2 ? 0.96 : (st === 1 ? 0.90 : 0.84);
+      const curAp = Number(stop.ap || stopNeed);
+      stop.ap = clamp(curAp + (stopNeed * f - curAp) * (0.45 * sGain), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+      enforceApertureRadiusCoupling(stop, 1.08);
+
+      const neighBase = Number(stop.ap || stopNeed);
+      for (let d = 1; d <= 3; d++) {
+        const ids = [stopIdx - d, stopIdx + d];
+        for (const id of ids) {
+          if (id < 0 || id >= surfaces.length) continue;
+          const ss = surfaces[id];
+          if (surfaceIsLocked(ss)) continue;
+          const tt = String(ss?.type || "").toUpperCase();
+          if (tt === "OBJ" || tt === "IMS") continue;
+          const need = neighBase * (1 - d * 0.08);
+          if (Number(ss.ap || 0) < need) ss.ap = clamp(need, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+          enforceApertureRadiusCoupling(ss, 1.06);
+        }
+      }
+    }
+
+    if (Number.isFinite(targetIC) && targetIC > 0) {
+      const floor = clamp(
+        targetIC * (st >= 2 ? 0.34 : (st === 1 ? 0.30 : 0.28)),
+        8.0,
+        keepFl ? 24.0 : 30.0
+      );
+      for (let i = 0; i < surfaces.length; i++) {
+        const ss = surfaces[i];
+        if (surfaceIsLocked(ss)) continue;
+        const tt = String(ss?.type || "").toUpperCase();
+        if (tt === "OBJ" || tt === "IMS") continue;
+        const ap = Number(ss.ap || 0);
+        if (ap < floor) {
+          ss.ap = clamp(ap + (floor - ap) * (0.28 * sGain), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        }
+        enforceApertureRadiusCoupling(ss, 1.04);
+      }
+    }
+  }
+
+  function enforcePupilHealthFloors(
+    surfaces,
+    { targetEfl = 50, targetT = 0, targetIC = 0, stage = 0, keepFl = false } = {}
+  ) {
+    if (!Array.isArray(surfaces) || surfaces.length < 3) return;
+    const st = Number(stage || 0);
+    const stopIdx = findStopSurfaceIndex(surfaces);
+
+    let stopFloor = 0;
+    if (Number.isFinite(targetT) && targetT > 0.2 && Number.isFinite(targetEfl) && targetEfl > 1) {
+      const stopNeed = clamp(targetEfl / (2 * targetT), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+      const stopFrac = st <= 0 ? 0.62 : (st === 1 ? 0.80 : (st === 2 ? 0.90 : 0.95));
+      stopFloor = stopNeed * stopFrac;
+    }
+
+    let icFloor = 0;
+    if (Number.isFinite(targetIC) && targetIC > 0) {
+      const icFrac = st <= 0 ? 0.28 : (st === 1 ? 0.32 : (st === 2 ? 0.38 : 0.36));
+      icFloor = clamp(targetIC * icFrac, 8.0, keepFl ? 28.0 : 34.0);
+    }
+
+    const baseFloor = Math.max(6.0, icFloor, stopFloor * 0.62);
+    for (let i = 0; i < surfaces.length; i++) {
+      const s = surfaces[i];
+      if (surfaceIsLocked(s)) continue;
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      if (Number(s.ap || 0) < baseFloor) s.ap = baseFloor;
+    }
+
+    if (stopIdx >= 0) {
+      const stop = surfaces[stopIdx];
+      if (!surfaceIsLocked(stop)) {
+        if (stopFloor > 0 && Number(stop.ap || 0) < stopFloor) stop.ap = stopFloor;
+        enforceApertureRadiusCoupling(stop, 1.09);
+      }
+
+      const stopAp = Math.max(0, Number(stop.ap || 0));
+      for (let d = 1; d <= 3; d++) {
+        const need = stopAp * (1 - d * 0.10);
+        for (const idx of [stopIdx - d, stopIdx + d]) {
+          if (idx < 0 || idx >= surfaces.length) continue;
+          const s = surfaces[idx];
+          if (surfaceIsLocked(s)) continue;
+          const t = String(s?.type || "").toUpperCase();
+          if (t === "OBJ" || t === "IMS") continue;
+          if (Number(s.ap || 0) < need) s.ap = need;
+          enforceApertureRadiusCoupling(s, 1.07);
+        }
+      }
+
+      const rearFrac = st >= 2 ? 0.80 : (st === 1 ? 0.74 : 0.68);
+      for (let i = stopIdx + 1; i < surfaces.length - 1; i++) {
+        const s = surfaces[i];
+        if (surfaceIsLocked(s)) continue;
+        const t = String(s?.type || "").toUpperCase();
+        if (t === "OBJ" || t === "IMS") continue;
+        const need = Math.max(baseFloor, stopAp * rearFrac);
+        if (Number(s.ap || 0) < need) s.ap = need;
+        enforceApertureRadiusCoupling(s, 1.06);
+      }
+    }
+  }
+
   function buildGuidedCandidate(baseLens, pri, targets, wavePreset, topo, aggressive = false) {
     const c = clone(baseLens);
     const st = Number(pri?.stage ?? 0);
@@ -3657,11 +3968,14 @@
     const hard = !!aggressive;
 
     if (st <= 0) {
-      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 1.0 : 0.92, hard ? 0.30 : 0.22);
+      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 1.0 : 0.92, hard ? 0.30 : 0.22, { keepAperture: true });
+      if (targets.targetT > 0) {
+        nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, hard ? 0.56 : 0.42);
+      }
     } else if (st === 1) {
       // T coarse phase before IC growth.
       nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, hard ? 0.98 : 0.88);
-      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 0.64 : 0.52, hard ? 0.08 : 0.06);
+      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 0.64 : 0.52, hard ? 0.08 : 0.06, { keepAperture: true });
     } else if (st === 2) {
       const passes = hard ? 3 : (icNeed > 3.0 ? 2 : 1);
       for (let p = 0; p < passes; p++) {
@@ -3675,20 +3989,38 @@
         });
       }
       nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, hard ? 0.92 : 0.78);
-      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 0.55 : 0.40, hard ? 0.07 : 0.05);
+      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 0.55 : 0.40, hard ? 0.07 : 0.05, { keepAperture: true });
     } else {
       // Fine tune: keep T close and clean up sharpness.
       nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, hard ? 0.85 : 0.62);
-      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 0.42 : 0.32, hard ? 0.05 : 0.035);
+      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 0.42 : 0.32, hard ? 0.05 : 0.035, { keepAperture: true });
     }
+
+    promoteElementDiameters(c.surfaces, {
+      targetEfl: targets.targetEfl,
+      targetT: targets.targetT,
+      targetIC: targets.targetIC,
+      stage: st,
+      strength: hard ? 1.15 : 0.9,
+      keepFl,
+    });
+    enforcePupilHealthFloors(c.surfaces, {
+      targetEfl: targets.targetEfl,
+      targetT: targets.targetT,
+      targetIC: targets.targetIC,
+      stage: st,
+      keepFl,
+    });
 
     quickSanity(c.surfaces);
     if (topo) enforceTopology(c.surfaces, topo);
     return c;
   }
 
-  function nudgeLensTowardFocal(lensObj, targetEfl, wavePreset, strength = 0.6, maxStep = 0.20) {
+  function nudgeLensTowardFocal(lensObj, targetEfl, wavePreset, strength = 0.6, maxStep = 0.20, opts = null) {
     if (!lensObj?.surfaces || !(Number.isFinite(targetEfl) && targetEfl > 1)) return false;
+    const o = opts || {};
+    const keepAperture = o.keepAperture !== false;
     const surfaces = lensObj.surfaces;
     computeVertices(surfaces, 0, 0);
     const p = estimateEflBflParaxial(surfaces, wavePreset);
@@ -3710,7 +4042,16 @@
       if (t === "OBJ" || t === "IMS") continue;
       ss.R = Number(ss.R || 0) * k;
       ss.t = clamp(Number(ss.t || 0) * k, PHYS_CFG.minThickness, 42);
-      ss.ap = clamp(Number(ss.ap || 0) * k, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+      const ap0 = Number(ss.ap || 0);
+      if (keepAperture) {
+        const kAp = (k >= 1)
+          ? Math.pow(k, 0.20)
+          : Math.max(0.995, Math.pow(k, 0.08)); // keep pupil nearly stable during FL pulls
+        ss.ap = clamp(ap0 * kAp, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        enforceApertureRadiusCoupling(ss, 1.03);
+      } else {
+        ss.ap = clamp(ap0 * k, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+      }
     }
     quickSanity(surfaces);
     return true;
@@ -3724,10 +4065,46 @@
     rayCount,
     wavePreset,
     sensorW,
-    sensorH
+    sensorH,
+    evalTier = "accurate",
+    lensShiftHint = null,
+    afOptions = null,
+    icOptions = null,
+    rayCountFast = null,
+    timingSink = null,
   }){
+    const evalTierNorm = String(evalTier || "accurate").toLowerCase() === "fast" ? "fast" : "accurate";
+    const tEval0 = performance.now();
+    let tAfMs = 0;
+    let tPhysMs = 0;
+    let tTraceMs = 0;
+    let tIcMs = 0;
+
+    const finishEval = (payload) => {
+      const totalMs = performance.now() - tEval0;
+      if (timingSink && typeof timingSink === "object") {
+        timingSink.evals = (timingSink.evals || 0) + 1;
+        timingSink.totalMs = (timingSink.totalMs || 0) + totalMs;
+        timingSink.afMs = (timingSink.afMs || 0) + tAfMs;
+        timingSink.traceMs = (timingSink.traceMs || 0) + tTraceMs;
+        timingSink.icMs = (timingSink.icMs || 0) + tIcMs;
+        timingSink.physMs = (timingSink.physMs || 0) + tPhysMs;
+      }
+      return {
+        ...payload,
+        evalTier: evalTierNorm,
+        evalMs: totalMs,
+      };
+    };
+
     const tmp = clone(lensObj);
     const surfaces = tmp.surfaces;
+    const evalRayCount = evalTierNorm === "fast"
+      ? Math.max(9, Math.min(21, Number(rayCountFast || rayCount || 15) | 0))
+      : Math.max(9, Math.min(61, Number(rayCount || 31) | 0));
+    const afRayCountDefault = evalTierNorm === "fast"
+      ? Math.max(7, Math.min(15, evalRayCount))
+      : Math.max(9, Math.min(31, evalRayCount));
 
     // IMS ap = half height
     const halfH = Math.max(0.1, sensorH * 0.5);
@@ -3735,19 +4112,56 @@
     if (ims && String(ims.type).toUpperCase()==="IMS") ims.ap = halfH;
 
     // autofocus (lens shift)
-    const af = bestLensShiftForDesign(surfaces, fieldAngle, rayCount, wavePreset);
-    const lensShift = af.ok ? af.shift : 0;
+    const af0 = performance.now();
+    const afCfg = afOptions || {};
+    const hintShift = Number(lensShiftHint);
+    const hasHint = Number.isFinite(hintShift);
+    const forceAf = !!afCfg.force;
+    const doFastSkipAf = (evalTierNorm === "fast") && hasHint && !forceAf;
+    let lensShift = hasHint ? hintShift : 0;
+    let afOk = hasHint;
+    if (!doFastSkipAf) {
+      const af = bestLensShiftForDesign(
+        surfaces,
+        fieldAngle,
+        afRayCountDefault,
+        wavePreset,
+        {
+          centerShift: hasHint ? hintShift : Number(afCfg.centerShift || 0),
+          coarseHalfRange: Number.isFinite(afCfg.coarseHalfRange)
+            ? Number(afCfg.coarseHalfRange)
+            : (evalTierNorm === "fast" ? 3.0 : 6.0),
+          coarseStep: Number.isFinite(afCfg.coarseStep)
+            ? Number(afCfg.coarseStep)
+            : (evalTierNorm === "fast" ? 0.60 : 0.30),
+          fineHalfRange: Number.isFinite(afCfg.fineHalfRange)
+            ? Number(afCfg.fineHalfRange)
+            : (evalTierNorm === "fast" ? 0.90 : 1.60),
+          fineStep: Number.isFinite(afCfg.fineStep)
+            ? Number(afCfg.fineStep)
+            : (evalTierNorm === "fast" ? 0.20 : 0.08),
+          rayCount: Number.isFinite(afCfg.rayCount) ? Number(afCfg.rayCount) : afRayCountDefault,
+        }
+      );
+      if (af.ok) {
+        lensShift = af.shift;
+        afOk = true;
+      }
+    }
+    tAfMs += (performance.now() - af0);
 
     const sensorX = 0.0;
+    const phys0 = performance.now();
     computeVertices(surfaces, lensShift, sensorX);
     const phys = evaluatePhysicalConstraints(surfaces);
     const rearVx = lastPhysicalVertexX(surfaces);
     const intrusion = Number.isFinite(rearVx) ? (rearVx - (-PL_FFD)) : Infinity;
+    tPhysMs += (performance.now() - phys0);
 
     if (phys.hardFail) {
       const score = MERIT_CFG.hardInvalidPenalty + Math.max(0, Number(phys.penalty || 0));
       const icShortfallMm = Number.isFinite(targetIC) && targetIC > 0 ? targetIC : 0;
-      return {
+      return finishEval({
         score,
         efl: null,
         T: null,
@@ -3763,6 +4177,7 @@
         lensShift,
         rms0: null,
         rmsE: null,
+        afOk,
         breakdown: {
           rmsCenter: null,
           rmsEdge: null,
@@ -3772,10 +4187,11 @@
           physPenalty: Number(phys.penalty || 0),
           hardInvalid: true,
         },
-      };
+      });
     }
 
-    const rays = buildRays(surfaces, fieldAngle, rayCount);
+    const trace0 = performance.now();
+    const rays = buildRays(surfaces, fieldAngle, evalRayCount);
     const traces = rays.map(r => traceRayForward(clone(r), surfaces, wavePreset));
 
     const vCount = traces.filter(t=>t.vignetted).length;
@@ -3783,7 +4199,12 @@
 
     const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
     const Tgeom = estimateTStopApprox(efl, surfaces);
-    const centerTp = measureCenterThroughput(surfaces, wavePreset, sensorX, Math.max(31, rayCount | 0));
+    const centerTp = measureCenterThroughput(
+      surfaces,
+      wavePreset,
+      sensorX,
+      evalTierNorm === "fast" ? Math.max(13, evalRayCount) : Math.max(31, evalRayCount)
+    );
     const T = estimateEffectiveT(Tgeom, centerTp.goodFrac);
 
     const fov = computeFovDeg(efl, sensorW, sensorH);
@@ -3792,7 +4213,7 @@
       surfaces,
       wavePreset,
       sensorX,
-      rayCount,
+      rayCount: evalRayCount,
       fov,
       intrusion,
       efl, T, bfl,
@@ -3801,27 +4222,47 @@
       physPenalty: phys.penalty,
       hardInvalid: phys.hardFail,
     });
+    tTraceMs += (performance.now() - trace0);
 
     // tiny extra: hard fail if NaNs
     const score = Number.isFinite(meritRes.merit) ? meritRes.merit : 1e9;
     let softIcMm = null;
     let icShortfallMm = 0;
     if (Number.isFinite(targetIC) && targetIC > 0) {
-      const icRes = estimateUsableCircleBackgroundLut(
-        surfaces,
-        sensorW,
-        sensorH,
-        wavePreset,
-        Math.max(15, Math.min(41, rayCount | 0)),
-        OPT_IC_CFG,
-        { useCurrentGeometry: true, lensShift }
-      );
-      const measured = Number(icRes?.usableCircleDiameterMm ?? icRes?.softICmm ?? 0);
-      softIcMm = Number.isFinite(measured) ? measured : 0;
+      const ic0 = performance.now();
+      const icMode = String(icOptions?.mode || (evalTierNorm === "fast" ? "proxy" : "lut")).toLowerCase();
+      const icHint = Number(icOptions?.hintMm);
+      if (icMode === "skip") {
+        softIcMm = Number.isFinite(icHint) ? icHint : 0;
+      } else if (icMode === "proxy") {
+        const icRes = estimateUsableCircleFastProxy(
+          surfaces,
+          sensorW,
+          sensorH,
+          wavePreset,
+          Math.max(9, evalRayCount),
+          { ...FAST_OPT_IC_CFG, ...(icOptions?.cfg || {}) }
+        );
+        const measured = Number(icRes?.usableCircleDiameterMm ?? icRes?.softICmm ?? 0);
+        softIcMm = Number.isFinite(measured) ? measured : 0;
+      } else {
+        const icRes = estimateUsableCircleBackgroundLut(
+          surfaces,
+          sensorW,
+          sensorH,
+          wavePreset,
+          Math.max(15, Math.min(41, evalRayCount | 0)),
+          { ...OPT_IC_CFG, ...(icOptions?.cfg || {}) },
+          { useCurrentGeometry: true, lensShift }
+        );
+        const measured = Number(icRes?.usableCircleDiameterMm ?? icRes?.softICmm ?? 0);
+        softIcMm = Number.isFinite(measured) ? measured : 0;
+      }
       icShortfallMm = Math.max(0, Number(targetIC) - softIcMm);
+      tIcMs += (performance.now() - ic0);
     }
 
-    return {
+    return finishEval({
       score,
       efl,
       T,
@@ -3836,10 +4277,11 @@
       worstPinch: Number(phys.worstPinch || 0),
       goodFrac0: centerTp.goodFrac,
       lensShift,
+      afOk,
       rms0: meritRes.breakdown.rmsCenter,
       rmsE: meritRes.breakdown.rmsEdge,
       breakdown: meritRes.breakdown,
-    };
+    });
   }
 
   function stageName(stage) {
@@ -3943,6 +4385,12 @@
       return A.score - B.score;
     }
 
+    // Hard gate: while in FL acquire, FL error is lexicographically dominant.
+    if (A.stage === 0 && B.stage === 0) {
+      if (Math.abs(A.eflErrRel - B.eflErrRel) > 1e-6) return A.eflErrRel - B.eflErrRel;
+      return A.score - B.score;
+    }
+
     const flGap = Math.abs(A.eflErrRel - B.eflErrRel);
     // FL is dominant while still acquiring FL or when either candidate drifts outside the hold band.
     const flDominant = (A.stage <= 0 && B.stage <= 0) || !A.flInBand || !B.flInBand;
@@ -3984,9 +4432,9 @@
       return 1e9 + pri.feasibilityDebt * 100 + pri.eflErrRel * 1e5;
     }
     const stagePenalty = Math.max(0, 5 - Number(pri.stageRank || 0));
-    const eflW = pri.stage <= 0 ? 22000 : (pri.stage === 1 ? 4200 : 9000);
-    const icW = pri.stage === 2 ? 360 : 200;
-    const tW = pri.stage === 1 ? 185 : (pri.stage === 2 ? 130 : 110);
+    const eflW = pri.stage <= 0 ? 360000 : (pri.stage === 1 ? 60000 : 16000);
+    const icW = pri.stage === 2 ? 1400 : 260;
+    const tW = pri.stage === 1 ? 520 : (pri.stage === 2 ? 260 : 140);
     return (
       stagePenalty * 100000 +
       pri.eflErrRel * eflW +
@@ -4059,10 +4507,50 @@
 
     const startLens = sanitizeLens(lens);
     const topo = captureTopology(startLens);
+    const fastRayCount = Math.max(11, Math.min(21, Math.min(rayCount, Number(OPT_EVAL_CFG.fastRayCount || 15) | 0)));
+    const perf = {
+      fast: makeEvalPerfBucket(),
+      accurate: makeEvalPerfBucket(),
+    };
 
     let cur = startLens;
-    let curEval = evalLensMerit(cur, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+    let curEval = evalLensMerit(cur, {
+      targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH,
+      evalTier: "accurate",
+      lensShiftHint: num(ui.lensFocus?.value, 0),
+      afOptions: {
+        force: true,
+        centerShift: num(ui.lensFocus?.value, 0),
+        coarseHalfRange: OPT_EVAL_CFG.accurateAfRange,
+        coarseStep: OPT_EVAL_CFG.accurateAfCoarseStep,
+        fineHalfRange: OPT_EVAL_CFG.accurateAfFineHalf,
+        fineStep: OPT_EVAL_CFG.accurateAfFineStep,
+      },
+      icOptions: { mode: targetIC > 0 ? "lut" : "skip", cfg: OPT_IC_CFG },
+      rayCountFast: fastRayCount,
+      timingSink: perf.accurate,
+    });
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
+    let elites = [{ lens: clone(cur), eval: curEval, iter: 0 }];
+    const ELITE_MAX = 8;
+    const addElite = (lensObj, evalObj, iterIdx) => {
+      if (!lensObj || !evalObj) return;
+      const p = buildOptPriority(evalObj, targets);
+      if (!p.feasible && p.stageRank <= 0) return;
+      const efl = Number(evalObj?.efl);
+      const score = Number(evalObj?.score);
+      const dup = elites.some((e) => {
+        const ee = Number(e?.eval?.efl);
+        const es = Number(e?.eval?.score);
+        return Number.isFinite(score) && Number.isFinite(es) &&
+          Math.abs(score - es) < 1e-6 &&
+          Number.isFinite(efl) && Number.isFinite(ee) && Math.abs(efl - ee) < 1e-6;
+      });
+      if (dup) return;
+      elites.push({ lens: clone(lensObj), eval: evalObj, iter: iterIdx | 0 });
+      elites.sort((a, b) => compareEvalByPlan(a.eval, b.eval, targets));
+      if (elites.length > ELITE_MAX) elites = elites.slice(0, ELITE_MAX);
+    };
     let stallIters = 0;
     let flLocked = (() => {
       const p0 = buildOptPriority(curEval, targets);
@@ -4077,6 +4565,52 @@
 
     const BATCH = 60;
     let itersRan = 0;
+
+    const evalCandidateTier = (lensCand, tier, priRef, baseEvalRef, iterIdx, forceAcc = false) => {
+      const baseShift = Number(baseEvalRef?.lensShift);
+      const hasShift = Number.isFinite(baseShift);
+      const useFast = tier === "fast" && !forceAcc;
+      const doFastAf = useFast && (!hasShift || (iterIdx % Math.max(10, Number(OPT_EVAL_CFG.fastAutofocusEvery || 120) | 0) === 0));
+      const icHint = Number(baseEvalRef?.softIcMm);
+      const fastIcTick = iterIdx % Math.max(2, Number(OPT_EVAL_CFG.fastIcEvery || 10) | 0) === 0;
+      const fastIcMode = (priRef?.stage === 2 || fastIcTick) ? "proxy" : "skip";
+      return evalLensMerit(lensCand, {
+        targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH,
+        evalTier: useFast ? "fast" : "accurate",
+        lensShiftHint: hasShift ? baseShift : curEval?.lensShift,
+        afOptions: useFast
+          ? {
+              force: !!doFastAf,
+              centerShift: hasShift ? baseShift : Number(curEval?.lensShift || 0),
+              coarseHalfRange: OPT_EVAL_CFG.fastAfRange,
+              coarseStep: OPT_EVAL_CFG.fastAfCoarseStep,
+              fineHalfRange: OPT_EVAL_CFG.fastAfFineHalf,
+              fineStep: OPT_EVAL_CFG.fastAfFineStep,
+              rayCount: Math.max(7, Math.min(15, fastRayCount)),
+            }
+          : {
+              force: true,
+              centerShift: hasShift ? baseShift : Number(curEval?.lensShift || 0),
+              coarseHalfRange: OPT_EVAL_CFG.accurateAfRange,
+              coarseStep: OPT_EVAL_CFG.accurateAfCoarseStep,
+              fineHalfRange: OPT_EVAL_CFG.accurateAfFineHalf,
+              fineStep: OPT_EVAL_CFG.accurateAfFineStep,
+              rayCount: Math.max(9, Math.min(31, rayCount)),
+            },
+        icOptions: useFast
+          ? {
+              mode: targetIC > 0 ? fastIcMode : "skip",
+              hintMm: Number.isFinite(icHint) ? icHint : 0,
+              cfg: FAST_OPT_IC_CFG,
+            }
+          : {
+              mode: targetIC > 0 ? "lut" : "skip",
+              cfg: OPT_IC_CFG,
+            },
+        rayCountFast: fastRayCount,
+        timingSink: useFast ? perf.fast : perf.accurate,
+      });
+    };
 
     for (let i = 1; i <= iters; i++){
       if (!optRunning) break;
@@ -4110,21 +4644,35 @@
           topo,
           stallIters > 380
         );
-        const ge = evalLensMerit(guided, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+        const ge = evalCandidateTier(
+          guided,
+          "fast",
+          guidePri,
+          best?.lens ? best.eval : curEval,
+          i
+        );
         cand = guided;
         candEval = ge;
         candPri = buildOptPriority(ge, targets);
       }
 
       for (let trIdx = 0; trIdx < tries; trIdx++) {
-        const useBestBase = !!best?.lens && (
-          (flLocked && Math.random() < 0.92) ||
-          (!flLocked && Math.random() < 0.66) ||
-          (!Number.isFinite(curPri.eflErrRel)) ||
-          (curPri.eflErrRel > 0.35)
-        );
-        const baseLens = useBestBase ? best.lens : cur;
-        const basePri = useBestBase ? bestPriPre : curPri;
+        const rBase = Math.random();
+        let baseLens = cur;
+        let baseEvalRef = curEval;
+        let basePri = curPri;
+        if (best?.lens && rBase < 0.70) {
+          baseLens = best.lens;
+          baseEvalRef = best.eval;
+          basePri = bestPriPre;
+        } else if (elites.length > 1 && rBase < 0.90) {
+          const ePick = pick(elites);
+          if (ePick?.lens && ePick?.eval) {
+            baseLens = ePick.lens;
+            baseEvalRef = ePick.eval;
+            basePri = buildOptPriority(baseEvalRef, targets);
+          }
+        }
         const unlockForIC = (basePri.stage === 2 && basePri.icNeedMm > 10);
         const mutMode = (unlockForIC && Math.random() < 0.40) ? "wild" : mode;
         const topoUse = (unlockForIC && mutMode === "wild" && Math.random() < 0.55) ? null : topo;
@@ -4138,13 +4686,13 @@
         });
         if (basePri.stage === 1 && Math.random() < 0.95) {
           // Coarse T phase: always push stop/pupil first.
-          nudgeStopTowardTargetT(c.surfaces, targetEfl, targetT, 0.90);
+          nudgeStopTowardTargetT(c.surfaces, targetEfl, targetT, 0.95);
           quickSanity(c.surfaces);
           if (topoUse) enforceTopology(c.surfaces, topoUse);
         }
         if (basePri.stage === 2) {
           // IC phase: every candidate keeps pupil health in sync.
-          nudgeStopTowardTargetT(c.surfaces, targetEfl, targetT, 0.78);
+          nudgeStopTowardTargetT(c.surfaces, targetEfl, targetT, 0.86);
         }
         if (basePri.stage === 2 && basePri.icNeedMm > 1.0 && Math.random() < 0.92) {
           applyCoverageBoostMutation(c.surfaces, {
@@ -4168,24 +4716,80 @@
         }
         // Keep FL search from hovering around ~5% by adding a small deterministic focal nudge.
         if (basePri.stage === 0) {
-          const nearEdge = Number.isFinite(basePri.eflErrRel) && basePri.eflErrRel <= 0.03;
+          const flErrRel = Number(basePri.eflErrRel);
+          const nearEdge = Number.isFinite(flErrRel) && flErrRel <= 0.03;
+          const farAway = !Number.isFinite(flErrRel) || flErrRel >= 0.12;
           nudgeLensTowardFocal(
             c,
             targetEfl,
             wavePreset,
-            nearEdge ? 1.0 : 0.82,
-            nearEdge ? 0.06 : 0.18
+            1.0,
+            nearEdge ? 0.03 : (farAway ? 0.10 : 0.06),
+            { keepAperture: true }
           );
+          if (farAway) {
+            nudgeLensTowardFocal(c, targetEfl, wavePreset, 0.85, 0.06, { keepAperture: true });
+          }
+          if (targetT > 0 && Math.random() < 0.85) {
+            nudgeStopTowardTargetT(c.surfaces, targetEfl, targetT, 0.48);
+          }
         } else if (flLocked && Math.random() < 0.90) {
-          nudgeLensTowardFocal(c, targetEfl, wavePreset, 0.40, 0.045);
+          nudgeLensTowardFocal(c, targetEfl, wavePreset, 0.40, 0.045, { keepAperture: true });
         }
-        const ce = evalLensMerit(c, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+        promoteElementDiameters(c.surfaces, {
+          targetEfl,
+          targetT,
+          targetIC,
+          stage: basePri.stage,
+          strength: basePri.stage === 2 ? 1.1 : 0.8,
+          keepFl: flLocked,
+        });
+        enforcePupilHealthFloors(c.surfaces, {
+          targetEfl,
+          targetT,
+          targetIC,
+          stage: basePri.stage,
+          keepFl: flLocked,
+        });
+        quickSanity(c.surfaces);
+        if (topoUse) enforceTopology(c.surfaces, topoUse);
+        const ce = evalCandidateTier(
+          c,
+          "fast",
+          basePri,
+          baseEvalRef,
+          i
+        );
         if (!candEval || isEvalBetterByPlan(ce, candEval, targets)) {
           cand = c;
           candEval = ce;
           candPri = buildOptPriority(ce, targets);
         }
       }
+
+      let candAccurate = false;
+      let candAccEval = null;
+      const promoteCandAccurate = () => {
+        if (candAccurate && candAccEval) return candAccEval;
+        candAccEval = evalCandidateTier(
+          cand,
+          "accurate",
+          candPri,
+          candEval || curEval,
+          i,
+          true
+        );
+        candEval = candAccEval;
+        candPri = buildOptPriority(candEval, targets);
+        candAccurate = true;
+        return candAccEval;
+      };
+
+      const shouldAccurateCheck =
+        isEvalBetterByPlan(candEval, curEval, targets) ||
+        isEvalBetterByPlan(candEval, best.eval, targets) ||
+        (i % Math.max(20, Number(OPT_EVAL_CFG.accurateAuditEvery || 90) | 0) === 0);
+      if (shouldAccurateCheck) promoteCandAccurate();
 
       let accept = false;
       if (!curPri.feasible && candPri.feasible) {
@@ -4207,6 +4811,16 @@
       // Once we have entered FL band, never accept candidates outside the 5% band.
       if (flLocked && candPri.eflErrRel > OPT_STAGE_CFG.flHoldRel) {
         accept = false;
+      } else if (curPri.stage === 0 && candPri.stage === 0) {
+        // Hard FL gate: in FL acquire we only move when FL gets better (or not worse within tiny epsilon).
+        const flTol = 1e-6;
+        if (candPri.eflErrRel < curPri.eflErrRel - flTol) {
+          accept = true;
+        } else if (candPri.eflErrRel <= curPri.eflErrRel + flTol) {
+          accept = candPri.score <= curEval.score + 1e-6;
+        } else {
+          accept = false;
+        }
       } else if (curPri.flInBand && curPri.stage === 2 && candPri.eflErrRel > OPT_STAGE_CFG.flHoldRel) {
         // IC phase may move inside FL hold band, but never outside hard hold.
         accept = false;
@@ -4237,25 +4851,67 @@
         // Controlled exploration within FL constraints, to avoid optimizer stagnation.
         const sameStage = candPri.stage === curPri.stage;
         if (sameStage) {
-          const dE = planEnergy(candPri) - planEnergy(curPri);
-          const tempScale = (curPri.stage === 2 ? 520 : 300) * Math.max(0.10, temp);
-          const uphillProb = Math.exp(-Math.max(0, dE) / Math.max(1e-6, tempScale));
-          if (flLocked) {
-            accept = Math.random() < uphillProb;
+          if (curPri.stage === 0) {
+            // No uphill exploration in FL acquire.
+            accept = candPri.eflErrRel <= curPri.eflErrRel + 1e-6;
+          } else if (curPri.stage === 1) {
+            // T coarse stays target-dominant: do not accept worse T error.
+            accept =
+              candPri.feasible &&
+              candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
+              candPri.tErrAbs <= curPri.tErrAbs + 1e-4;
+          } else if (curPri.stage === 2) {
+            // IC growth stays target-dominant: do not accept worse IC shortfall.
+            accept =
+              candPri.feasible &&
+              candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
+              candPri.icNeedMm <= curPri.icNeedMm + 0.01;
           } else {
-            accept = (dE <= 0) || (Math.random() < uphillProb);
+            const dE = planEnergy(candPri) - planEnergy(curPri);
+            const tempScale = (curPri.stage === 2 ? 520 : 300) * Math.max(0.10, temp);
+            const uphillProb = Math.exp(-Math.max(0, dE) / Math.max(1e-6, tempScale));
+            if (flLocked) {
+              accept = Math.random() < uphillProb;
+            } else {
+              accept = (dE <= 0) || (Math.random() < uphillProb);
+            }
           }
         }
+      }
+      if (accept && !candAccurate) {
+        promoteCandAccurate();
+        const accStillGood =
+          isEvalBetterByPlan(candEval, curEval, targets) ||
+          (
+            curPri.stage === 1 &&
+            candPri.stage === 1 &&
+            candPri.feasible &&
+            candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
+            candPri.tErrAbs < curPri.tErrAbs - 0.01
+          ) ||
+          (
+            curPri.stage === 2 &&
+            candPri.stage === 2 &&
+            candPri.feasible &&
+            candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
+            candPri.icMeasured > curPri.icMeasured + 0.005
+          );
+        if (!accStillGood) accept = false;
       }
       if (accept){
         cur = cand;
         curEval = candEval;
         flLocked = flLocked || (candPri.feasible && candPri.flInBand);
+        addElite(cur, curEval, i);
       }
 
       let improvedBest = false;
+      if (!candAccurate && isEvalBetterByPlan(candEval, best.eval, targets)) {
+        promoteCandAccurate();
+      }
       if (isEvalBetterByPlan(candEval, best.eval, targets)){
         best = { lens: clone(cand), eval: candEval, iter: i };
+        addElite(best.lens, best.eval, i);
         improvedBest = true;
         const bp = buildOptPriority(best.eval, targets);
         const stageStep = fmtStageStep(bp.stage);
@@ -4281,15 +4937,17 @@
       if (stallIters > 220 && (i % Math.max(40, BATCH / 2) === 0)) {
         const bpKick = buildOptPriority(best.eval, targets);
         const kick = buildGuidedCandidate(best.lens, bpKick, targets, wavePreset, topo, true);
-        const kickEval = evalLensMerit(kick, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+        const kickEval = evalCandidateTier(kick, "accurate", bpKick, best.eval, i, true);
         if (isEvalBetterByPlan(kickEval, curEval, targets)) {
           cur = kick;
           curEval = kickEval;
           const kp = buildOptPriority(kickEval, targets);
           flLocked = flLocked || (kp.feasible && kp.flInBand);
+          addElite(cur, curEval, i);
         }
         if (isEvalBetterByPlan(kickEval, best.eval, targets)) {
           best = { lens: clone(kick), eval: kickEval, iter: i };
+          addElite(best.lens, best.eval, i);
           stallIters = 0;
         } else {
           stallIters = Math.floor(stallIters * 0.6);
@@ -4325,7 +4983,9 @@
             `current ${fmtFlOpt(curEval, targetEfl)}\n` +
             `current ${fmtIcOpt(curEval, targetIC)}\n` +
             `current ${fmtTOpt(curEval, targetT)}\n` +
-            `best: ${fmtFlOpt(best.eval, targetEfl)} • ${fmtIcOpt(best.eval, targetIC)} • ${fmtTOpt(best.eval, targetT)} • ${fmtPhysOpt(best.eval, targets)}\n`
+            `best: ${fmtFlOpt(best.eval, targetEfl)} • ${fmtIcOpt(best.eval, targetIC)} • ${fmtTOpt(best.eval, targetT)} • ${fmtPhysOpt(best.eval, targets)}\n` +
+            `${fmtEvalPerf("perf fast", perf.fast)}\n` +
+            `${fmtEvalPerf("perf acc", perf.accurate)}\n`
           );
         }
         // yield to UI
@@ -4353,6 +5013,8 @@
         `Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}%\n` +
         `INTR ${fmtIntrusion(best.eval)}\n` +
         `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
+        `${fmtEvalPerf("perf fast", perf.fast)}\n` +
+        `${fmtEvalPerf("perf acc", perf.accurate)}\n` +
         `Click “Apply best” to load.`
       );
     }
