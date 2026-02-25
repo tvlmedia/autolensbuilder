@@ -100,6 +100,7 @@
     btnOptDist: $("#btnOptDist"),
     btnOptDistApply: $("#btnOptDistApply"),
     btnOptSharp: $("#btnOptSharp"),
+    btnOptSharpApply: $("#btnOptSharpApply"),
     btnOptStop: $("#btnOptStop"),
     btnOptApply: $("#btnOptApply"),
     btnOptBench: $("#btnOptBench"),
@@ -6173,6 +6174,7 @@
   let distOptRunning = false;
   let distOptStopRequested = false;
   let distOptBest = null;
+  let sharpOptBest = null;
   let sharpOptRunning = false;
   let sharpOptStopRequested = false;
   let optBest = null; // {lens, score, meta}
@@ -6305,6 +6307,53 @@
     scheduleAutosave();
     const d70 = Number(distOptBest?.state?.dist70Pct);
     toast(`Applied Dist best${Number.isFinite(d70) ? ` (@0.7D ${d70.toFixed(2)}%)` : ""}`);
+  }
+
+  function queueSharpnessBest(bestLens, state, meta = {}) {
+    if (!bestLens?.surfaces || !Array.isArray(bestLens.surfaces)) return false;
+    const focusMode = String(meta?.focusMode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
+    const sensorX = Number(meta?.sensorX ?? state?.focus?.sensorX ?? 0);
+    const lensShift = Number(meta?.lensShift ?? state?.focus?.lensShift ?? 0);
+    sharpOptBest = {
+      lens: sanitizeLens(clone(bestLens)),
+      meta: {
+        focusMode,
+        sensorX: Number.isFinite(sensorX) ? sensorX : 0,
+        lensShift: Number.isFinite(lensShift) ? lensShift : 0,
+        runNo: Number(meta?.runNo || 0),
+      },
+      state: {
+        efl: Number.isFinite(Number(state?.efl)) ? Number(state.efl) : null,
+        T: Number.isFinite(Number(state?.T)) ? Number(state.T) : null,
+        centerRmsMm: Number.isFinite(Number(state?.sharp?.centerRmsMm)) ? Number(state.sharp.centerRmsMm) : null,
+        edgeRmsMm: Number.isFinite(Number(state?.sharp?.edgeRmsMm)) ? Number(state.sharp.edgeRmsMm) : null,
+        sharpScore: Number.isFinite(Number(state?.sharp?.score)) ? Number(state.sharp.score) : null,
+      },
+    };
+    return true;
+  }
+
+  function applySharpnessBest() {
+    if (!sharpOptBest?.lens?.surfaces) return toast("No sharpness best yet");
+    if (optRunning || distOptRunning || sharpOptRunning || scratchBuildRunning) {
+      return toast("Stop running optimizer/build first.");
+    }
+    loadLens(sharpOptBest.lens);
+    const m = sharpOptBest.meta || {};
+    const fm = String(m.focusMode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
+    if (ui.focusMode) ui.focusMode.value = fm;
+    if (ui.sensorOffset) ui.sensorOffset.value = Number.isFinite(Number(m.sensorX))
+      ? Number(m.sensorX).toFixed(3)
+      : "0";
+    if (ui.lensFocus) ui.lensFocus.value = Number.isFinite(Number(m.lensShift))
+      ? Number(m.lensShift).toFixed(3)
+      : "0";
+    renderAll();
+    scheduleRenderPreviewIfAvailable();
+    scheduleAutosave();
+    const c = Number(sharpOptBest?.state?.centerRmsMm);
+    const e = Number(sharpOptBest?.state?.edgeRmsMm);
+    toast(`Applied Sharp best${Number.isFinite(c) && Number.isFinite(e) ? ` (C/E ${c.toFixed(3)}/${e.toFixed(3)}mm)` : ""}`);
   }
 
   function makeEvalPerfBucket() {
@@ -8334,6 +8383,33 @@
     };
   }
 
+  function estimateImageCircleDriftProxyMm(
+    surfaces,
+    sensorW,
+    sensorH,
+    wavePreset,
+    rayCount = 15
+  ) {
+    if (!Array.isArray(surfaces) || !surfaces.length) return NaN;
+    const ic = Number(
+      estimateUsableCircleFastProxy(
+        surfaces,
+        Number(sensorW || 36.7),
+        Number(sensorH || 25.54),
+        wavePreset || "d",
+        Math.max(7, Math.min(21, Number(rayCount || 15) | 0)),
+        FAST_OPT_IC_CFG
+      )?.usableCircleDiameterMm
+    );
+    return Number.isFinite(ic) && ic > 0 ? ic : NaN;
+  }
+
+  function formatSignedMm(v, digits = 2) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "—";
+    return `${n >= 0 ? "+" : ""}${n.toFixed(Math.max(0, digits | 0))}mm`;
+  }
+
   function randRange(a, b) {
     return Number(a) + Math.random() * (Number(b) - Number(a));
   }
@@ -8851,11 +8927,14 @@
         return;
       }
       const baseScore = scoreSharpnessState(baseState, baseState, SHARP_OPT_CFG);
+      const baseIcMm = estimateImageCircleDriftProxyMm(startLens.surfaces, sensor.w, sensor.h, wavePreset, 15);
 
       let bestLens = clone(startLens);
       let bestState = baseState;
       let bestMerit = Number(baseScore?.merit || Infinity);
       let bestIter = 0;
+      let bestIcMm = baseIcMm;
+      let bestIcIterMeasured = 0;
 
       let curLens = clone(startLens);
       let curState = baseState;
@@ -8888,7 +8967,7 @@
         `running… 0/${iters}\n` +
         `apply mode: ${autoApply ? "auto" : "manual (Apply best)"}\n` +
         `baseline RMS C/E ${Number(baseState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(baseState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm\n` +
-        `baseline score ${Number(baseState?.sharp?.score || 0).toFixed(4)} • EFL ${baseState.efl.toFixed(2)}mm • T ${baseState.T.toFixed(2)} • field ${baseState.maxFieldDeg.toFixed(2)}°`
+        `baseline score ${Number(baseState?.sharp?.score || 0).toFixed(4)} • EFL ${baseState.efl.toFixed(2)}mm • T ${baseState.T.toFixed(2)} • field ${baseState.maxFieldDeg.toFixed(2)}° • IC ${Number.isFinite(baseIcMm) ? baseIcMm.toFixed(2) : "—"}mm`
       );
 
       let itersRan = 0;
@@ -8958,6 +9037,13 @@
           const tDrift = Number(bestState?.T || 0) - Number(baseState?.T || 0);
           const fieldDrop = Math.max(0, Number(baseState?.maxFieldDeg || 0) - Number(bestState?.maxFieldDeg || 0));
           const distNow = Number(bestState?.dist70Pct);
+          if (bestIter !== bestIcIterMeasured) {
+            bestIcMm = estimateImageCircleDriftProxyMm(bestLens.surfaces, sensor.w, sensor.h, wavePreset, 15);
+            bestIcIterMeasured = bestIter;
+          }
+          const icDriftMm = Number.isFinite(baseIcMm) && Number.isFinite(bestIcMm)
+            ? (bestIcMm - baseIcMm)
+            : NaN;
           setOptLog(
             `${runHeader}\n` +
             `running… ${i}/${iters} (${ips.toFixed(1)} it/s)\n` +
@@ -8965,7 +9051,7 @@
             `base RMS C/E ${Number(baseState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(baseState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm\n` +
             `cur  RMS C/E ${Number.isFinite(curC) ? curC.toFixed(3) : "—"} / ${Number.isFinite(curE) ? curE.toFixed(3) : "—"} mm\n` +
             `best RMS C/E ${Number.isFinite(bestC) ? bestC.toFixed(3) : "—"} / ${Number.isFinite(bestE) ? bestE.toFixed(3) : "—"} mm\n` +
-            `best drift EFL ${eflDrift.toFixed(3)}mm • T ${tDrift.toFixed(3)} • field drop ${fieldDrop.toFixed(2)}° • dist70 ${Number.isFinite(distNow) ? distNow.toFixed(2) : "—"}%\n` +
+            `best drift EFL ${eflDrift.toFixed(3)}mm • T ${tDrift.toFixed(3)} • field drop ${fieldDrop.toFixed(2)}° • IC drift ${formatSignedMm(icDriftMm, 2)} • dist70 ${Number.isFinite(distNow) ? distNow.toFixed(2) : "—"}%\n` +
             `focus ${focusMode === "cam" ? `sensor ${Number(bestState?.focus?.sensorX || 0).toFixed(3)}mm` : `lens ${Number(bestState?.focus?.lensShift || 0).toFixed(3)}mm`}\n` +
             `rejects phys ${rejects.phys} • pl ${rejects.pl} • xover ${rejects.xover} • bfl ${rejects.bfl} • af ${rejects.af} • sharp ${rejects.sharp} • efl ${rejects.efl_guard} • t ${rejects.t_guard} • cov ${rejects.cov_guard} • dist ${rejects.dist_guard} • mut ${rejects.mutation}`
           );
@@ -8978,6 +9064,15 @@
         Number.isFinite(bestScore?.merit) &&
         Number.isFinite(baseScore?.merit) &&
         bestScore.merit + 1e-6 < baseScore.merit;
+
+      if (improved) {
+        queueSharpnessBest(bestLens, bestState, {
+          focusMode,
+          sensorX: Number(bestState?.focus?.sensorX ?? sensorX0),
+          lensShift: Number(bestState?.focus?.lensShift ?? lensShift0),
+          runNo,
+        });
+      }
 
       const appliedNow = improved && autoApply;
       const queuedManual = improved && !autoApply;
@@ -9014,6 +9109,13 @@
       const eflDrift = Number(bestState?.efl || 0) - Number(baseState?.efl || 0);
       const tDrift = Number(bestState?.T || 0) - Number(baseState?.T || 0);
       const fieldDrop = Math.max(0, Number(baseState?.maxFieldDeg || 0) - Number(bestState?.maxFieldDeg || 0));
+      if (bestIter !== bestIcIterMeasured) {
+        bestIcMm = estimateImageCircleDriftProxyMm(bestLens.surfaces, sensor.w, sensor.h, wavePreset, 15);
+        bestIcIterMeasured = bestIter;
+      }
+      const icDriftMm = Number.isFinite(baseIcMm) && Number.isFinite(bestIcMm)
+        ? (bestIcMm - baseIcMm)
+        : NaN;
       const bestIterTxt = (bestIter > 0) ? `${bestIter}/${Math.max(1, iters)}` : "baseline (0)";
       setOptLog(
         `${runHeader}\n` +
@@ -9023,7 +9125,7 @@
         `sharp before RMS C/E ${Number(baseState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(baseState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm • score ${Number(baseState?.sharp?.score || 0).toFixed(4)}\n` +
         `sharp after  RMS C/E ${Number(bestState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(bestState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm • score ${Number(bestState?.sharp?.score || 0).toFixed(4)}\n` +
         `focus ${focusMode === "cam" ? `sensorOffset ${Number(bestState?.focus?.sensorX || 0).toFixed(3)}mm` : `lensFocus ${Number(bestState?.focus?.lensShift || 0).toFixed(3)}mm`}\n` +
-        `drift EFL ${eflDrift.toFixed(3)}mm • T ${tDrift.toFixed(3)} • field drop ${fieldDrop.toFixed(2)}° • dist70 ${Number.isFinite(bestState?.dist70Pct) ? Number(bestState.dist70Pct).toFixed(2) : "—"}%\n` +
+        `drift EFL ${eflDrift.toFixed(3)}mm • T ${tDrift.toFixed(3)} • field drop ${fieldDrop.toFixed(2)}° • IC drift ${formatSignedMm(icDriftMm, 2)} (${Number.isFinite(baseIcMm) ? baseIcMm.toFixed(2) : "—"}→${Number.isFinite(bestIcMm) ? bestIcMm.toFixed(2) : "—"}mm) • dist70 ${Number.isFinite(bestState?.dist70Pct) ? Number(bestState.dist70Pct).toFixed(2) : "—"}%\n` +
         `rejects phys ${rejects.phys} • pl ${rejects.pl} • xover ${rejects.xover} • bfl ${rejects.bfl} • af ${rejects.af} • sharp ${rejects.sharp} • efl ${rejects.efl_guard} • t ${rejects.t_guard} • cov ${rejects.cov_guard} • dist ${rejects.dist_guard} • mut ${rejects.mutation}`
       );
       toast(
@@ -9110,11 +9212,14 @@
       const baseScore = scoreDistortionState(baseState, baseState, DIST_OPT_CFG);
       const baseDist70 = Number(baseState?.dist?.distPctAt70);
       const baseRms = Number(baseState?.dist?.rmsDistPct);
+      const baseIcMm = estimateImageCircleDriftProxyMm(startLens.surfaces, sensor.w, sensor.h, wavePreset, 15);
 
       let bestLens = clone(startLens);
       let bestState = baseState;
       let bestMerit = baseScore.merit;
       let bestIter = 0;
+      let bestIcMm = baseIcMm;
+      let bestIcIterMeasured = 0;
 
       let curLens = clone(startLens);
       let curState = baseState;
@@ -9146,7 +9251,7 @@
         `running… 0/${iters}\n` +
         `apply mode: ${autoApply ? "auto" : "manual (Apply best)"}\n` +
         `baseline DIST@0.7D ${Number.isFinite(baseDist70) ? baseDist70.toFixed(2) : "—"}% • RMS ${Number.isFinite(baseRms) ? baseRms.toFixed(2) : "—"}%\n` +
-        `baseline EFL ${baseState.efl.toFixed(2)}mm • T ${baseState.T.toFixed(2)} • field ${baseState.maxFieldDeg.toFixed(2)}° • stop #${baseState.stopIdx}`
+        `baseline EFL ${baseState.efl.toFixed(2)}mm • T ${baseState.T.toFixed(2)} • field ${baseState.maxFieldDeg.toFixed(2)}° • IC ${Number.isFinite(baseIcMm) ? baseIcMm.toFixed(2) : "—"}mm • stop #${baseState.stopIdx}`
       );
 
       let itersRan = 0;
@@ -9218,6 +9323,13 @@
           const eflDrift = Number(bestState?.efl || 0) - Number(baseState?.efl || 0);
           const tDrift = Number(bestState?.T || 0) - Number(baseState?.T || 0);
           const fieldDrop = Math.max(0, Number(baseState?.maxFieldDeg || 0) - Number(bestState?.maxFieldDeg || 0));
+          if (bestIter !== bestIcIterMeasured) {
+            bestIcMm = estimateImageCircleDriftProxyMm(bestLens.surfaces, sensor.w, sensor.h, wavePreset, 15);
+            bestIcIterMeasured = bestIter;
+          }
+          const icDriftMm = Number.isFinite(baseIcMm) && Number.isFinite(bestIcMm)
+            ? (bestIcMm - baseIcMm)
+            : NaN;
           setOptLog(
             `${runHeader}\n` +
             `running… ${i}/${iters} (${ips.toFixed(1)} it/s)\n` +
@@ -9225,7 +9337,7 @@
             `base DIST@0.7D ${Number.isFinite(baseDist70) ? baseDist70.toFixed(2) : "—"}% • RMS ${Number.isFinite(baseRms) ? baseRms.toFixed(2) : "—"}%\n` +
             `cur  DIST@0.7D ${Number.isFinite(cur70) ? cur70.toFixed(2) : "—"}% • RMS ${Number.isFinite(curRms) ? curRms.toFixed(2) : "—"}%\n` +
             `best DIST@0.7D ${Number.isFinite(best70) ? best70.toFixed(2) : "—"}% • RMS ${Number.isFinite(bestRms) ? bestRms.toFixed(2) : "—"}%\n` +
-            `best drift EFL ${eflDrift.toFixed(3)}mm • T ${tDrift.toFixed(3)} • field drop ${fieldDrop.toFixed(2)}° • stop #${bestState.stopIdx}\n` +
+            `best drift EFL ${eflDrift.toFixed(3)}mm • T ${tDrift.toFixed(3)} • field drop ${fieldDrop.toFixed(2)}° • IC drift ${formatSignedMm(icDriftMm, 2)} • stop #${bestState.stopIdx}\n` +
             `rejects phys ${rejects.phys} • pl ${rejects.pl} • xover ${rejects.xover} • bfl ${rejects.bfl} • dist ${rejects.dist} • efl ${rejects.efl_guard} • t ${rejects.t_guard} • cov ${rejects.cov_guard} • mut ${rejects.mutation}`
           );
           await new Promise((r) => setTimeout(r, 0));
@@ -9276,6 +9388,13 @@
       const eflDrift = Number(bestState?.efl || 0) - Number(baseState?.efl || 0);
       const tDrift = Number(bestState?.T || 0) - Number(baseState?.T || 0);
       const fieldDrop = Math.max(0, Number(baseState?.maxFieldDeg || 0) - Number(bestState?.maxFieldDeg || 0));
+      if (bestIter !== bestIcIterMeasured) {
+        bestIcMm = estimateImageCircleDriftProxyMm(bestLens.surfaces, sensor.w, sensor.h, wavePreset, 15);
+        bestIcIterMeasured = bestIter;
+      }
+      const icDriftMm = Number.isFinite(baseIcMm) && Number.isFinite(bestIcMm)
+        ? (bestIcMm - baseIcMm)
+        : NaN;
       const bestIterTxt = (bestIter > 0) ? `${bestIter}/${Math.max(1, iters)}` : "baseline (0)";
       setOptLog(
         `${runHeader}\n` +
@@ -9284,7 +9403,7 @@
         `${appliedNow ? "APPLIED ✅" : (queuedManual ? "QUEUED (click Apply best) ⏳" : "no better candidate (kept original)")}\n` +
         `dist before DIST@0.7D ${Number.isFinite(baseDist70) ? baseDist70.toFixed(2) : "—"}% • RMS ${Number.isFinite(baseRms) ? baseRms.toFixed(2) : "—"}%\n` +
         `dist after  DIST@0.7D ${Number.isFinite(after70) ? after70.toFixed(2) : "—"}% • RMS ${Number.isFinite(afterRms) ? afterRms.toFixed(2) : "—"}%\n` +
-        `drift EFL ${eflDrift.toFixed(3)}mm • T ${tDrift.toFixed(3)} • field drop ${fieldDrop.toFixed(2)}°\n` +
+        `drift EFL ${eflDrift.toFixed(3)}mm • T ${tDrift.toFixed(3)} • field drop ${fieldDrop.toFixed(2)}° • IC drift ${formatSignedMm(icDriftMm, 2)} (${Number.isFinite(baseIcMm) ? baseIcMm.toFixed(2) : "—"}→${Number.isFinite(bestIcMm) ? bestIcMm.toFixed(2) : "—"}mm)\n` +
         `stop idx ${bestState.stopIdx}\n` +
         `rejects phys ${rejects.phys} • pl ${rejects.pl} • xover ${rejects.xover} • bfl ${rejects.bfl} • dist ${rejects.dist} • efl ${rejects.efl_guard} • t ${rejects.t_guard} • cov ${rejects.cov_guard} • mut ${rejects.mutation}`
       );
@@ -10052,6 +10171,7 @@
     ui.btnOptDist?.addEventListener("click", runDistortionOptimizer);
     ui.btnOptDistApply?.addEventListener("click", applyDistortionBest);
     ui.btnOptSharp?.addEventListener("click", runSharpnessOptimizer);
+    ui.btnOptSharpApply?.addEventListener("click", applySharpnessBest);
     ui.btnOptStop?.addEventListener("click", stopOptimizer);
     ui.btnOptApply?.addEventListener("click", applyBest);
     ui.btnOptBench?.addEventListener("click", benchOptimizer);
