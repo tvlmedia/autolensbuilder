@@ -3682,6 +3682,66 @@
     surfaces[imsIdx].ap = Math.max(0.1, Number(sensorH || 24) * 0.5);
   }
 
+  function findScratchRearSurfaceIndex(surfaces) {
+    if (!Array.isArray(surfaces) || !surfaces.length) return -1;
+    const imsIdx = surfaces.findIndex((s) => String(s?.type || "").toUpperCase() === "IMS");
+    if (imsIdx <= 0) return -1;
+    for (let i = imsIdx - 1; i >= 0; i--) {
+      const t = String(surfaces[i]?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      return i;
+    }
+    return -1;
+  }
+
+  function enforceRearMountStart(surfaces, opts = {}) {
+    if (!Array.isArray(surfaces) || !surfaces.length) return false;
+    const rearIdx = findScratchRearSurfaceIndex(surfaces);
+    if (rearIdx < 0) return false;
+
+    const minRearClear = Math.max(0, Number(opts?.minRearClearMm ?? 0.8));
+    const minGapToSensor = Math.max(PHYS_CFG.minAirGap, PL_FFD + minRearClear);
+    const maxGapToSensor = Math.max(minGapToSensor + 2, Number(opts?.maxRearGapMm ?? (PL_FFD + 95)));
+    const rear = surfaces[rearIdx];
+    rear.glass = "AIR";
+    rear.t = clamp(
+      Math.max(PHYS_CFG.minAirGap, Number(rear.t || 0), minGapToSensor),
+      minGapToSensor,
+      maxGapToSensor
+    );
+
+    // If the gap right before the rear surface got very large, shift excess into the
+    // final image-space gap so the geometry does not "balloon" near the sensor.
+    const preRearIdx = rearIdx - 1;
+    if (preRearIdx >= 0) {
+      const prev = surfaces[preRearIdx];
+      const tp = String(prev?.type || "").toUpperCase();
+      const prevMed = String(resolveGlassName(prev?.glass || "AIR")).toUpperCase();
+      if (tp !== "OBJ" && tp !== "IMS" && prevMed === "AIR") {
+        const preRearMax = Math.max(PHYS_CFG.minAirGap, Number(opts?.maxPreRearAirGapMm ?? 14));
+        const prevGap = Math.max(PHYS_CFG.minAirGap, Number(prev.t || 0));
+        if (prevGap > preRearMax) {
+          const spill = prevGap - preRearMax;
+          prev.t = preRearMax;
+          rear.t = clamp(Number(rear.t || 0) + spill, minGapToSensor, maxGapToSensor);
+        }
+      }
+    }
+    return true;
+  }
+
+  function bakeLensShiftIntoRearGap(surfaces, lensShiftMm) {
+    if (!Array.isArray(surfaces) || !surfaces.length) return false;
+    const sh = Number(lensShiftMm);
+    if (!Number.isFinite(sh) || Math.abs(sh) < 1e-5) return false;
+    const rearIdx = findScratchRearSurfaceIndex(surfaces);
+    if (rearIdx < 0) return false;
+    const rear = surfaces[rearIdx];
+    rear.glass = "AIR";
+    rear.t = Math.max(PHYS_CFG.minAirGap, Number(rear.t || 0) - sh);
+    return true;
+  }
+
   function enforceSingleStopSurface(surfaces) {
     if (!Array.isArray(surfaces) || !surfaces.length) return;
     ensureStopExists(surfaces);
@@ -3722,6 +3782,7 @@
     const tgt = Number(targetEfl || 0);
     if (!Number.isFinite(tgt) || tgt <= 1) return false;
 
+    enforceRearMountStart(surfaces);
     let ok = false;
     for (let pass = 0; pass < 4; pass++) {
       computeVertices(surfaces, 0, 0);
@@ -3739,14 +3800,22 @@
         ? clamp(kRaw, 0.30, 3.20)
         : clamp(kRaw, 0.60, 1.70);
 
+      const rearIdx = findScratchRearSurfaceIndex(surfaces);
       for (let i = 0; i < surfaces.length; i++) {
         const s = surfaces[i];
         const t = String(s?.type || "").toUpperCase();
         if (t === "OBJ" || t === "IMS") continue;
         s.R = Number(s.R || 0) * k;
-        s.t = Math.max(PHYS_CFG.minThickness, Number(s.t || 0) * k);
+        if (i === rearIdx) {
+          // Keep image-space gap tied to mount geometry instead of scaling with optical power.
+          s.t = Math.max(PHYS_CFG.minAirGap, Number(s.t || 0));
+          s.glass = "AIR";
+        } else {
+          s.t = Math.max(PHYS_CFG.minThickness, Number(s.t || 0) * k);
+        }
         s.ap = Math.max(PHYS_CFG.minAperture, Number(s.ap || 0) * Math.sqrt(k));
       }
+      enforceRearMountStart(surfaces);
       quickSanity(surfaces);
       ok = true;
     }
@@ -3935,6 +4004,9 @@
       stop: false,
     });
 
+    enforceRearMountStart(surfaces);
+    quickSanity(surfaces);
+
     const made = sanitizeLens({
       name: `Scratch ${scratchFamilyLabel(resolvedFamily)} ${f.toFixed(0)}mm`,
       notes: [
@@ -3950,6 +4022,7 @@
     const wavePreset = String(opts?.wavePreset || ui.wavePreset?.value || "d");
     const work = sanitizeLens(clone(lensObj));
     const surfaces = work.surfaces;
+    enforceRearMountStart(surfaces);
     setImsApertureForSensor(surfaces, Number(sensor?.h || 24));
     enforceSingleStopSurface(surfaces);
     ensureStopInAirBothSides(surfaces);
@@ -3973,6 +4046,7 @@
     });
     setImsApertureForSensor(surfaces, Number(sensor?.h || 24));
     ensureStopInAirBothSides(surfaces);
+    enforceRearMountStart(surfaces);
     quickSanity(surfaces);
     return sanitizeLens(work);
   }
@@ -3990,6 +4064,15 @@
     const distMax = Number.isFinite(p.distMaxScore) ? Number(p.distMaxScore) : 999;
     const sharp = Number.isFinite(p.sharpness) ? Number(p.sharpness) : 999;
     const targetIC = Math.max(0, Number(targets?.targetIC || 0));
+    const intrusion = Math.max(0, Number(p.intrusionMm || 0));
+    const overlap = Math.max(0, Number(p.overlapMm || 0));
+    const bflShort = Math.max(0, Number(p.bflShortMm || 0));
+
+    // If physical feasibility is bad, avoid rear-heavy growth that tends to worsen intrusion.
+    if (!p.feasible && (intrusion > 0.15 || overlap > 0.01)) {
+      return (cycleIdx % 2 === 0) ? "distortion_corrector" : "achromat_corrector";
+    }
+    if (!p.feasible && bflShort > 0.8) return "rear_expander";
 
     if (targetIC > 0 && icNeed > Math.max(0.55, targetIC * 0.02)) return "rear_expander";
     if (distRms > 0.90 || distMax > 1.80) return "distortion_corrector";
@@ -4083,6 +4166,7 @@
     enforceSingleStopSurface(surfaces);
     ensureStopInAirBothSides(surfaces);
     setImsApertureForSensor(surfaces, Number(sensor?.h || 24));
+    enforceRearMountStart(surfaces);
     quickSanity(surfaces);
     return sanitizeLens(work);
   }
@@ -4121,8 +4205,16 @@
     return "safe";
   }
 
-  function applyOptimizerBestUnsafe() {
+  function applyOptimizerBestUnsafe(targets = null) {
     if (!optBest?.lens) return false;
+    if (targets && typeof targets === "object") {
+      const pri = buildOptPriority(optBest.eval, {
+        targetEfl: Number(targets.targetEfl || 50),
+        targetIC: Math.max(0, Number(targets.targetIC || 0)),
+        targetT: Number(targets.targetT || 0),
+      });
+      if (!pri.feasible) return false;
+    }
     loadLens(optBest.lens);
     if (ui.focusMode) ui.focusMode.value = "lens";
     if (ui.sensorOffset) ui.sensorOffset.value = "0";
@@ -4202,7 +4294,27 @@
       `optimizer ${ui.optPop?.value || "safe"} • ${ui.optIters?.value || pass.iters} iters`
     );
     await runOptimizer();
-    applyOptimizerBestUnsafe();
+    let loaded = applyOptimizerBestUnsafe({
+      targetEfl: Number(targets.targetEfl || 50),
+      targetT: Number(pass.targetT || 0),
+      targetIC: Math.max(0, Number(pass.targetIC || 0)),
+    });
+    if (!loaded) loaded = applyOptimizerBestUnsafe(null);
+    if (loaded && Array.isArray(lens?.surfaces)) {
+      const sensorNow = getSensorWH();
+      const shiftNow = Number(ui.lensFocus?.value ?? optBest?.eval?.lensShift ?? 0);
+      bakeLensShiftIntoRearGap(lens.surfaces, shiftNow);
+      enforceRearMountStart(lens.surfaces);
+      ensureStopInAirBothSides(lens.surfaces);
+      setImsApertureForSensor(lens.surfaces, Number(sensorNow?.h || 24));
+      quickSanity(lens.surfaces);
+      if (ui.focusMode) ui.focusMode.value = "lens";
+      if (ui.sensorOffset) ui.sensorOffset.value = "0";
+      if (ui.lensFocus) ui.lensFocus.value = "0.00";
+      buildTable();
+      applySensorToIMS();
+      autoFocus();
+    }
     return evaluateCurrentLensPriorityForTargets(targets);
   }
 
@@ -4269,10 +4381,28 @@
 
       const firstPasses = scratchPassesForAggressiveness(aggr, targets, false);
       let snap = null;
+      let bestFeasibleSnapshot = null;
+      const storeBestFeasible = (label, resObj) => {
+        const pri = resObj?.pri;
+        if (!pri?.feasible) return;
+        const metric = scratchProgressMetric(pri, targets);
+        if (!bestFeasibleSnapshot || metric < bestFeasibleSnapshot.metric) {
+          bestFeasibleSnapshot = {
+            metric,
+            label: String(label || "snapshot"),
+            lens: sanitizeLens(clone(lens)),
+            pri,
+            eval: resObj.evalRes,
+          };
+        }
+      };
+      const startSnap = evaluateCurrentLensPriorityForTargets(targets);
+      storeBestFeasible("prepared", startSnap);
       for (let i = 0; i < firstPasses.length; i++) {
         snap = await runScratchOptimizerPass(firstPasses[i], targets, aggr, {
           tag: `pass ${i + 1}/${firstPasses.length}`,
         });
+        storeBestFeasible(`pass_${firstPasses[i]?.id || i}`, snap);
       }
 
       let bestPri = snap?.pri || evaluateCurrentLensPriorityForTargets(targets).pri;
@@ -4331,6 +4461,7 @@
         }
 
         const after = evaluateCurrentLensPriorityForTargets(targets);
+        storeBestFeasible(`grow_${cycle + 1}`, after);
         const metric = scratchProgressMetric(after.pri, targets);
         const relImprove = (bestMetric - metric) / Math.max(1e-6, Math.abs(bestMetric));
         if (metric < bestMetric) {
@@ -4358,18 +4489,30 @@
       );
 
       const final = evaluateCurrentLensPriorityForTargets(targets);
-      const p = final.pri;
+      let finalSnap = final;
+      if (!finalSnap.pri?.feasible && bestFeasibleSnapshot?.lens) {
+        loadLens(bestFeasibleSnapshot.lens);
+        if (ui.focusMode) ui.focusMode.value = "lens";
+        if (ui.sensorOffset) ui.sensorOffset.value = "0";
+        if (ui.lensFocus && Number.isFinite(bestFeasibleSnapshot?.eval?.lensShift)) {
+          ui.lensFocus.value = Number(bestFeasibleSnapshot.eval.lensShift).toFixed(2);
+        }
+        renderAll();
+        finalSnap = evaluateCurrentLensPriorityForTargets(targets);
+      }
+      const p = finalSnap.pri;
       const done = scratchTargetsReached(p, targets);
       const finalElems = countLensElements(lens.surfaces);
       setOptLog(
         `Build From Scratch ${done ? "DONE ✅" : "DONE (best effort)"}\n` +
         `family ${scratchFamilyLabel(familyResolved)} • aggr ${aggr}\n` +
+        `${bestFeasibleSnapshot ? `fallback ${bestFeasibleSnapshot.label}\n` : ""}` +
         `elements ${finalElems}/${maxElems}\n` +
         `FL err ${(Number(p.eflErrRel || 0) * 100).toFixed(2)}%\n` +
         `T err ${Number.isFinite(p.tErrAbs) ? p.tErrAbs.toFixed(2) : "—"}\n` +
         `IC short ${Number.isFinite(p.icNeedMm) ? p.icNeedMm.toFixed(2) : "—"}mm\n` +
         `Dist RMS ${Number.isFinite(p.distRmsPct) ? Math.abs(p.distRmsPct).toFixed(2) : "—"}% • MAX ${Number.isFinite(p.distMaxPct) ? Math.abs(p.distMaxPct).toFixed(2) : "—"}%\n` +
-        `${fmtPhysOpt(final.evalRes, targets)}\n` +
+        `${fmtPhysOpt(finalSnap.evalRes, targets)}\n` +
         `stage ${p.stageName}`
       );
 
@@ -5359,10 +5502,16 @@
 
     const sensorX = 0.0;
     const phys0 = performance.now();
+    // Evaluate mount intrusion at both neutral focus and focused state.
+    // This prevents "cheating" mount constraints by sliding the whole lens with lensShift.
+    computeVertices(surfaces, 0, sensorX);
+    const rearVxNeutral = lastPhysicalVertexX(surfaces);
+    const intrusionNeutral = Number.isFinite(rearVxNeutral) ? (rearVxNeutral - (-PL_FFD)) : Infinity;
     computeVertices(surfaces, lensShift, sensorX);
     const phys = evaluatePhysicalConstraints(surfaces);
-    const rearVx = lastPhysicalVertexX(surfaces);
-    const intrusion = Number.isFinite(rearVx) ? (rearVx - (-PL_FFD)) : Infinity;
+    const rearVxFocused = lastPhysicalVertexX(surfaces);
+    const intrusionFocused = Number.isFinite(rearVxFocused) ? (rearVxFocused - (-PL_FFD)) : Infinity;
+    const intrusion = Math.max(intrusionNeutral, intrusionFocused);
     tPhysMs += (performance.now() - phys0);
 
     if (phys.hardFail) {
@@ -5577,17 +5726,21 @@
   function buildOptPriority(evalRes, { targetEfl, targetIC, targetT }) {
     const efl = Number(evalRes?.efl);
     const T = Number(evalRes?.T);
+    const bfl = Number(evalRes?.bfl);
     const score = Number.isFinite(evalRes?.score) ? Number(evalRes.score) : 1e9;
     const hardInvalid = !!evalRes?.hardInvalid;
     const intrusionMm = Math.max(0, Number(evalRes?.intrusion || 0));
     const overlapMm = Math.max(0, Number(evalRes?.worstOverlap || 0));
     const pinchMm = Math.max(0, Number(evalRes?.worstPinch || 0));
     const physPenalty = Math.max(0, Number(evalRes?.physPenalty || 0));
-    const feasible = !hardInvalid && intrusionMm <= 1e-3 && overlapMm <= 1e-3;
+    const bflShortMm = Number.isFinite(bfl) ? Math.max(0, MERIT_CFG.bflMin - bfl) : MERIT_CFG.bflMin;
+    const bflBad = bflShortMm > 0.5;
+    const feasible = !hardInvalid && intrusionMm <= 1e-3 && overlapMm <= 1e-3 && !bflBad;
     const feasibilityDebt =
       (hardInvalid ? 5000 : 0) +
       intrusionMm * 1200 +
       overlapMm * 2000 +
+      bflShortMm * 260 +
       Math.max(0, pinchMm - 0.35) * 160 +
       physPenalty * 0.02;
 
@@ -5646,6 +5799,8 @@
       overlapMm,
       pinchMm,
       physPenalty,
+      bfl,
+      bflShortMm,
       efl,
       eflErrRel,
       flInBand,
@@ -5790,7 +5945,8 @@
     if (p.feasible) return "PHYS OK ✅";
     const intrTxt = Number.isFinite(p.intrusionMm) ? p.intrusionMm.toFixed(2) : "—";
     const ovTxt = Number.isFinite(p.overlapMm) ? p.overlapMm.toFixed(2) : "—";
-    return `PHYS INVALID ❌ (intr ${intrTxt}mm • overlap ${ovTxt}mm)`;
+    const bflTxt = Number.isFinite(p.bflShortMm) ? p.bflShortMm.toFixed(2) : "—";
+    return `PHYS INVALID ❌ (intr ${intrTxt}mm • overlap ${ovTxt}mm • BFL short ${bflTxt}mm)`;
   }
 
   function fmtStageStep(stage) {
@@ -6363,7 +6519,7 @@
     };
     const p = buildOptPriority(optBest.eval, targets);
     if (!p.feasible) {
-      return toast("Best is fysiek ongeldig (intrusion/overlap). Eerst verder optimaliseren.");
+      return toast("Best is fysiek ongeldig (intrusion/overlap/BFL). Eerst verder optimaliseren.");
     }
     loadLens(optBest.lens);
     // set lensFocus from best
