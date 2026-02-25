@@ -1296,9 +1296,9 @@
     flHoldRel: 0.05,      // hard FL hold after lock (within +/-5%)
     polishFlDriftRel: 0.0008, // in fine tune, keep FL nearly locked while reducing residual distortion
     icStageDriftRel: 0.006, // allow a bit more FL drift during IC growth
-    tCoarseAbs: 0.75,     // before IC growth, first pull T close enough
+    tCoarseAbs: 0.75,     // before IC growth, first reduce too-slow T overshoot
     icPassFrac: 0.95,     // IC phase is "good enough" at >=95% of requested IC
-    tGoodAbs: 0.25,       // T phase considered good when absolute T error <= 0.25
+    tGoodAbs: 0.25,       // T phase considered good when too-slow T overshoot <= 0.25
   };
 
   const OPT_EVAL_CFG = {
@@ -2559,8 +2559,8 @@
     eflRelWeight: 6000.0,     // relative EFL penalty (dominant vs absolute mm)
     eflBarrierRel: 0.05,      // beyond 5% FL error, apply hard barrier
     eflBarrierWeight: 280000.0,
-    tWeight: 10.0,            // penalty per T error (squared)
-    tBarrierAbs: 0.50,        // beyond 0.5 T-error, apply hard barrier
+    tWeight: 10.0,            // penalty per too-slow T overshoot (squared)
+    tBarrierAbs: 0.50,        // beyond +0.5 too-slow T overshoot, apply hard barrier
     tBarrierWeight: 5200.0,
     bflMin: 52.0,             // for PL: discourage too-short backfocus
     bflWeight: 6.0,
@@ -2661,11 +2661,12 @@
       }
     }
     if (Number.isFinite(targetT) && Number.isFinite(T)){
-      const d = (T - targetT);
-      merit += MERIT_CFG.tWeight * (d * d);
-      const dAbs = Math.abs(d);
-      if (dAbs > MERIT_CFG.tBarrierAbs) {
-        const x = dAbs - MERIT_CFG.tBarrierAbs;
+      // Target T is treated as a maximum allowed value.
+      // Faster lens (smaller T) is acceptable; only too-slow T is penalized.
+      const dSlow = Math.max(0, T - targetT);
+      merit += MERIT_CFG.tWeight * (dSlow * dSlow);
+      if (dSlow > MERIT_CFG.tBarrierAbs) {
+        const x = dSlow - MERIT_CFG.tBarrierAbs;
         merit += MERIT_CFG.tBarrierWeight * (x * x);
       }
     }
@@ -3910,14 +3911,15 @@
 
     const stop = surfaces[stopIdx];
     const desiredStopAp = clamp(fTarget / (2 * tTarget), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
-    stop.ap = desiredStopAp;
+    // One-sided T target: preserve faster-than-target pupil if already present.
+    stop.ap = Math.max(Number(stop.ap || 0), desiredStopAp);
     stop.glass = "AIR";
     stop.stop = true;
     stop.type = "STOP";
     enforceApertureRadiusCoupling(stop, 1.10);
 
     for (let d = 1; d <= 3; d++) {
-      const need = desiredStopAp * (1 - d * 0.10);
+      const need = Number(stop.ap || desiredStopAp) * (1 - d * 0.10);
       for (const idx of [stopIdx - d, stopIdx + d]) {
         if (idx < 0 || idx >= surfaces.length) continue;
         const ss = surfaces[idx];
@@ -4382,13 +4384,30 @@
     if (ui.optPop) ui.optPop.value = scratchOptModeForPass(aggr, pass.id);
 
     const tag = meta?.tag ? `${meta.tag} • ` : "";
+    const runIndex = Number(meta?.runIndex || 0);
+    const runTotal = Number(meta?.runTotal || 0);
+    const runStepTxt = (Number.isFinite(runIndex) && runIndex > 0 && Number.isFinite(runTotal) && runTotal > 0)
+      ? `Step ${Math.round(runIndex)}/${Math.round(runTotal)} • `
+      : "";
+    const phaseLabel = String(meta?.phaseLabel || "").trim();
     setOptLog(
       `Build From Scratch\n` +
-      `${tag}stage ${pass.id}: ${pass.label}\n` +
+      `${runStepTxt}${tag}stage ${pass.id}: ${pass.label}\n` +
       `targets FL ${Number(targets.targetEfl).toFixed(2)} • T ${Number(pass.targetT || 0).toFixed(2)} • IC ${Math.max(0, Number(pass.targetIC || 0)).toFixed(2)}\n` +
       `optimizer ${ui.optPop?.value || "safe"} • ${ui.optIters?.value || pass.iters} iters`
     );
-    await runOptimizer();
+    const prevRunCtx = optRunContext;
+    setOptRunContext({
+      mode: "Build From Scratch",
+      stepIndex: runIndex,
+      stepTotal: runTotal,
+      label: phaseLabel || `${tag}stage ${pass.id}: ${pass.label}`,
+    });
+    try {
+      await runOptimizer();
+    } finally {
+      setOptRunContext(prevRunCtx);
+    }
     let loaded = applyOptimizerBestUnsafe({
       targetEfl: Number(targets.targetEfl || 50),
       targetT: Number(pass.targetT || 0),
@@ -4470,15 +4489,22 @@
       if (ui.sensorOffset) ui.sensorOffset.value = "0";
       autoFocus();
 
+      const firstPasses = scratchPassesForAggressiveness(aggr, targets, false, effortScale);
+      const maxGrowCyclesBase = Number(SCRATCH_CFG.maxGrowCycles[aggr] || 4);
+      const maxGrowCycles = Math.max(1, Math.round(maxGrowCyclesBase * effortScale));
+      const growPassTemplate = scratchPassesForAggressiveness(aggr, targets, true, effortScale);
+      const runTotalEstimate = firstPasses.length + (maxGrowCycles * growPassTemplate.length) + 1;
+      let runStep = 0;
+
       const startElements = countLensElements(lens.surfaces);
       setOptLog(
         `Build From Scratch\n` +
         `family ${scratchFamilyLabel(familyResolved)} • aggr ${aggr} • effort x${effortScale.toFixed(2)} • stopOnAccept ${stopOnAccept ? "ON" : "OFF"}\n` +
         `targets FL ${targets.targetEfl.toFixed(2)} • T ${targets.targetT.toFixed(2)} • IC ${targets.targetIC.toFixed(2)}\n` +
-        `elements ${startElements}/${maxElems}`
+        `elements ${startElements}/${maxElems}\n` +
+        `planned optimizer runs <= ${runTotalEstimate}`
       );
 
-      const firstPasses = scratchPassesForAggressiveness(aggr, targets, false, effortScale);
       let snap = null;
       let bestFeasibleSnapshot = null;
       let earlyStopReason = "";
@@ -4499,8 +4525,12 @@
       const startSnap = evaluateCurrentLensPriorityForTargets(targets);
       storeBestFeasible("prepared", startSnap);
       for (let i = 0; i < firstPasses.length; i++) {
+        runStep++;
         snap = await runScratchOptimizerPass(firstPasses[i], targets, aggr, {
           tag: `pass ${i + 1}/${firstPasses.length}`,
+          phaseLabel: `initial stage ${firstPasses[i]?.id || (i + 1)} (${firstPasses[i]?.label || "run"})`,
+          runIndex: runStep,
+          runTotal: runTotalEstimate,
         });
         storeBestFeasible(`pass_${firstPasses[i]?.id || i}`, snap);
         if (stopOnAccept && scratchAcceptableReached(snap?.pri, targets)) {
@@ -4512,8 +4542,6 @@
       let bestPri = snap?.pri || evaluateCurrentLensPriorityForTargets(targets).pri;
       let bestMetric = scratchProgressMetric(bestPri, targets);
       let plateauRun = 0;
-      const maxGrowCyclesBase = Number(SCRATCH_CFG.maxGrowCycles[aggr] || 4);
-      const maxGrowCycles = Math.max(1, Math.round(maxGrowCyclesBase * effortScale));
 
       for (let cycle = 0; cycle < maxGrowCycles && !earlyStopReason; cycle++) {
         const cur = evaluateCurrentLensPriorityForTargets(targets);
@@ -4564,8 +4592,12 @@
           `running staged optimize...`
         );
         for (let i = 0; i < growPasses.length; i++) {
+          runStep++;
           snap = await runScratchOptimizerPass(growPasses[i], targets, aggr, {
             tag: `grow ${cycle + 1} • pass ${i + 1}/${growPasses.length}`,
+            phaseLabel: `grow ${cycle + 1}/${maxGrowCycles} • ${reason} • stage ${growPasses[i]?.id || (i + 1)} (${growPasses[i]?.label || "run"})`,
+            runIndex: runStep,
+            runTotal: runTotalEstimate,
           });
           storeBestFeasible(`grow_${cycle + 1}_${growPasses[i]?.id || i}`, snap);
           if (stopOnAccept && scratchAcceptableReached(snap?.pri, targets)) {
@@ -4598,6 +4630,7 @@
           800,
           Math.round(Number((SCRATCH_CFG.stageIters[aggr] || SCRATCH_CFG.stageIters.normal).D) * 0.75 * effortScale)
         );
+        runStep++;
         await runScratchOptimizerPass(
           {
             id: "D",
@@ -4608,7 +4641,12 @@
           },
           targets,
           aggr,
-          { tag: "final" }
+          {
+            tag: "final",
+            phaseLabel: "final polish",
+            runIndex: runStep,
+            runTotal: runTotalEstimate,
+          }
         );
       }
 
@@ -4634,9 +4672,10 @@
         `family ${scratchFamilyLabel(familyResolved)} • aggr ${aggr} • effort x${effortScale.toFixed(2)}\n` +
         `${earlyStopReason ? `stop ${earlyStopReason}\n` : ""}` +
         `${bestFeasibleSnapshot ? `fallback ${bestFeasibleSnapshot.label}\n` : ""}` +
+        `optimizer runs ${runStep}/${runTotalEstimate}\n` +
         `elements ${finalElems}/${maxElems}\n` +
         `FL err ${(Number(p.eflErrRel || 0) * 100).toFixed(2)}%\n` +
-        `T err ${Number.isFinite(p.tErrAbs) ? p.tErrAbs.toFixed(2) : "—"}\n` +
+        `T slow ${Number.isFinite(p.tErrAbs) ? p.tErrAbs.toFixed(2) : "—"}\n` +
         `IC short ${Number.isFinite(p.icNeedMm) ? p.icNeedMm.toFixed(2) : "—"}mm\n` +
         `acceptable ${acceptable ? "YES" : "NO"} • strict ${doneStrict ? "YES" : "NO"}\n` +
         `Dist RMS ${Number.isFinite(p.distRmsPct) ? Math.abs(p.distRmsPct).toFixed(2) : "—"}% • MAX ${Number.isFinite(p.distMaxPct) ? Math.abs(p.distMaxPct).toFixed(2) : "—"}%\n` +
@@ -4861,10 +4900,37 @@
   let optRunning = false;
   let optBest = null; // {lens, score, meta}
   let scratchBuildRunning = false;
+  let optimizerRunSerial = 0;
+  let optRunContext = null;
 
   function setOptLog(lines){
     if (!ui.optLog) return;
     ui.optLog.value = String(lines || "");
+  }
+
+  function setOptRunContext(ctx) {
+    if (!ctx || typeof ctx !== "object") {
+      optRunContext = null;
+      return;
+    }
+    const stepIndex = Number(ctx.stepIndex);
+    const stepTotal = Number(ctx.stepTotal);
+    optRunContext = {
+      mode: String(ctx.mode || "").trim(),
+      label: String(ctx.label || "").trim(),
+      stepIndex: (Number.isFinite(stepIndex) && stepIndex > 0) ? Math.round(stepIndex) : null,
+      stepTotal: (Number.isFinite(stepTotal) && stepTotal > 0) ? Math.round(stepTotal) : null,
+    };
+  }
+
+  function formatOptimizerRunHeader(runNo) {
+    const c = optRunContext;
+    const base = `Run #${Math.max(1, Number(runNo) || 1)}`;
+    if (!c) return base;
+    const modeTxt = c.mode ? ` • ${c.mode}` : "";
+    const stepTxt = (c.stepIndex && c.stepTotal) ? ` • Step ${c.stepIndex}/${c.stepTotal}` : "";
+    const labelTxt = c.label ? ` • ${c.label}` : "";
+    return `${base}${modeTxt}${stepTxt}${labelTxt}`;
   }
 
   function makeEvalPerfBucket() {
@@ -4876,18 +4942,6 @@
       icMs: 0,
       physMs: 0,
     };
-  }
-
-  function fmtEvalPerf(label, b) {
-    const n = Math.max(0, Number(b?.evals || 0));
-    if (n <= 0) return `${label}: 0`;
-    const inv = 1 / n;
-    const total = Number(b.totalMs || 0) * inv;
-    const af = Number(b.afMs || 0) * inv;
-    const tr = Number(b.traceMs || 0) * inv;
-    const ic = Number(b.icMs || 0) * inv;
-    const ph = Number(b.physMs || 0) * inv;
-    return `${label}: ${n} • ${total.toFixed(2)}ms/e (AF ${af.toFixed(2)} • trace ${tr.toFixed(2)} • IC ${ic.toFixed(2)} • phys ${ph.toFixed(2)})`;
   }
 
   function randn(){
@@ -5299,7 +5353,10 @@
     const targetAp = clamp(targetEfl / (2 * targetT), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
     const curAp = Number(stop.ap || targetAp);
     const s = clamp(Number(strength), 0.05, 1);
-    stop.ap = clamp(curAp + (targetAp - curAp) * s, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+    // One-sided T target: if lens is already faster (curAp >= targetAp), keep that speed.
+    stop.ap = (curAp < targetAp)
+      ? clamp(curAp + (targetAp - curAp) * s, PHYS_CFG.minAperture, PHYS_CFG.maxAperture)
+      : clamp(curAp, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
     {
       const signR = Math.sign(Number(stop.R || 1)) || 1;
       const absR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(stop.R || 0)));
@@ -5910,9 +5967,13 @@
     const icNeedMm = targetIC > 0 ? Math.max(0, icGoalMm - icMeasured) : 0;
     const icGood = targetIC <= 0 || icNeedMm <= 0;
 
+    // One-sided T error: only too-slow T is an error.
     const tErrAbs = targetT > 0 && Number.isFinite(T)
-      ? Math.abs(T - targetT)
+      ? Math.max(0, T - targetT)
       : (targetT > 0 ? Infinity : 0);
+    const tFastAbs = targetT > 0 && Number.isFinite(T)
+      ? Math.max(0, targetT - T)
+      : 0;
     const tGood = targetT <= 0 || tErrAbs <= OPT_STAGE_CFG.tGoodAbs;
 
     const rms0 = Number(evalRes?.rms0);
@@ -5966,6 +6027,7 @@
       icGood,
       T,
       tErrAbs,
+      tFastAbs,
       tGood,
       sharpness,
       distRmsPct: Number.isFinite(distRmsPctRaw) ? distRmsPctRaw : null,
@@ -6082,8 +6144,9 @@
     if (!(Number.isFinite(targetT) && targetT > 0)) return "T target off";
     const p = buildOptPriority(evalRes, { targetEfl: 1, targetIC: 0, targetT });
     const tTxt = Number.isFinite(p.T) ? p.T.toFixed(2) : "—";
-    const eTxt = Number.isFinite(p.tErrAbs) ? p.tErrAbs.toFixed(2) : "—";
-    return `T ${tTxt} (target ${targetT.toFixed(2)} • err ${eTxt}${p.tGood ? " ✅" : ""})`;
+    const slowTxt = Number.isFinite(p.tErrAbs) ? p.tErrAbs.toFixed(2) : "—";
+    const fastTxt = Number.isFinite(p.tFastAbs) && p.tFastAbs > 0.01 ? ` • fast ${p.tFastAbs.toFixed(2)}` : "";
+    return `T ${tTxt} (target <= ${targetT.toFixed(2)} • slow ${slowTxt}${fastTxt}${p.tGood ? " ✅" : ""})`;
   }
 
   function fmtDistOpt(evalRes) {
@@ -6117,6 +6180,8 @@
   async function runOptimizer(){
     if (optRunning) return;
     optRunning = true;
+    const runNo = ++optimizerRunSerial;
+    const runHeader = formatOptimizerRunHeader(runNo);
 
     const targetEfl = num(ui.optTargetFL?.value, 75);
     const targetT = num(ui.optTargetT?.value, 2.0);
@@ -6573,6 +6638,7 @@
         // UI update (rare)
         if (ui.optLog){
           setOptLog(
+            `${runHeader}\n` +
             `best @${i}/${iters}\n` +
             `score ${best.eval.score.toFixed(2)}\n` +
             `stage ${stageStep}: ${bp.stageName}\n` +
@@ -6631,6 +6697,7 @@
         const bp = buildOptPriority(best.eval, targets);
         if (ui.optLog){
           setOptLog(
+            `${runHeader}\n` +
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
             `current ${curEval.score.toFixed(2)} • best ${best.eval.score.toFixed(2)} @${best.iter}\n` +
             `phase current: ${cp.stageName} • best: ${bp.stageName}${flLocked ? " • FL lock ON" : ""}\n` +
@@ -6643,9 +6710,7 @@
             `best ${fmtIcOpt(best.eval, targetIC)}\n` +
             `best ${fmtTOpt(best.eval, targetT)}\n` +
             `best ${fmtDistOpt(best.eval)}\n` +
-            `best ${fmtPhysOpt(best.eval, targets)}\n` +
-            `${fmtEvalPerf("perf fast", perf.fast)}\n` +
-            `${fmtEvalPerf("perf acc", perf.accurate)}\n`
+            `best ${fmtPhysOpt(best.eval, targets)}\n`
           );
         }
         // yield to UI
@@ -6662,6 +6727,7 @@
     const stageStep = fmtStageStep(bp.stage);
     if (ui.optLog){
       setOptLog(
+        `${runHeader}\n` +
         `done ${itersRan}/${iters}  (${(Math.max(1, itersRan)/Math.max(1e-6,sec)).toFixed(1)} it/s)\n` +
         `BEST score ${best.eval.score.toFixed(2)}\n` +
         `BEST @${best.iter}\n` +
@@ -6674,8 +6740,6 @@
         `Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}%\n` +
         `INTR ${fmtIntrusion(best.eval)}\n` +
         `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
-        `${fmtEvalPerf("perf fast", perf.fast)}\n` +
-        `${fmtEvalPerf("perf acc", perf.accurate)}\n` +
         `Click “Apply best” to load.`
       );
     }
