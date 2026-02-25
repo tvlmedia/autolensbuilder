@@ -3505,6 +3505,40 @@
       }
     }
 
+// --- FORCE STOP / PUPIL HEALTH DURING IC STAGE ---
+if (icStage && Number(opt?.targetT || 0) > 0.2 && Number(opt?.targetEfl || 0) > 1) {
+  const targetEfl = Number(opt.targetEfl);
+  const targetT   = Number(opt.targetT);
+
+  // 1) push stop aperture toward geometric requirement
+  nudgeStopTowardTargetT(s, targetEfl, targetT, 0.90);
+
+  // 2) ensure neighbors don't choke the stop (rear group especially)
+  const stopIdx = findStopSurfaceIndex(s);
+  if (stopIdx >= 0) {
+    const stopAp = Number(s[stopIdx].ap || 0);
+    const need = stopAp / 1.05;
+    for (let d = 1; d <= 3; d++) {
+      for (const idx of [stopIdx - d, stopIdx + d]) {
+        if (idx < 0 || idx >= s.length) continue;
+        const ss = s[idx];
+        if (surfaceIsLocked(ss)) continue;
+        const tt = String(ss.type || "").toUpperCase();
+        if (tt === "OBJ" || tt === "IMS") continue;
+
+        if (Number(ss.ap || 0) < need * (1 - d * 0.06)) {
+          ss.ap = clamp(need * (1 - d * 0.06), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        }
+        // match radius so clampSurfaceAp() doesn't immediately nerf ap back down
+        const signR = Math.sign(Number(ss.R || 1)) || 1;
+        const absR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(ss.R || 0)));
+        const needAbsR = (Number(ss.ap || 0) / AP_SAFETY) * 1.08;
+        ss.R = signR * clamp(Math.max(absR, needAbsR), PHYS_CFG.minRadius, 600);
+      }
+    }
+  }
+}
+     
     ensureStopExists(s);
     // enforce single stop
     const firstStop = s.findIndex(x => !!x.stop);
@@ -3873,10 +3907,13 @@
     let stage = feasible ? 0 : -1;
     // Stage flow should use the locked FL band (+/-5%), not only the tighter 1% mark.
     if (feasible && flInBand) {
-      if (!icGood) stage = 1;
-      else if (!tGood) stage = 2;
-      else stage = 3;
-    }
+  const needsTFirst = (targetT > 0) && (!tGood) && (tErrAbs > 0.75);
+
+  if (needsTFirst) stage = 2;      // eerst stop/pupil op orde
+  else if (!icGood) stage = 1;     // daarna IC
+  else if (!tGood) stage = 2;
+  else stage = 3;
+}
     const stageRank = stage < 0 ? 0 : (stage + 1); // 0=invalid, 1..4 better as objectives complete
 
     return {
@@ -3935,10 +3972,13 @@
       return A.eflErrRel - B.eflErrRel;
     }
 
-    if (A.stage === 1) {
-      if (Math.abs(A.icNeedMm - B.icNeedMm) > 0.005) return A.icNeedMm - B.icNeedMm;
-      if (Math.abs(A.icMeasured - B.icMeasured) > 0.005) return B.icMeasured - A.icMeasured;
-    }
+   if (A.stage === 1) {
+  if (Math.abs(A.icNeedMm - B.icNeedMm) > 0.005) return A.icNeedMm - B.icNeedMm;
+  if (Math.abs(A.icMeasured - B.icMeasured) > 0.005) return B.icMeasured - A.icMeasured;
+
+  // NEW: if IC is basically tied, prefer better T (closer to target)
+  if (Math.abs(A.tErrAbs - B.tErrAbs) > 0.02) return A.tErrAbs - B.tErrAbs;
+}
 
     if (A.stage === 2 && Math.abs(A.tErrAbs - B.tErrAbs) > 1e-4) {
       return A.tErrAbs - B.tErrAbs;
