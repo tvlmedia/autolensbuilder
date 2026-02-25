@@ -3378,12 +3378,16 @@
     if (icStage) kChanges += (mode === "wild" ? 5 : 4);
     if (icStage && keepFl) kChanges += 2;
 
-    const radiusScale = keepFl ? (mode === "wild" ? 0.12 : 0.06) : (mode === "wild" ? 0.35 : 0.18);
-    const thickScale  = keepFl ? (mode === "wild" ? 0.18 : 0.08) : (mode === "wild" ? 0.55 : 0.25);
+    const radiusScale = icStage
+      ? (keepFl ? (mode === "wild" ? 0.20 : 0.12) : (mode === "wild" ? 0.42 : 0.24))
+      : (keepFl ? (mode === "wild" ? 0.12 : 0.06) : (mode === "wild" ? 0.35 : 0.18));
+    const thickScale  = icStage
+      ? (keepFl ? (mode === "wild" ? 0.24 : 0.16) : (mode === "wild" ? 0.62 : 0.30))
+      : (keepFl ? (mode === "wild" ? 0.18 : 0.08) : (mode === "wild" ? 0.55 : 0.25));
 
-    const rThresh = (!icStage ? 0.45 : (keepFl ? 0.12 : 0.30));
-    const tThresh = (!icStage ? 0.70 : (keepFl ? 0.24 : 0.48));
-    const aThresh = (!icStage ? 0.88 : (keepFl ? 0.99 : 0.98));
+    const rThresh = (!icStage ? 0.45 : (keepFl ? 0.28 : 0.35));
+    const tThresh = (!icStage ? 0.70 : (keepFl ? 0.48 : 0.58));
+    const aThresh = (!icStage ? 0.88 : 0.98);
 
     for (let c=0;c<kChanges;c++){
       const idxs = s.map((x,i)=>({x,i})).filter(o=>!surfaceIsLocked(o.x));
@@ -3444,6 +3448,14 @@
         } else if (Math.random() < 0.25) {
           ss.ap = clamp(ap * (1.02 + Math.random() * 0.10), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
         }
+
+        // Keep radius aligned to aperture; otherwise quickSanity clamps aperture back down.
+        const signR = Math.sign(Number(ss.R || 1)) || 1;
+        const absR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(ss.R || 0)));
+        const needAbsR = (Number(ss.ap || 0) / AP_SAFETY) * 1.07;
+        if (absR < needAbsR) {
+          ss.R = signR * clamp(absR + (needAbsR - absR) * 0.72, PHYS_CFG.minRadius, 600);
+        }
       }
 
       // Rear group usually drives hard cutoff; give it extra breathing room.
@@ -3455,6 +3467,10 @@
           if (Math.random() < 0.65) {
             const ap = Number(ss.ap || 0);
             ss.ap = clamp(ap * (1.05 + Math.random() * 0.13), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+            const signR = Math.sign(Number(ss.R || 1)) || 1;
+            const absR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(ss.R || 0)));
+            const needAbsR = (Number(ss.ap || 0) / AP_SAFETY) * 1.06;
+            if (absR < needAbsR) ss.R = signR * clamp(Math.max(absR, needAbsR), PHYS_CFG.minRadius, 600);
           }
         }
       }
@@ -3595,13 +3611,17 @@
     if (st <= 0) {
       nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 1.0 : 0.92, hard ? 0.30 : 0.22);
     } else if (st === 1) {
-      applyCoverageBoostMutation(c.surfaces, {
-        targetIC: targets.targetIC,
-        targetEfl: targets.targetEfl,
-        targetT: targets.targetT,
-        icNeedMm: hard ? (icNeed + 3.0) : icNeed,
-        keepFl,
-      });
+      const passes = hard ? 3 : (icNeed > 3.0 ? 2 : 1);
+      for (let p = 0; p < passes; p++) {
+        applyCoverageBoostMutation(c.surfaces, {
+          targetIC: targets.targetIC,
+          targetEfl: targets.targetEfl,
+          targetT: targets.targetT,
+          icNeedMm: hard ? (icNeed + 3.0) : icNeed,
+          // First pass respects FL lock, extra passes may relax lock for stronger IC push.
+          keepFl: (p === 0 ? keepFl : false),
+        });
+      }
       nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, hard ? 0.88 : 0.72);
       nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 0.55 : 0.40, hard ? 0.07 : 0.05);
     } else if (st === 2) {
@@ -4054,6 +4074,15 @@
             icNeedMm: basePri.icNeedMm + (stallIters > 220 ? 2.5 : 0),
             keepFl: flLocked,
           });
+          if (basePri.icNeedMm > 3.0 && Math.random() < 0.55) {
+            applyCoverageBoostMutation(c.surfaces, {
+              targetIC,
+              targetEfl,
+              targetT,
+              icNeedMm: basePri.icNeedMm + 3.0,
+              keepFl: false,
+            });
+          }
           quickSanity(c.surfaces);
           if (topo) enforceTopology(c.surfaces, topo);
         }
@@ -4087,9 +4116,21 @@
       // Once we have entered FL band, never accept candidates outside the 5% band.
       if (flLocked && candPri.eflErrRel > OPT_STAGE_CFG.flHoldRel) {
         accept = false;
-      } else if (curPri.flInBand && candPri.eflErrRel > curPri.eflErrRel + (curPri.stage === 1 ? OPT_STAGE_CFG.icStageDriftRel : OPT_STAGE_CFG.flPreferRel)) {
-        // In-band: never drift FL away more than a tiny amount.
+      } else if (curPri.flInBand && curPri.stage === 1 && candPri.eflErrRel > OPT_STAGE_CFG.flHoldRel) {
+        // IC phase may move inside FL hold band, but never outside hard hold.
         accept = false;
+      } else if (curPri.flInBand && curPri.stage !== 1 && candPri.eflErrRel > curPri.eflErrRel + OPT_STAGE_CFG.flPreferRel) {
+        // Outside IC phase keep FL very tight.
+        accept = false;
+      } else if (
+        curPri.stage === 1 &&
+        candPri.stage === 1 &&
+        candPri.feasible &&
+        candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
+        candPri.icMeasured > curPri.icMeasured + 0.03
+      ) {
+        // Explicitly keep climbing IC when FL remains inside lock band.
+        accept = true;
       } else if (isEvalBetterByPlan(candEval, curEval, targets)) {
         accept = true;
       } else {
