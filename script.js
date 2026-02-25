@@ -359,28 +359,8 @@
       stop: Boolean(s?.stop ?? false),
     }));
 
-    // Hard fallback: never allow an empty/broken lens model into runtime.
-    if (safe.surfaces.length < 2) {
-      const fallback = omit50ConceptV1();
-      safe.name = String(fallback?.name || "OMIT 50mm fallback");
-      safe.notes = Array.isArray(fallback?.notes) ? fallback.notes.map(String) : [];
-      safe.surfaces = (fallback?.surfaces || []).map((s) => ({
-        type: String(s?.type ?? ""),
-        R: Number(s?.R ?? 0),
-        t: Number(s?.t ?? 0),
-        ap: Number(s?.ap ?? 10),
-        glass: String(s?.glass ?? "AIR"),
-        stop: Boolean(s?.stop ?? false),
-      }));
-    }
-
     const firstStop = safe.surfaces.findIndex((s) => s.stop);
     if (firstStop >= 0) safe.surfaces.forEach((s, i) => { if (i !== firstStop) s.stop = false; });
-    if (firstStop < 0 && safe.surfaces.length >= 3) {
-      const mid = Math.max(1, Math.min(safe.surfaces.length - 2, (safe.surfaces.length / 2) | 0));
-      safe.surfaces[mid].stop = true;
-      safe.surfaces[mid].type = "STOP";
-    }
 
     safe.surfaces.forEach((s, i) => { if (!s.type || !s.type.trim()) s.type = String(i); });
 
@@ -579,74 +559,38 @@
     scheduleAutosave();
   }
 
-  const RAY_TRACE_CFG = {
-    maxFieldDeg: 60,
-    minDirX: 1e-3,
-    tanLimit: 7.5,
-    rootEps: 1e-9,
-    discEps: 1e-10,
-    dirEps: 1e-9,
-    debug: false,
-    debugMaxLogs: 24,
-  };
-  let _rayDebugCount = 0;
-  function logRayDebug(tag, payload) {
-    if (!RAY_TRACE_CFG.debug) return;
-    if (_rayDebugCount >= (RAY_TRACE_CFG.debugMaxLogs | 0)) return;
-    _rayDebugCount++;
-    try {
-      console.warn(`[ray:${tag}]`, payload);
-    } catch (_) {}
-  }
-
   // -------------------- math helpers --------------------
   function normalize(v) {
-    const x = Number(v?.x);
-    const y = Number(v?.y);
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return { x: 1, y: 0 };
-    const m = Math.hypot(x, y);
-    if (!(m > RAY_TRACE_CFG.dirEps)) {
-      const sx = Math.sign(x);
-      return { x: sx === 0 ? 1 : sx, y: 0 };
-    }
-    return { x: x / m, y: y / m };
+    const m = Math.hypot(v.x, v.y);
+    if (m < 1e-12) return { x: 0, y: 0 };
+    return { x: v.x / m, y: v.y / m };
   }
   function dot(a, b) { return a.x * b.x + a.y * b.y; }
   function add(a, b) { return { x: a.x + b.x, y: a.y + b.y }; }
   function mul(a, s) { return { x: a.x * s, y: a.y * s }; }
 
   function refract(I, N, n1, n2) {
-    if (!(Number.isFinite(n1) && Number.isFinite(n2) && n1 > 0 && n2 > 0)) return null;
     I = normalize(I);
     N = normalize(N);
     if (dot(I, N) > 0) N = mul(N, -1);
-    const cosi = clamp(-dot(N, I), -1, 1);
+    const cosi = -dot(N, I);
     const eta = n1 / n2;
     const k = 1 - eta * eta * (1 - cosi * cosi);
-    if (k < -RAY_TRACE_CFG.discEps) return null;
-    const kk = Math.max(0, k);
-    const T = add(mul(I, eta), mul(N, eta * cosi - Math.sqrt(kk)));
-    if (!Number.isFinite(T.x) || !Number.isFinite(T.y)) return null;
-    const out = normalize(T);
-    if (!Number.isFinite(out.x) || !Number.isFinite(out.y)) return null;
-    if (Math.hypot(out.x, out.y) < RAY_TRACE_CFG.dirEps) return null;
-    return out;
+    if (k < 0) return null;
+    const T = add(mul(I, eta), mul(N, eta * cosi - Math.sqrt(k)));
+    return normalize(T);
   }
 
   function intersectSurface(ray, surf) {
-    if (!ray?.p || !ray?.d || !surf) return null;
     const vx = surf.vx;
     const R = Number(surf.R || 0);
     const ap = Math.max(0, Number(surf.ap || 0));
-    if (!Number.isFinite(vx) || !Number.isFinite(R) || !Number.isFinite(ap)) return null;
 
     if (Math.abs(R) < 1e-9) {
       if (Math.abs(ray.d.x) < 1e-12) return null;
       const t = (vx - ray.p.x) / ray.d.x;
-      if (!Number.isFinite(t) || t <= RAY_TRACE_CFG.rootEps) return null;
+      if (!Number.isFinite(t) || t <= 1e-9) return null;
       const hit = add(ray.p, mul(ray.d, t));
-      if (!Number.isFinite(hit.x) || !Number.isFinite(hit.y)) return null;
-      if ((hit.x - ray.p.x) * ray.d.x <= RAY_TRACE_CFG.rootEps) return null;
       const vignetted = Math.abs(hit.y) > ap + 1e-9;
       const N = { x: -1, y: 0 };
       return { hit, t, vignetted, normal: N };
@@ -661,34 +605,25 @@
     const dy = ray.d.y;
 
     const A = dx * dx + dy * dy;
-    if (!(A > RAY_TRACE_CFG.dirEps * RAY_TRACE_CFG.dirEps)) return null;
     const B = 2 * (px * dx + py * dy);
     const C = px * px + py * py - rad * rad;
 
     const disc = B * B - 4 * A * C;
-    if (disc < -RAY_TRACE_CFG.discEps) return null;
+    if (disc < 0) return null;
 
-    const sdisc = Math.sqrt(Math.max(0, disc));
+    const sdisc = Math.sqrt(disc);
     const t1 = (-B - sdisc) / (2 * A);
     const t2 = (-B + sdisc) / (2 * A);
 
-    const roots = [t1, t2].filter((tt) => Number.isFinite(tt) && tt > RAY_TRACE_CFG.rootEps).sort((a, b) => a - b);
-    if (!roots.length) return null;
     let t = null;
-    let hit = null;
-    for (const rt of roots) {
-      const h = add(ray.p, mul(ray.d, rt));
-      if (!Number.isFinite(h.x) || !Number.isFinite(h.y)) continue;
-      if ((h.x - ray.p.x) * ray.d.x <= RAY_TRACE_CFG.rootEps) continue;
-      t = rt;
-      hit = h;
-      break;
-    }
-    if (!(Number.isFinite(t) && hit)) return null;
+    if (t1 > 1e-9 && t2 > 1e-9) t = Math.min(t1, t2);
+    else if (t1 > 1e-9) t = t1;
+    else if (t2 > 1e-9) t = t2;
+    else return null;
 
+    const hit = add(ray.p, mul(ray.d, t));
     const vignetted = Math.abs(hit.y) > ap + 1e-9;
     const Nout = normalize({ x: hit.x - cx, y: hit.y });
-    if (!Number.isFinite(Nout.x) || !Number.isFinite(Nout.y)) return null;
     return { hit, t, vignetted, normal: Nout };
   }
 
@@ -841,11 +776,6 @@
     const stopAp = stopIdx >= 0 ? Math.max(0.1, Number(surfaces[stopIdx]?.ap || 0)) : null;
 
     for (let i = 0; i < surfaces.length; i++) {
-      if (!Number.isFinite(ray?.d?.x) || !Number.isFinite(ray?.d?.y) || Math.abs(ray.d.x) < RAY_TRACE_CFG.dirEps) {
-        vignetted = true;
-        logRayDebug("dir-degenerate", { tag: debugTag, idx: i, ray });
-        break;
-      }
       const s = surfaces[i];
       const t = String(s?.type || "").toUpperCase();
       if (t === "OBJ" || t === "IMS") continue;
@@ -1024,112 +954,6 @@
     return { penalty, hardFail, worstOverlap, worstPinch, airGapCount };
   }
 
-  // Fast, cheap constraint estimate for optimizer fast-tier.
-  function evaluatePhysicalConstraintsLite(surfaces) {
-    let penalty = 0;
-    let hardFail = false;
-    let worstOverlap = 0;
-    let worstPinch = 0;
-    let airGapCount = 0;
-
-    const stopIdx = findStopSurfaceIndex(surfaces);
-    if (stopIdx < 0) {
-      return {
-        penalty: 1800,
-        hardFail: true,
-        worstOverlap: 0,
-        worstPinch: 0,
-        airGapCount: 0,
-      };
-    }
-
-    const stopAp = Math.max(0.1, Number(surfaces[stopIdx]?.ap || 0));
-    for (let i = 0; i < surfaces.length; i++) {
-      const s = surfaces[i];
-      const t = String(s?.type || "").toUpperCase();
-      if (t === "OBJ" || t === "IMS") continue;
-
-      const ap = Number(s?.ap || 0);
-      const R = Math.abs(Number(s?.R || 0));
-      const th = Number(s?.t || 0);
-      if (!Number.isFinite(ap) || !Number.isFinite(R) || !Number.isFinite(th)) {
-        hardFail = true;
-        penalty += 10000;
-        continue;
-      }
-      if (ap < PHYS_CFG.minAperture) {
-        const d = PHYS_CFG.minAperture - ap;
-        penalty += 110 * d * d;
-      }
-      if (R > 1e-9 && R < PHYS_CFG.minRadius) {
-        const d = PHYS_CFG.minRadius - R;
-        penalty += 70 * d * d;
-      }
-      if (th < PHYS_CFG.minThickness) {
-        const d = PHYS_CFG.minThickness - th;
-        penalty += 350 * d * d;
-      }
-      if (Number.isFinite(stopAp) && ap < stopAp * PHYS_CFG.minStopToApertureRatio) {
-        const d = stopAp * PHYS_CFG.minStopToApertureRatio - ap;
-        penalty += 100 * d * d;
-      }
-    }
-
-    for (let i = 0; i < surfaces.length - 1; i++) {
-      const a = surfaces[i];
-      const b = surfaces[i + 1];
-      const ta = String(a?.type || "").toUpperCase();
-      const tb = String(b?.type || "").toUpperCase();
-      if (ta === "OBJ" || ta === "IMS" || tb === "OBJ" || tb === "IMS") continue;
-
-      const medium = String(a?.glass || "AIR").toUpperCase();
-      const gap = Number(a?.t || 0);
-      if (medium === "AIR") {
-        airGapCount++;
-        if (gap < PHYS_CFG.minAirGap) {
-          const d = PHYS_CFG.minAirGap - gap;
-          penalty += 900 * d * d;
-        }
-      } else {
-        if (gap < PHYS_CFG.minGlassCT) {
-          const d = PHYS_CFG.minGlassCT - gap;
-          penalty += 1700 * d * d;
-        }
-      }
-      if (gap < -PHYS_CFG.maxNegOverlap) {
-        hardFail = true;
-        worstOverlap = Math.max(worstOverlap, -gap);
-      }
-    }
-
-    for (let i = 1; i < surfaces.length - 1; i++) {
-      const prev = surfaces[i - 1];
-      const cur = surfaces[i];
-      const next = surfaces[i + 1];
-      const tp = String(prev?.type || "").toUpperCase();
-      const tc = String(cur?.type || "").toUpperCase();
-      const tn = String(next?.type || "").toUpperCase();
-      if (tp === "OBJ" || tc === "OBJ" || tn === "OBJ") continue;
-      if (tp === "IMS" || tc === "IMS" || tn === "IMS") continue;
-      const ref = Math.min(Number(prev.ap || 0), Number(next.ap || 0));
-      const apCur = Number(cur.ap || 0);
-      if (ref > 0.5 && apCur < 0.48 * ref) {
-        const d = 0.48 * ref - apCur;
-        worstPinch = Math.max(worstPinch, d);
-        penalty += 160 * d * d;
-      }
-    }
-
-    const prevMedium = stopIdx > 0 ? String(resolveGlassName(surfaces[stopIdx - 1]?.glass || "AIR")).toUpperCase() : "AIR";
-    const nextMedium = String(resolveGlassName(surfaces[stopIdx]?.glass || "AIR")).toUpperCase();
-    if (prevMedium !== "AIR" || nextMedium !== "AIR") {
-      penalty += 1200;
-      hardFail = true;
-    }
-
-    return { penalty, hardFail, worstOverlap, worstPinch, airGapCount };
-  }
-
   // -------------------- tracing --------------------
   function mountClipHitAlongRay(ray, tMax = Infinity) {
     if (!MOUNT_TRACE_CFG.enabled) return null;
@@ -1189,19 +1013,11 @@
 
   function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     const skipIMS = !!opts.skipIMS;
-    const debugTag = opts.debugTag || "";
 
     let pts = [];
     let vignetted = false;
     let tir = false;
     let clippedByMount = false;
-
-    if (!ray?.p || !ray?.d || !Number.isFinite(ray.p.x) || !Number.isFinite(ray.p.y) ||
-      !Number.isFinite(ray.d.x) || !Number.isFinite(ray.d.y) ||
-      Math.hypot(ray.d.x, ray.d.y) < RAY_TRACE_CFG.dirEps) {
-      logRayDebug("start-invalid", { tag: debugTag, ray });
-      return { pts: [], vignetted: true, tir: false, clippedByMount: false, endRay: null, badRay: true };
-    }
 
     pts.push({ x: ray.p.x, y: ray.p.y });
 
@@ -1216,16 +1032,12 @@
       if (skipIMS && isIMS) continue;
 
       const hitInfo = intersectSurface(ray, s);
-      const mountHit = (!skipIMS && nBefore <= 1.000001 && Number.isFinite(hitInfo?.t))
-        ? mountClipHitAlongRay(ray, hitInfo.t)
+      const mountHit = (!skipIMS && nBefore <= 1.000001)
+        ? mountClipHitAlongRay(ray, hitInfo?.t ?? Infinity)
         : null;
       if (mountHit) { pts.push(mountHit.hit); vignetted = true; clippedByMount = true; break; }
 
-      if (!hitInfo) {
-        vignetted = true;
-        logRayDebug("miss-surface", { tag: debugTag, idx: i, type, ray, surf: { vx: s?.vx, R: s?.R, ap: s?.ap } });
-        break;
-      }
+      if (!hitInfo) { vignetted = true; break; }
 
       pts.push(hitInfo.hit);
 
@@ -1245,24 +1057,12 @@
       }
 
       const newDir = refract(ray.d, hitInfo.normal, nBefore, nAfter);
-      if (!newDir || !Number.isFinite(newDir.x) || !Number.isFinite(newDir.y) ||
-        Math.hypot(newDir.x, newDir.y) < RAY_TRACE_CFG.dirEps ||
-        Math.abs(newDir.x) < RAY_TRACE_CFG.dirEps) {
-        tir = true;
-        logRayDebug("refract-invalid", {
-          tag: debugTag, idx: i, nBefore, nAfter, dirIn: ray.d, normal: hitInfo.normal, newDir
-        });
-        break;
-      }
+      if (!newDir) { tir = true; break; }
 
       ray = { p: hitInfo.hit, d: newDir };
       nBefore = nAfter;
     }
 
-    if (ray?.d && (!Number.isFinite(ray.d.x) || !Number.isFinite(ray.d.y))) {
-      logRayDebug("end-invalid", { tag: debugTag, endRay: ray });
-      return { pts, vignetted: true, tir: true, clippedByMount, endRay: null, badRay: true };
-    }
     return { pts, vignetted, tir, clippedByMount, endRay: ray };
   }
 
@@ -1286,55 +1086,35 @@
 
   function buildRays(surfaces, fieldAngleDeg, count) {
     const n = Math.max(3, Math.min(101, count | 0));
-    const field = clamp(Number(fieldAngleDeg || 0), -RAY_TRACE_CFG.maxFieldDeg, RAY_TRACE_CFG.maxFieldDeg);
-    const theta = (field * Math.PI) / 180;
-    let dir = normalize({ x: Math.cos(theta), y: Math.sin(theta) });
-    if (Math.abs(dir.x) < RAY_TRACE_CFG.minDirX) {
-      const sx = Math.sign(dir.x || 1);
-      const nx = sx * RAY_TRACE_CFG.minDirX;
-      const ny = Math.sign(dir.y || 1) * Math.sqrt(Math.max(0, 1 - nx * nx));
-      dir = normalize({ x: nx, y: ny });
-    }
+    const theta = (fieldAngleDeg * Math.PI) / 180;
+    const dir = normalize({ x: Math.cos(theta), y: Math.sin(theta) });
 
     const xStart = (surfaces[0]?.vx ?? 0) - 80;
     const { xRef, apRef } = getRayReferencePlane(surfaces);
 
     const hMax = apRef;
     const rays = [];
-    const tanRaw = Math.abs(dir.x) < RAY_TRACE_CFG.minDirX ? 0 : dir.y / dir.x;
-    const tanT = clamp(tanRaw, -RAY_TRACE_CFG.tanLimit, RAY_TRACE_CFG.tanLimit);
+    const tanT = Math.abs(dir.x) < 1e-9 ? 0 : dir.y / dir.x;
 
     for (let k = 0; k < n; k++) {
       const a = (k / (n - 1)) * 2 - 1;
       const yAtRef = a * hMax;
       const y0 = yAtRef - tanT * (xRef - xStart);
-      if (!Number.isFinite(y0)) continue;
       rays.push({ p: { x: xStart, y: y0 }, d: dir });
-    }
-    if (!rays.length) {
-      rays.push({ p: { x: xStart, y: 0 }, d: { x: 1, y: 0 } });
     }
     return rays;
   }
 
   function buildChiefRay(surfaces, fieldAngleDeg) {
-    const field = clamp(Number(fieldAngleDeg || 0), -RAY_TRACE_CFG.maxFieldDeg, RAY_TRACE_CFG.maxFieldDeg);
-    const theta = (field * Math.PI) / 180;
-    let dir = normalize({ x: Math.cos(theta), y: Math.sin(theta) });
-    if (Math.abs(dir.x) < RAY_TRACE_CFG.minDirX) {
-      const sx = Math.sign(dir.x || 1);
-      const nx = sx * RAY_TRACE_CFG.minDirX;
-      const ny = Math.sign(dir.y || 1) * Math.sqrt(Math.max(0, 1 - nx * nx));
-      dir = normalize({ x: nx, y: ny });
-    }
+    const theta = (fieldAngleDeg * Math.PI) / 180;
+    const dir = normalize({ x: Math.cos(theta), y: Math.sin(theta) });
 
     const xStart = (surfaces[0]?.vx ?? 0) - 120;
     const stopIdx = findStopSurfaceIndex(surfaces);
     const stopSurf = stopIdx >= 0 ? surfaces[stopIdx] : surfaces[0];
     const xStop = stopSurf.vx;
 
-    const tanRaw = Math.abs(dir.x) < RAY_TRACE_CFG.minDirX ? 0 : dir.y / dir.x;
-    const tanT = clamp(tanRaw, -RAY_TRACE_CFG.tanLimit, RAY_TRACE_CFG.tanLimit);
+    const tanT = Math.abs(dir.x) < 1e-9 ? 0 : dir.y / dir.x;
     const y0 = 0 - tanT * (xStop - xStart);
     return { p: { x: xStart, y: y0 }, d: dir };
   }
@@ -1522,16 +1302,7 @@
     fastRayCount: 15,
     fastAutofocusEvery: 120,
     fastIcEvery: 10,
-    fastIcEveryStage2: 3,
     accurateAuditEvery: 90,
-    promoteScoreRatio: 1.02,
-    flPromoteDeltaRel: 0.0008,
-    tPromoteDelta: 0.02,
-    icPromoteDeltaMm: 0.10,
-    uiMaxHz: 10,
-    stallSoft: 260,
-    stallHard: 900,
-    earlyStopMinIter: 300,
     fastAfRange: 3.0,
     fastAfCoarseStep: 0.60,
     fastAfFineHalf: 0.90,
@@ -1560,45 +1331,36 @@
 
   // -------------------- IC-only background helpers (ported from Render Engine) --------------------
   function normalize3(v) {
-    const x = Number(v?.x);
-    const y = Number(v?.y);
-    const z = Number(v?.z);
-    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return { x: 1, y: 0, z: 0 };
-    const m = Math.hypot(x, y, z);
-    if (m < 1e-12) return { x: 1, y: 0, z: 0 };
-    return { x: x / m, y: y / m, z: z / m };
+    const m = Math.hypot(v.x, v.y, v.z);
+    if (m < 1e-12) return { x: 0, y: 0, z: 0 };
+    return { x: v.x / m, y: v.y / m, z: v.z / m };
   }
   function dot3(a, b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
   function add3(a, b) { return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }; }
   function mul3(a, s) { return { x: a.x * s, y: a.y * s, z: a.z * s }; }
 
   function refract3(I, N, n1, n2) {
-    if (!(Number.isFinite(n1) && Number.isFinite(n2) && n1 > 0 && n2 > 0)) return null;
     I = normalize3(I);
     N = normalize3(N);
     if (dot3(I, N) > 0) N = mul3(N, -1);
-    const cosi = clamp(-dot3(N, I), -1, 1);
+    const cosi = -dot3(N, I);
     const eta = n1 / n2;
     const k = 1 - eta * eta * (1 - cosi * cosi);
-    if (k < -RAY_TRACE_CFG.discEps) return null;
-    const T = add3(mul3(I, eta), mul3(N, eta * cosi - Math.sqrt(Math.max(0, k))));
-    if (!Number.isFinite(T.x) || !Number.isFinite(T.y) || !Number.isFinite(T.z)) return null;
+    if (k < 0) return null;
+    const T = add3(mul3(I, eta), mul3(N, eta * cosi - Math.sqrt(k)));
     return normalize3(T);
   }
 
   function intersectSurface3D(ray, surf) {
-    if (!ray?.p || !ray?.d || !surf) return null;
     const vx = surf.vx;
     const R = Number(surf.R || 0);
     const ap = Math.max(0, Number(surf.ap || 0));
-    if (!Number.isFinite(vx) || !Number.isFinite(R) || !Number.isFinite(ap)) return null;
 
     if (Math.abs(R) < 1e-9) {
       if (Math.abs(ray.d.x) < 1e-12) return null;
       const t = (vx - ray.p.x) / ray.d.x;
-      if (!Number.isFinite(t) || t <= RAY_TRACE_CFG.rootEps) return null;
+      if (!Number.isFinite(t) || t <= 1e-9) return null;
       const hit = add3(ray.p, mul3(ray.d, t));
-      if (!Number.isFinite(hit.x) || !Number.isFinite(hit.y) || !Number.isFinite(hit.z)) return null;
       const r = Math.hypot(hit.y, hit.z);
       const vignetted = r > ap + 1e-9;
       return { hit, t, vignetted, normal: { x: -1, y: 0, z: 0 } };
@@ -1614,21 +1376,22 @@
     const dz = ray.d.z;
 
     const A = dx * dx + dy * dy + dz * dz;
-    if (!(A > RAY_TRACE_CFG.dirEps * RAY_TRACE_CFG.dirEps)) return null;
     const B = 2 * (px * dx + py * dy + pz * dz);
     const C = px * px + py * py + pz * pz - rad * rad;
     const disc = B * B - 4 * A * C;
-    if (disc < -RAY_TRACE_CFG.discEps) return null;
+    if (disc < 0) return null;
 
-    const sdisc = Math.sqrt(Math.max(0, disc));
+    const sdisc = Math.sqrt(disc);
     const t1 = (-B - sdisc) / (2 * A);
     const t2 = (-B + sdisc) / (2 * A);
-    const roots = [t1, t2].filter((tt) => Number.isFinite(tt) && tt > RAY_TRACE_CFG.rootEps).sort((a, b) => a - b);
-    if (!roots.length) return null;
-    const t = roots[0];
+
+    let t = null;
+    if (t1 > 1e-9 && t2 > 1e-9) t = Math.min(t1, t2);
+    else if (t1 > 1e-9) t = t1;
+    else if (t2 > 1e-9) t = t2;
+    else return null;
 
     const hit = add3(ray.p, mul3(ray.d, t));
-    if (!Number.isFinite(hit.x) || !Number.isFinite(hit.y) || !Number.isFinite(hit.z)) return null;
     const r = Math.hypot(hit.y, hit.z);
     const vignetted = r > ap + 1e-9;
     const normal = normalize3({ x: hit.x - cx, y: hit.y, z: hit.z });
@@ -2415,7 +2178,6 @@
       if (!raw) return false;
       const payload = JSON.parse(raw);
       if (!payload || !payload.lens) return false;
-      if (!Array.isArray(payload.lens?.surfaces) || payload.lens.surfaces.length < 2) return false;
       applyUiSnapshot(payload.ui);
       lens = sanitizeLens(payload.lens);
       selectedIndex = 0;
@@ -3169,15 +2931,10 @@
       ? "FOV: —"
       : `FOV: H ${fov.hfov.toFixed(1)}° • V ${fov.vfov.toFixed(1)}° • D ${fov.dfov.toFixed(1)}°`;
 
-    let softIc = null;
-    try {
-      softIc = getSoftIcForCurrentLens(lens.surfaces, sensorW, sensorH, wavePreset, rayCount);
-    } catch (err) {
-      console.error("soft-IC failed:", err);
-      softIc = { usableCircleDiameterMm: 0, thresholdRel: SOFT_IC_CFG.thresholdRel };
-      if (ui.footerWarn) ui.footerWarn.textContent = "IC calc error; using fallback.";
-    }
-    const icDiameterMm = Number(softIc?.usableCircleDiameterMm ?? softIc?.softICmm ?? 0);
+    const softIc = getSoftIcForCurrentLens(lens.surfaces, sensorW, sensorH, wavePreset, rayCount);
+    const icDiameterMm = Number(
+      softIc?.usableCircleDiameterMm ?? softIc?.softICmm ?? 0
+    );
     const softIcValid = Number.isFinite(icDiameterMm) && icDiameterMm > 0.1;
     const softIcTxt = softIcValid ? `IC: Ø${icDiameterMm.toFixed(1)}mm` : "IC: —";
     const softIcDetailTxt = softIcValid
@@ -3190,29 +2947,19 @@
     const intrusion = rearVx - plX;
     const phys = evaluatePhysicalConstraints(lens.surfaces);
 
-    let meritRes;
-    try {
-      meritRes = computeMeritV1({
-        surfaces: lens.surfaces,
-        wavePreset,
-        sensorX,
-        rayCount,
-        fov,
-        intrusion,
-        efl, T, bfl,
-        targetEfl: num(ui.optTargetFL?.value, NaN),
-        targetT: num(ui.optTargetT?.value, NaN),
-        physPenalty: phys.penalty,
-        hardInvalid: phys.hardFail,
-      });
-    } catch (err) {
-      console.error("merit failed:", err);
-      meritRes = {
-        merit: 1e9,
-        breakdown: { rmsCenter: null, rmsEdge: null, vigPct: 100, intrusion: null, fields: [0, 0, 0], physPenalty: 0, hardInvalid: true },
-      };
-      if (ui.footerWarn) ui.footerWarn.textContent = "Merit calc error; check lens geometry.";
-    }
+    const meritRes = computeMeritV1({
+      surfaces: lens.surfaces,
+      wavePreset,
+      sensorX,
+      rayCount,
+      fov,
+      intrusion,
+      efl, T, bfl,
+      targetEfl: num(ui.optTargetFL?.value, NaN),
+      targetT: num(ui.optTargetT?.value, NaN),
+      physPenalty: phys.penalty,
+      hardInvalid: phys.hardFail,
+    });
 
     const m = meritRes.merit;
     const bd = meritRes.breakdown;
@@ -3704,42 +3451,6 @@
       const ref = Math.min(Number(a.ap || 0), Number(c.ap || 0));
       if (ref > 0.5 && Number(b.ap || 0) < 0.45 * ref) b.ap = 0.45 * ref;
       clampSurfaceAp(b);
-    }
-  }
-
-  // Keep mutational candidates physically reachable to avoid "all hard-fail" optimizer batches.
-  function enforceGapFloors(surfaces, opts = null) {
-    if (!Array.isArray(surfaces) || surfaces.length < 2) return;
-    const o = opts || {};
-    const strong = !!o.strong;
-    for (let i = 0; i < surfaces.length; i++) {
-      const s = surfaces[i];
-      const t = String(s?.type || "").toUpperCase();
-      if (t === "OBJ" || t === "IMS") continue;
-      const med = String(resolveGlassName(s?.glass || "AIR")).toUpperCase();
-      const minGap = med === "AIR" ? PHYS_CFG.minAirGap : PHYS_CFG.minGlassCT;
-      const prefGap = med === "AIR" ? PHYS_CFG.prefAirGap : PHYS_CFG.prefGlassCT;
-      const floor = strong ? Math.max(minGap, prefGap * 0.55) : minGap;
-      s.t = clamp(Math.max(Number(s.t || 0), floor), PHYS_CFG.minThickness, PHYS_CFG.maxThickness);
-      enforceApertureRadiusCoupling(s, strong ? 1.08 : 1.05);
-      clampSurfaceAp(s);
-    }
-
-    const stopIdx = findStopSurfaceIndex(surfaces);
-    if (stopIdx >= 0) {
-      const stop = surfaces[stopIdx];
-      if (stop) {
-        // Stop should sit in air for stable, non-exotic optimizer paths.
-        stop.glass = "AIR";
-        stop.t = Math.max(Number(stop.t || 0), PHYS_CFG.minStopSideAirGap);
-      }
-      if (stopIdx > 0) {
-        const prev = surfaces[stopIdx - 1];
-        if (prev) {
-          prev.glass = "AIR";
-          prev.t = Math.max(Number(prev.t || 0), PHYS_CFG.minStopSideAirGap);
-        }
-      }
     }
   }
 
@@ -4257,11 +3968,9 @@
     const hard = !!aggressive;
 
     if (st <= 0) {
-      // FL-first deterministic solve: two smaller stable steps outperform one aggressive unstable jump.
-      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 1.0 : 0.95, hard ? 0.18 : 0.14, { keepAperture: true });
-      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 0.92 : 0.80, hard ? 0.12 : 0.08, { keepAperture: true });
-      if (targets.targetT > 0 && pri?.eflErrRel <= 0.12) {
-        nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, hard ? 0.42 : 0.28);
+      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 1.0 : 0.92, hard ? 0.30 : 0.22, { keepAperture: true });
+      if (targets.targetT > 0) {
+        nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, hard ? 0.56 : 0.42);
       }
     } else if (st === 1) {
       // T coarse phase before IC growth.
@@ -4303,7 +4012,6 @@
       keepFl,
     });
 
-    enforceGapFloors(c.surfaces, { strong: st <= 1 || hard });
     quickSanity(c.surfaces);
     if (topo) enforceTopology(c.surfaces, topo);
     return c;
@@ -4445,8 +4153,7 @@
     const sensorX = 0.0;
     const phys0 = performance.now();
     computeVertices(surfaces, lensShift, sensorX);
-    const useLitePhys = evalTierNorm === "fast" && afCfg?.physMode !== "full";
-    const phys = useLitePhys ? evaluatePhysicalConstraintsLite(surfaces) : evaluatePhysicalConstraints(surfaces);
+    const phys = evaluatePhysicalConstraints(surfaces);
     const rearVx = lastPhysicalVertexX(surfaces);
     const intrusion = Number.isFinite(rearVx) ? (rearVx - (-PL_FFD)) : Infinity;
     tPhysMs += (performance.now() - phys0);
@@ -4492,14 +4199,11 @@
 
     const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
     const Tgeom = estimateTStopApprox(efl, surfaces);
-    const centerTpRays = evalTierNorm === "fast"
-      ? Math.max(7, Math.min(11, evalRayCount))
-      : Math.max(31, evalRayCount);
     const centerTp = measureCenterThroughput(
       surfaces,
       wavePreset,
       sensorX,
-      centerTpRays
+      evalTierNorm === "fast" ? Math.max(13, evalRayCount) : Math.max(31, evalRayCount)
     );
     const T = estimateEffectiveT(Tgeom, centerTp.goodFrac);
 
@@ -4801,38 +4505,13 @@
     const rayCount = Math.max(9, Math.min(61, (num(ui.rayCount?.value, 31) | 0))); // limit for speed
     const wavePreset = ui.wavePreset?.value || "d";
 
-    let startLens = sanitizeLens(lens);
+    const startLens = sanitizeLens(lens);
     const topo = captureTopology(startLens);
     const fastRayCount = Math.max(11, Math.min(21, Math.min(rayCount, Number(OPT_EVAL_CFG.fastRayCount || 15) | 0)));
-    const uiMinMs = 1000 / Math.max(2, Number(OPT_EVAL_CFG.uiMaxHz || 10));
-    const promoteScoreRatio = Math.max(1.0, Number(OPT_EVAL_CFG.promoteScoreRatio || 1.02));
-    const flPromoteDelta = Math.max(1e-5, Number(OPT_EVAL_CFG.flPromoteDeltaRel || 0.0008));
-    const tPromoteDelta = Math.max(1e-4, Number(OPT_EVAL_CFG.tPromoteDelta || 0.02));
-    const icPromoteDelta = Math.max(1e-3, Number(OPT_EVAL_CFG.icPromoteDeltaMm || 0.10));
-    const stallSoft = Math.max(80, Number(OPT_EVAL_CFG.stallSoft || 260) | 0);
-    const stallHard = Math.max(stallSoft + 100, Number(OPT_EVAL_CFG.stallHard || 900) | 0);
-    const earlyStopMinIter = Math.max(50, Number(OPT_EVAL_CFG.earlyStopMinIter || 300) | 0);
-    let lastUiMs = 0;
     const perf = {
       fast: makeEvalPerfBucket(),
       accurate: makeEvalPerfBucket(),
     };
-
-    // Deterministic pre-pass toward FL/T so stage-0 does not start from a hopeless offset.
-    if (targetEfl > 1) {
-      const seeded = clone(startLens);
-      nudgeLensTowardFocal(seeded, targetEfl, wavePreset, 1.0, 0.22, { keepAperture: true });
-      if (targetT > 0) nudgeStopTowardTargetT(seeded.surfaces, targetEfl, targetT, 0.40);
-      enforcePupilHealthFloors(seeded.surfaces, {
-        targetEfl, targetT, targetIC,
-        stage: 0,
-        keepFl: false,
-      });
-      enforceGapFloors(seeded.surfaces, { strong: true });
-      quickSanity(seeded.surfaces);
-      if (topo) enforceTopology(seeded.surfaces, topo);
-      startLens = sanitizeLens(seeded);
-    }
 
     let cur = startLens;
     let curEval = evalLensMerit(cur, {
@@ -4893,12 +4572,8 @@
       const useFast = tier === "fast" && !forceAcc;
       const doFastAf = useFast && (!hasShift || (iterIdx % Math.max(10, Number(OPT_EVAL_CFG.fastAutofocusEvery || 120) | 0) === 0));
       const icHint = Number(baseEvalRef?.softIcMm);
-      const fastIcEvery = Math.max(2, Number(OPT_EVAL_CFG.fastIcEvery || 10) | 0);
-      const fastIcStage2Every = Math.max(2, Number(OPT_EVAL_CFG.fastIcEveryStage2 || 3) | 0);
-      const icCadence = (priRef?.stage === 2) ? fastIcStage2Every : fastIcEvery;
-      const fastIcTick = iterIdx % icCadence === 0;
-      const needFastIc = !Number.isFinite(icHint) || fastIcTick;
-      const fastIcMode = needFastIc ? "proxy" : "skip";
+      const fastIcTick = iterIdx % Math.max(2, Number(OPT_EVAL_CFG.fastIcEvery || 10) | 0) === 0;
+      const fastIcMode = (priRef?.stage === 2 || fastIcTick) ? "proxy" : "skip";
       return evalLensMerit(lensCand, {
         targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH,
         evalTier: useFast ? "fast" : "accurate",
@@ -4907,7 +4582,6 @@
           ? {
               force: !!doFastAf,
               centerShift: hasShift ? baseShift : Number(curEval?.lensShift || 0),
-              physMode: "lite",
               coarseHalfRange: OPT_EVAL_CFG.fastAfRange,
               coarseStep: OPT_EVAL_CFG.fastAfCoarseStep,
               fineHalfRange: OPT_EVAL_CFG.fastAfFineHalf,
@@ -4957,8 +4631,6 @@
       let cand = null;
       let candEval = null;
       let candPri = null;
-      let candAccurate = false;
-      let candAccEval = null;
 
       // Deterministic guided candidate each iteration to keep momentum.
       {
@@ -4982,41 +4654,6 @@
         cand = guided;
         candEval = ge;
         candPri = buildOptPriority(ge, targets);
-      }
-
-      if (curPri.stage === 0) {
-        // Deterministic FL-solver candidate every iteration: guarantees stage-0 movement when random mutations stall.
-        const flSolve = clone(best?.lens || cur);
-        nudgeLensTowardFocal(flSolve, targetEfl, wavePreset, 1.0, 0.14, { keepAperture: true });
-        nudgeLensTowardFocal(flSolve, targetEfl, wavePreset, 0.85, 0.08, { keepAperture: true });
-        if (targetT > 0 && curPri.eflErrRel <= 0.12) {
-          nudgeStopTowardTargetT(flSolve.surfaces, targetEfl, targetT, 0.24);
-        }
-        enforcePupilHealthFloors(flSolve.surfaces, {
-          targetEfl,
-          targetT,
-          targetIC,
-          stage: 0,
-          keepFl: false,
-        });
-        enforceGapFloors(flSolve.surfaces, { strong: true });
-        quickSanity(flSolve.surfaces);
-        if (topo) enforceTopology(flSolve.surfaces, topo);
-        const flSolveEval = evalCandidateTier(
-          flSolve,
-          "accurate",
-          curPri,
-          best?.eval || curEval,
-          i,
-          true
-        );
-        if (!candEval || isEvalBetterByPlan(flSolveEval, candEval, targets)) {
-          cand = flSolve;
-          candEval = flSolveEval;
-          candPri = buildOptPriority(flSolveEval, targets);
-          candAccurate = true;
-          candAccEval = flSolveEval;
-        }
       }
 
       for (let trIdx = 0; trIdx < tries; trIdx++) {
@@ -5093,8 +4730,8 @@
           if (farAway) {
             nudgeLensTowardFocal(c, targetEfl, wavePreset, 0.85, 0.06, { keepAperture: true });
           }
-          if (targetT > 0 && !farAway && Math.random() < 0.55) {
-            nudgeStopTowardTargetT(c.surfaces, targetEfl, targetT, nearEdge ? 0.34 : 0.24);
+          if (targetT > 0 && Math.random() < 0.85) {
+            nudgeStopTowardTargetT(c.surfaces, targetEfl, targetT, 0.48);
           }
         } else if (flLocked && Math.random() < 0.90) {
           nudgeLensTowardFocal(c, targetEfl, wavePreset, 0.40, 0.045, { keepAperture: true });
@@ -5104,7 +4741,7 @@
           targetT,
           targetIC,
           stage: basePri.stage,
-          strength: basePri.stage === 2 ? 1.1 : (basePri.stage === 1 ? 0.85 : 0.55),
+          strength: basePri.stage === 2 ? 1.1 : 0.8,
           keepFl: flLocked,
         });
         enforcePupilHealthFloors(c.surfaces, {
@@ -5114,7 +4751,6 @@
           stage: basePri.stage,
           keepFl: flLocked,
         });
-        enforceGapFloors(c.surfaces, { strong: basePri.stage <= 1 });
         quickSanity(c.surfaces);
         if (topoUse) enforceTopology(c.surfaces, topoUse);
         const ce = evalCandidateTier(
@@ -5131,6 +4767,8 @@
         }
       }
 
+      let candAccurate = false;
+      let candAccEval = null;
       const promoteCandAccurate = () => {
         if (candAccurate && candAccEval) return candAccEval;
         candAccEval = evalCandidateTier(
@@ -5147,22 +4785,8 @@
         return candAccEval;
       };
 
-      const nearBestScore =
-        Number.isFinite(candEval?.score) &&
-        Number.isFinite(best?.eval?.score) &&
-        candEval.score <= best.eval.score * promoteScoreRatio;
-      const stageSignal =
-        curPri.stage === 0
-          ? (candPri.eflErrRel < curPri.eflErrRel - flPromoteDelta)
-          : curPri.stage === 1
-          ? (candPri.tErrAbs < curPri.tErrAbs - tPromoteDelta)
-          : curPri.stage === 2
-          ? (candPri.icNeedMm < curPri.icNeedMm - icPromoteDelta)
-          : isEvalBetterByPlan(candEval, curEval, targets);
       const shouldAccurateCheck =
-        (curPri.stage === 0) ||
-        stageSignal ||
-        nearBestScore ||
+        isEvalBetterByPlan(candEval, curEval, targets) ||
         isEvalBetterByPlan(candEval, best.eval, targets) ||
         (i % Math.max(20, Number(OPT_EVAL_CFG.accurateAuditEvery || 90) | 0) === 0);
       if (shouldAccurateCheck) promoteCandAccurate();
@@ -5231,25 +4855,17 @@
             // No uphill exploration in FL acquire.
             accept = candPri.eflErrRel <= curPri.eflErrRel + 1e-6;
           } else if (curPri.stage === 1) {
-            // T coarse stays target-dominant, but allow tiny uphill annealing moves.
-            if (candPri.feasible && candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel) {
-              const dT = candPri.tErrAbs - curPri.tErrAbs;
-              if (dT <= 1e-4) accept = true;
-              else if (dT <= 0.035) {
-                const pUp = Math.exp(-dT * 55 / Math.max(0.06, temp));
-                accept = Math.random() < pUp;
-              } else accept = false;
-            } else accept = false;
+            // T coarse stays target-dominant: do not accept worse T error.
+            accept =
+              candPri.feasible &&
+              candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
+              candPri.tErrAbs <= curPri.tErrAbs + 1e-4;
           } else if (curPri.stage === 2) {
-            // IC growth stays target-dominant, but allow tiny uphill annealing moves.
-            if (candPri.feasible && candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel) {
-              const dIc = candPri.icNeedMm - curPri.icNeedMm;
-              if (dIc <= 0.01) accept = true;
-              else if (dIc <= 0.18) {
-                const pUp = Math.exp(-dIc * 14 / Math.max(0.08, temp));
-                accept = Math.random() < pUp;
-              } else accept = false;
-            } else accept = false;
+            // IC growth stays target-dominant: do not accept worse IC shortfall.
+            accept =
+              candPri.feasible &&
+              candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
+              candPri.icNeedMm <= curPri.icNeedMm + 0.01;
           } else {
             const dE = planEnergy(candPri) - planEnergy(curPri);
             const tempScale = (curPri.stage === 2 ? 520 : 300) * Math.max(0.10, temp);
@@ -5301,8 +4917,7 @@
         const stageStep = fmtStageStep(bp.stage);
 
         // UI update (rare)
-        const tNowBest = performance.now();
-        if (ui.optLog && (tNowBest - lastUiMs) >= uiMinMs){
+        if (ui.optLog){
           setOptLog(
             `best @${i}/${iters}\n` +
             `score ${best.eval.score.toFixed(2)}\n` +
@@ -5315,43 +4930,11 @@
             `INTR ${fmtIntrusion(best.eval)}\n` +
             `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
           );
-          lastUiMs = tNowBest;
         }
       }
       stallIters = improvedBest ? 0 : (stallIters + 1);
 
-      if (curPri.stage === 0 && stallIters > Math.max(80, Math.floor(stallSoft * 0.6)) && (i % Math.max(20, BATCH / 3) === 0)) {
-        // FL-only escape: deterministic focal rescale kick when stage 0 stalls.
-        const flKick = clone(best.lens);
-        nudgeLensTowardFocal(flKick, targetEfl, wavePreset, 1.0, 0.14, { keepAperture: true });
-        nudgeLensTowardFocal(flKick, targetEfl, wavePreset, 0.9, 0.10, { keepAperture: true });
-        if (targetT > 0) nudgeStopTowardTargetT(flKick.surfaces, targetEfl, targetT, 0.42);
-        enforcePupilHealthFloors(flKick.surfaces, {
-          targetEfl, targetT, targetIC,
-          stage: 0,
-          keepFl: false,
-        });
-        enforceGapFloors(flKick.surfaces, { strong: true });
-        quickSanity(flKick.surfaces);
-        if (topo) enforceTopology(flKick.surfaces, topo);
-        const flKickEval = evalCandidateTier(flKick, "accurate", curPri, best.eval, i, true);
-        if (isEvalBetterByPlan(flKickEval, curEval, targets)) {
-          cur = flKick;
-          curEval = flKickEval;
-          const kp = buildOptPriority(flKickEval, targets);
-          flLocked = flLocked || (kp.feasible && kp.flInBand);
-          addElite(cur, curEval, i);
-        }
-        if (isEvalBetterByPlan(flKickEval, best.eval, targets)) {
-          best = { lens: clone(flKick), eval: flKickEval, iter: i };
-          addElite(best.lens, best.eval, i);
-          stallIters = 0;
-        } else {
-          stallIters = Math.floor(stallIters * 0.75);
-        }
-      }
-
-      if (stallIters > stallSoft && (i % Math.max(40, BATCH / 2) === 0)) {
+      if (stallIters > 220 && (i % Math.max(40, BATCH / 2) === 0)) {
         const bpKick = buildOptPriority(best.eval, targets);
         const kick = buildGuidedCandidate(best.lens, bpKick, targets, wavePreset, topo, true);
         const kickEval = evalCandidateTier(kick, "accurate", bpKick, best.eval, i, true);
@@ -5368,53 +4951,6 @@
           stallIters = 0;
         } else {
           stallIters = Math.floor(stallIters * 0.6);
-        }
-      }
-      if (stallIters > stallHard && (i % Math.max(60, BATCH) === 0)) {
-        // Hard escape: restart from hall-of-fame sample, then push toward stage target.
-        const ePick = elites.length ? pick(elites) : best;
-        const seed = clone(ePick?.lens || best.lens);
-        const sp = buildOptPriority(ePick?.eval || best.eval, targets);
-        const restart = mutateLens(seed, "wild", null, {
-          stage: sp.stage,
-          targetIC,
-          targetEfl,
-          targetT,
-          icNeedMm: Math.max(0, sp.icNeedMm + 2.0),
-          keepFl: false,
-        });
-        if (sp.stage <= 0) {
-          nudgeLensTowardFocal(restart, targetEfl, wavePreset, 1.0, 0.14, { keepAperture: true });
-        } else if (sp.stage === 1) {
-          nudgeStopTowardTargetT(restart.surfaces, targetEfl, targetT, 0.95);
-        } else if (sp.stage === 2) {
-          applyCoverageBoostMutation(restart.surfaces, {
-            targetIC, targetEfl, targetT,
-            icNeedMm: Math.max(2, sp.icNeedMm + 2),
-            keepFl: false,
-          });
-        }
-        enforcePupilHealthFloors(restart.surfaces, {
-          targetEfl, targetT, targetIC,
-          stage: sp.stage,
-          keepFl: false,
-        });
-        enforceGapFloors(restart.surfaces, { strong: true });
-        quickSanity(restart.surfaces);
-        const restartEval = evalCandidateTier(restart, "accurate", sp, ePick?.eval || best.eval, i, true);
-        if (isEvalBetterByPlan(restartEval, curEval, targets)) {
-          cur = restart;
-          curEval = restartEval;
-          const rp = buildOptPriority(restartEval, targets);
-          flLocked = flLocked || (rp.feasible && rp.flInBand);
-          addElite(cur, curEval, i);
-        }
-        if (isEvalBetterByPlan(restartEval, best.eval, targets)) {
-          best = { lens: clone(restart), eval: restartEval, iter: i };
-          addElite(best.lens, best.eval, i);
-          stallIters = 0;
-        } else {
-          stallIters = Math.floor(stallIters * 0.7);
         }
       }
 
@@ -5438,8 +4974,7 @@
         const ips = i / Math.max(1e-6, dt);
         const cp = buildOptPriority(curEval, targets);
         const bp = buildOptPriority(best.eval, targets);
-        const uiTick = (tNow - lastUiMs) >= uiMinMs;
-        if (ui.optLog && uiTick){
+        if (ui.optLog){
           setOptLog(
             `running… ${i}/${iters}  (${ips.toFixed(1)} it/s)\n` +
             `current ${curEval.score.toFixed(2)} • best ${best.eval.score.toFixed(2)} @${best.iter}\n` +
@@ -5452,17 +4987,6 @@
             `${fmtEvalPerf("perf fast", perf.fast)}\n` +
             `${fmtEvalPerf("perf acc", perf.accurate)}\n`
           );
-          lastUiMs = tNow;
-        }
-        const goodEnough =
-          i >= earlyStopMinIter &&
-          bp.feasible &&
-          bp.eflErrRel <= 0.01 &&
-          (targetT <= 0 || bp.tErrAbs <= OPT_STAGE_CFG.tGoodAbs) &&
-          (targetIC <= 0 || bp.icMeasured >= bp.icGoalMm);
-        if (goodEnough) {
-          itersRan = i;
-          break;
         }
         // yield to UI
         await new Promise(r => setTimeout(r, 0));
