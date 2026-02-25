@@ -1282,6 +1282,7 @@
     flPreferRel: 0.002,   // in later phases, do not accept >0.2% FL degradation
     flHoldRel: 0.05,      // hard FL hold after lock (within +/-5%)
     icStageDriftRel: 0.006, // allow a bit more FL drift during IC growth
+    tCoarseAbs: 0.85,     // before IC growth, first pull T close enough
     icPassFrac: 0.95,     // IC phase is "good enough" at >=95% of requested IC
     tGoodAbs: 0.25,       // T phase considered good when absolute T error <= 0.25
   };
@@ -3349,8 +3350,10 @@
     L.name = baseLens.name;
     const stage = Number(opt?.stage ?? 0);
     const targetIC = Math.max(0, Number(opt?.targetIC || 0));
+    const targetEfl = Math.max(1, Number(opt?.targetEfl || 0));
+    const targetT = Math.max(0, Number(opt?.targetT || 0));
     const icNeedMm = Math.max(0, Number(opt?.icNeedMm || 0));
-    const icStage = (stage === 1 && targetIC > 0);
+    const icStage = (stage === 2 && targetIC > 0);
     const keepFl = !!opt?.keepFl;
 
     const s = L.surfaces;
@@ -3505,40 +3508,11 @@
       }
     }
 
-// --- FORCE STOP / PUPIL HEALTH DURING IC STAGE ---
-if (icStage && Number(opt?.targetT || 0) > 0.2 && Number(opt?.targetEfl || 0) > 1) {
-  const targetEfl = Number(opt.targetEfl);
-  const targetT   = Number(opt.targetT);
-
-  // 1) push stop aperture toward geometric requirement
-  nudgeStopTowardTargetT(s, targetEfl, targetT, 0.90);
-
-  // 2) ensure neighbors don't choke the stop (rear group especially)
-  const stopIdx = findStopSurfaceIndex(s);
-  if (stopIdx >= 0) {
-    const stopAp = Number(s[stopIdx].ap || 0);
-    const need = stopAp / 1.05;
-    for (let d = 1; d <= 3; d++) {
-      for (const idx of [stopIdx - d, stopIdx + d]) {
-        if (idx < 0 || idx >= s.length) continue;
-        const ss = s[idx];
-        if (surfaceIsLocked(ss)) continue;
-        const tt = String(ss.type || "").toUpperCase();
-        if (tt === "OBJ" || tt === "IMS") continue;
-
-        if (Number(ss.ap || 0) < need * (1 - d * 0.06)) {
-          ss.ap = clamp(need * (1 - d * 0.06), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
-        }
-        // match radius so clampSurfaceAp() doesn't immediately nerf ap back down
-        const signR = Math.sign(Number(ss.R || 1)) || 1;
-        const absR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(ss.R || 0)));
-        const needAbsR = (Number(ss.ap || 0) / AP_SAFETY) * 1.08;
-        ss.R = signR * clamp(Math.max(absR, needAbsR), PHYS_CFG.minRadius, 600);
-      }
+    // In IC stage always keep pupil/stop health in sync; otherwise IC cannot move.
+    if (icStage && targetEfl > 1 && targetT > 0) {
+      nudgeStopTowardTargetT(s, targetEfl, targetT, keepFl ? 0.52 : 0.70);
     }
-  }
-}
-     
+
     ensureStopExists(s);
     // enforce single stop
     const firstStop = s.findIndex(x => !!x.stop);
@@ -3649,17 +3623,28 @@ if (icStage && Number(opt?.targetT || 0) > 0.2 && Number(opt?.targetEfl || 0) > 
     const curAp = Number(stop.ap || targetAp);
     const s = clamp(Number(strength), 0.05, 1);
     stop.ap = clamp(curAp + (targetAp - curAp) * s, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+    {
+      const signR = Math.sign(Number(stop.R || 1)) || 1;
+      const absR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(stop.R || 0)));
+      const needAbsR = (Number(stop.ap || targetAp) / AP_SAFETY) * 1.08;
+      stop.R = signR * clamp(Math.max(absR, needAbsR), PHYS_CFG.minRadius, 600);
+    }
 
     // Keep immediate neighbors compatible with a larger stop.
     const neighNeed = Number(stop.ap || targetAp) / 1.08;
-    for (let d = 1; d <= 2; d++) {
+    for (let d = 1; d <= 3; d++) {
       for (const idx of [stopIdx - d, stopIdx + d]) {
         if (idx < 0 || idx >= surfaces.length) continue;
         const ss = surfaces[idx];
         if (surfaceIsLocked(ss)) continue;
         const t = String(ss?.type || "").toUpperCase();
         if (t === "OBJ" || t === "IMS") continue;
-        if (Number(ss.ap || 0) < neighNeed) ss.ap = neighNeed;
+        const apNeed = neighNeed * (1 - d * 0.06);
+        if (Number(ss.ap || 0) < apNeed) ss.ap = apNeed;
+        const signR = Math.sign(Number(ss.R || 1)) || 1;
+        const absR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(ss.R || 0)));
+        const needAbsR = (Number(ss.ap || 0) / AP_SAFETY) * 1.06;
+        ss.R = signR * clamp(Math.max(absR, needAbsR), PHYS_CFG.minRadius, 600);
       }
     }
   }
@@ -3674,6 +3659,10 @@ if (icStage && Number(opt?.targetT || 0) > 0.2 && Number(opt?.targetEfl || 0) > 
     if (st <= 0) {
       nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 1.0 : 0.92, hard ? 0.30 : 0.22);
     } else if (st === 1) {
+      // T coarse phase before IC growth.
+      nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, hard ? 0.98 : 0.88);
+      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 0.64 : 0.52, hard ? 0.08 : 0.06);
+    } else if (st === 2) {
       const passes = hard ? 3 : (icNeed > 3.0 ? 2 : 1);
       for (let p = 0; p < passes; p++) {
         applyCoverageBoostMutation(c.surfaces, {
@@ -3685,14 +3674,12 @@ if (icStage && Number(opt?.targetT || 0) > 0.2 && Number(opt?.targetEfl || 0) > 
           keepFl: (p === 0 ? keepFl : false),
         });
       }
-      nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, hard ? 0.88 : 0.72);
+      nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, hard ? 0.92 : 0.78);
       nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 0.55 : 0.40, hard ? 0.07 : 0.05);
-    } else if (st === 2) {
-      nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, hard ? 0.95 : 0.82);
-      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 0.60 : 0.45, hard ? 0.07 : 0.05);
     } else {
-      nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, 0.55);
-      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, 0.36, 0.04);
+      // Fine tune: keep T close and clean up sharpness.
+      nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, hard ? 0.85 : 0.62);
+      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 0.42 : 0.32, hard ? 0.05 : 0.035);
     }
 
     quickSanity(c.surfaces);
@@ -3858,9 +3845,9 @@ if (icStage && Number(opt?.targetT || 0) > 0.2 && Number(opt?.targetEfl || 0) > 
   function stageName(stage) {
     if (stage < 0) return "Physics fix";
     if (stage === 0) return "FL acquire";
-    if (stage === 1) return "IC growth";
-    if (stage === 2) return "T tune";
-    return "Sharpness";
+    if (stage === 1) return "T coarse";
+    if (stage === 2) return "IC growth";
+    return "Fine tune";
   }
 
   function buildOptPriority(evalRes, { targetEfl, targetIC, targetT }) {
@@ -3905,15 +3892,13 @@ if (icStage && Number(opt?.targetT || 0) > 0.2 && Number(opt?.targetEfl || 0) > 
       0.5 * (Number.isFinite(vigFrac) ? vigFrac : 1);
 
     let stage = feasible ? 0 : -1;
-    // Stage flow should use the locked FL band (+/-5%), not only the tighter 1% mark.
+    // Stage flow: FL acquire -> T coarse -> IC growth -> fine tune.
     if (feasible && flInBand) {
-  const needsTFirst = (targetT > 0) && (!tGood) && (tErrAbs > 0.75);
-
-  if (needsTFirst) stage = 2;      // eerst stop/pupil op orde
-  else if (!icGood) stage = 1;     // daarna IC
-  else if (!tGood) stage = 2;
-  else stage = 3;
-}
+      const needsTCoarse = targetT > 0 && (!Number.isFinite(tErrAbs) || tErrAbs > OPT_STAGE_CFG.tCoarseAbs);
+      if (needsTCoarse) stage = 1;
+      else if (!icGood) stage = 2;
+      else stage = 3;
+    }
     const stageRank = stage < 0 ? 0 : (stage + 1); // 0=invalid, 1..4 better as objectives complete
 
     return {
@@ -3965,27 +3950,28 @@ if (icStage && Number(opt?.targetT || 0) > 0.2 && Number(opt?.targetEfl || 0) > 
       return A.eflErrRel - B.eflErrRel;
     }
 
-    // Higher stage rank is better: Physics fix < FL acquire < IC growth < T tune < Sharpness.
+    // Higher stage rank is better: Physics fix < FL acquire < T coarse < IC growth < Fine tune.
     if (A.stageRank !== B.stageRank) return B.stageRank - A.stageRank;
 
     if (A.stage === 0 && Math.abs(A.eflErrRel - B.eflErrRel) > 1e-6) {
       return A.eflErrRel - B.eflErrRel;
     }
 
-   if (A.stage === 1) {
-  if (Math.abs(A.icNeedMm - B.icNeedMm) > 0.005) return A.icNeedMm - B.icNeedMm;
-  if (Math.abs(A.icMeasured - B.icMeasured) > 0.005) return B.icMeasured - A.icMeasured;
-
-  // NEW: if IC is basically tied, prefer better T (closer to target)
-  if (Math.abs(A.tErrAbs - B.tErrAbs) > 0.02) return A.tErrAbs - B.tErrAbs;
-}
-
-    if (A.stage === 2 && Math.abs(A.tErrAbs - B.tErrAbs) > 1e-4) {
-      return A.tErrAbs - B.tErrAbs;
+    if (A.stage === 1) {
+      if (Math.abs(A.tErrAbs - B.tErrAbs) > 1e-4) return A.tErrAbs - B.tErrAbs;
+      if (Math.abs(A.icNeedMm - B.icNeedMm) > 0.01) return A.icNeedMm - B.icNeedMm;
     }
 
-    if (A.stage === 3 && Math.abs(A.sharpness - B.sharpness) > 1e-5) {
-      return A.sharpness - B.sharpness;
+    if (A.stage === 2) {
+      if (Math.abs(A.icNeedMm - B.icNeedMm) > 0.005) return A.icNeedMm - B.icNeedMm;
+      if (Math.abs(A.icMeasured - B.icMeasured) > 0.005) return B.icMeasured - A.icMeasured;
+      // If IC is flat, prefer better T so the pupil can open for later IC jumps.
+      if (Math.abs(A.tErrAbs - B.tErrAbs) > 1e-4) return A.tErrAbs - B.tErrAbs;
+    }
+
+    if (A.stage === 3) {
+      if (Math.abs(A.tErrAbs - B.tErrAbs) > 1e-4) return A.tErrAbs - B.tErrAbs;
+      if (Math.abs(A.sharpness - B.sharpness) > 1e-5) return A.sharpness - B.sharpness;
     }
 
     if (Math.abs(A.eflErrRel - B.eflErrRel) > 1e-6) return A.eflErrRel - B.eflErrRel;
@@ -3998,9 +3984,9 @@ if (icStage && Number(opt?.targetT || 0) > 0.2 && Number(opt?.targetEfl || 0) > 
       return 1e9 + pri.feasibilityDebt * 100 + pri.eflErrRel * 1e5;
     }
     const stagePenalty = Math.max(0, 5 - Number(pri.stageRank || 0));
-    const eflW = pri.stage <= 0 ? 22000 : (pri.stage === 1 ? 2800 : 9000);
-    const icW = pri.stage === 1 ? 340 : 220;
-    const tW = pri.stage === 2 ? 120 : 95;
+    const eflW = pri.stage <= 0 ? 22000 : (pri.stage === 1 ? 4200 : 9000);
+    const icW = pri.stage === 2 ? 360 : 200;
+    const tW = pri.stage === 1 ? 185 : (pri.stage === 2 ? 130 : 110);
     return (
       stagePenalty * 100000 +
       pri.eflErrRel * eflW +
@@ -4104,8 +4090,10 @@ if (icStage && Number(opt?.targetT || 0) > 0.2 && Number(opt?.targetEfl || 0) > 
       const tries = (curPri.stage === 0)
         ? (curPri.eflErrRel > 0.20 ? 10 : 6)
         : (curPri.stage === 1)
-        ? (flLocked ? (curPri.icNeedMm > 9 ? 18 : 14) : 10)
-        : (flLocked ? 5 : 3);
+        ? (flLocked ? 12 : 9) // T coarse
+        : (curPri.stage === 2)
+        ? (flLocked ? (curPri.icNeedMm > 9 ? 18 : 14) : 10) // IC growth
+        : (flLocked ? 5 : 3); // fine tune
       let cand = null;
       let candEval = null;
       let candPri = null;
@@ -4137,16 +4125,28 @@ if (icStage && Number(opt?.targetT || 0) > 0.2 && Number(opt?.targetEfl || 0) > 
         );
         const baseLens = useBestBase ? best.lens : cur;
         const basePri = useBestBase ? bestPriPre : curPri;
-        const unlockForIC = (basePri.stage === 1 && basePri.icNeedMm > 10);
+        const unlockForIC = (basePri.stage === 2 && basePri.icNeedMm > 10);
         const mutMode = (unlockForIC && Math.random() < 0.40) ? "wild" : mode;
         const topoUse = (unlockForIC && mutMode === "wild" && Math.random() < 0.55) ? null : topo;
         const c = mutateLens(baseLens, mutMode, topoUse, {
           stage: basePri.stage,
           targetIC,
+          targetEfl,
+          targetT,
           icNeedMm: basePri.icNeedMm,
           keepFl: flLocked
         });
-        if (basePri.stage === 1 && basePri.icNeedMm > 1.0 && Math.random() < 0.92) {
+        if (basePri.stage === 1 && Math.random() < 0.95) {
+          // Coarse T phase: always push stop/pupil first.
+          nudgeStopTowardTargetT(c.surfaces, targetEfl, targetT, 0.90);
+          quickSanity(c.surfaces);
+          if (topoUse) enforceTopology(c.surfaces, topoUse);
+        }
+        if (basePri.stage === 2) {
+          // IC phase: every candidate keeps pupil health in sync.
+          nudgeStopTowardTargetT(c.surfaces, targetEfl, targetT, 0.78);
+        }
+        if (basePri.stage === 2 && basePri.icNeedMm > 1.0 && Math.random() < 0.92) {
           applyCoverageBoostMutation(c.surfaces, {
             targetIC,
             targetEfl,
@@ -4192,8 +4192,8 @@ if (icStage && Number(opt?.targetT || 0) > 0.2 && Number(opt?.targetEfl || 0) > 
         accept = true;
       } else if (curPri.feasible && !candPri.feasible) {
         if (
-          curPri.stage === 1 &&
-          candPri.stage <= 1 &&
+          curPri.stage === 2 &&
+          candPri.stage <= 2 &&
           candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
           candPri.icMeasured > curPri.icMeasured + 0.8 &&
           candPri.feasibilityDebt < 3500
@@ -4207,15 +4207,24 @@ if (icStage && Number(opt?.targetT || 0) > 0.2 && Number(opt?.targetEfl || 0) > 
       // Once we have entered FL band, never accept candidates outside the 5% band.
       if (flLocked && candPri.eflErrRel > OPT_STAGE_CFG.flHoldRel) {
         accept = false;
-      } else if (curPri.flInBand && curPri.stage === 1 && candPri.eflErrRel > OPT_STAGE_CFG.flHoldRel) {
+      } else if (curPri.flInBand && curPri.stage === 2 && candPri.eflErrRel > OPT_STAGE_CFG.flHoldRel) {
         // IC phase may move inside FL hold band, but never outside hard hold.
         accept = false;
-      } else if (curPri.flInBand && curPri.stage !== 1 && candPri.eflErrRel > curPri.eflErrRel + OPT_STAGE_CFG.flPreferRel) {
-        // Outside IC phase keep FL very tight.
+      } else if (curPri.flInBand && curPri.stage === 3 && candPri.eflErrRel > curPri.eflErrRel + OPT_STAGE_CFG.flPreferRel) {
+        // Fine tune keeps FL very tight.
         accept = false;
       } else if (
         curPri.stage === 1 &&
         candPri.stage === 1 &&
+        candPri.feasible &&
+        candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
+        candPri.tErrAbs < curPri.tErrAbs - 0.01
+      ) {
+        // Coarse T phase should move even if IC does not.
+        accept = true;
+      } else if (
+        curPri.stage === 2 &&
+        candPri.stage === 2 &&
         candPri.feasible &&
         candPri.eflErrRel <= OPT_STAGE_CFG.flHoldRel &&
         candPri.icMeasured > curPri.icMeasured + 0.005
@@ -4229,7 +4238,7 @@ if (icStage && Number(opt?.targetT || 0) > 0.2 && Number(opt?.targetEfl || 0) > 
         const sameStage = candPri.stage === curPri.stage;
         if (sameStage) {
           const dE = planEnergy(candPri) - planEnergy(curPri);
-          const tempScale = (curPri.stage === 1 ? 520 : 300) * Math.max(0.10, temp);
+          const tempScale = (curPri.stage === 2 ? 520 : 300) * Math.max(0.10, temp);
           const uphillProb = Math.exp(-Math.max(0, dE) / Math.max(1e-6, tempScale));
           if (flLocked) {
             accept = Math.random() < uphillProb;
