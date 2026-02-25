@@ -106,6 +106,51 @@
     btnOptBench: $("#btnOptBench"),
     btnBuildScratch: $("#btnBuildScratch"),
 
+    // Cockpit panel
+    cockpitProgress: $("#cockpitProgress"),
+    cockpitProgressText: $("#cockpitProgressText"),
+    cockpitCompareInfo: $("#cockpitCompareInfo"),
+
+    cockpitValEfl: $("#cockpitValEfl"),
+    cockpitDeltaEfl: $("#cockpitDeltaEfl"),
+    cockpitValBfl: $("#cockpitValBfl"),
+    cockpitDeltaBfl: $("#cockpitDeltaBfl"),
+    cockpitValT: $("#cockpitValT"),
+    cockpitDeltaT: $("#cockpitDeltaT"),
+    cockpitValCov: $("#cockpitValCov"),
+    cockpitDeltaCov: $("#cockpitDeltaCov"),
+    cockpitValIc: $("#cockpitValIc"),
+    cockpitDeltaIc: $("#cockpitDeltaIc"),
+    cockpitValDist: $("#cockpitValDist"),
+    cockpitDeltaDist: $("#cockpitDeltaDist"),
+    cockpitValSharp: $("#cockpitValSharp"),
+    cockpitDeltaSharp: $("#cockpitDeltaSharp"),
+    cockpitValFeas: $("#cockpitValFeas"),
+    cockpitDeltaFeas: $("#cockpitDeltaFeas"),
+
+    btnBaselineLens: $("#btnBaselineLens"),
+    btnOptEfl: $("#btnOptEfl"),
+    btnOptTLocal: $("#btnOptTLocal"),
+    btnOptICLocal: $("#btnOptICLocal"),
+    btnOptDistLocal: $("#btnOptDistLocal"),
+    btnOptSharpLocal: $("#btnOptSharpLocal"),
+    btnOptAllMacro: $("#btnOptAllMacro"),
+
+    btnSnapshotSave: $("#btnSnapshotSave"),
+    btnSnapshotUndo: $("#btnSnapshotUndo"),
+    btnSnapshotRedo: $("#btnSnapshotRedo"),
+    btnSnapshotCompare: $("#btnSnapshotCompare"),
+
+    cockpitIters: $("#cockpitIters"),
+    cockpitStep: $("#cockpitStep"),
+    cockpitStepOut: $("#cockpitStepOut"),
+    cockpitSurfaceMode: $("#cockpitSurfaceMode"),
+    cockpitSurfaceStart: $("#cockpitSurfaceStart"),
+    cockpitSurfaceEnd: $("#cockpitSurfaceEnd"),
+    cockpitStrictness: $("#cockpitStrictness"),
+    cockpitMacroPasses: $("#cockpitMacroPasses"),
+    cockpitAnneal: $("#cockpitAnneal"),
+
     newLensModal: $("#newLensModal"),
     elementModal: $("#elementModal"),
   };
@@ -1615,6 +1660,29 @@
     },
   };
 
+  const COCKPIT_CFG = {
+    progressBatch: 60,
+    minIterations: 80,
+    maxIterations: 120000,
+    defaultIters: 2400,
+    defaultStepSize: 0.06,
+    defaultMacroPasses: 2,
+    hardMinValidCenterFrac: 0.28,
+    plIntrusionRejectMm: 0.50,
+    maxBflShortRejectMm: 1.0,
+    defaultObjDistMm: Number(DIST_OPT_CFG.objDistMm || 20000),
+    defaultLutN: 240,
+    defaultRayCount: 21,
+    maxCoverageDropNormalDeg: 0.40,
+    maxCoverageDropStrictDeg: 0.20,
+    maxDistWorsenNormalPct: 0.60,
+    maxDistWorsenStrictPct: 0.30,
+    maxEflDriftNormalMm: 0.80,
+    maxEflDriftStrictMm: 0.35,
+    maxTDriftNormal: 0.10,
+    maxTDriftStrict: 0.05,
+  };
+
   const SCRATCH_CFG = {
     autoFamilyWideMaxMm: 35,
     autoFamilyNormalMaxMm: 85,
@@ -1661,6 +1729,8 @@
   let _realismCacheVal = null;
   let _sharpCacheKey = "";
   let _sharpCacheVal = null;
+  let _cockpitMetricsCacheKey = "";
+  let _cockpitMetricsCacheVal = null;
 
   function chiefRadiusAtFieldDeg(workSurfaces, fieldDeg, wavePreset, sensorX) {
     const chief = buildChiefRay(workSurfaces, fieldDeg);
@@ -2179,6 +2249,65 @@
     _lutDistMetricCacheKey = key;
     _lutDistMetricCacheVal = val;
     return val;
+  }
+
+  function computeUsableIcFromLUTPack(lutPack, cfg = SOFT_IC_CFG) {
+    if (!lutPack || !lutPack.rSensorLUT || !lutPack.transLUT || !lutPack.naturalLUT) {
+      return {
+        valid: false,
+        diameterMm: 0,
+        radiusMm: 0,
+        thresholdRel: Number(cfg?.thresholdRel || SOFT_IC_CFG.thresholdRel || 0.35),
+        relAtCutoff: 0,
+        samples: [],
+      };
+    }
+    const n = Math.min(
+      Number(lutPack.rSensorLUT.length || 0),
+      Number(lutPack.transLUT.length || 0),
+      Number(lutPack.naturalLUT.length || 0)
+    );
+    if (n < 4) {
+      return {
+        valid: false,
+        diameterMm: 0,
+        radiusMm: 0,
+        thresholdRel: Number(cfg?.thresholdRel || SOFT_IC_CFG.thresholdRel || 0.35),
+        relAtCutoff: 0,
+        samples: [],
+      };
+    }
+
+    const radialMm = new Array(n);
+    const gainCurve = new Array(n);
+    const samples = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const r = Number(lutPack.rSensorLUT[i] || 0);
+      const trans = clamp(Number(lutPack.transLUT[i] || 0), 0, 1);
+      const natural = clamp(Number(lutPack.naturalLUT[i] || 0), 0, 1);
+      const gain = clamp(trans * natural, 0, 1);
+      radialMm[i] = Math.max(0, r);
+      gainCurve[i] = gain;
+      samples[i] = { rMm: radialMm[i], gain };
+    }
+
+    const uc = computeUsableCircleFromRadialCurve(radialMm, gainCurve, {
+      ...SOFT_IC_CFG,
+      ...(cfg || {}),
+      minSamplesForCurve: Math.max(4, Number(cfg?.minSamplesForCurve || 6) | 0),
+      smoothingHalfWindow: Math.max(0, Number(cfg?.smoothingHalfWindow ?? 1) | 0),
+    });
+
+    return {
+      valid: !!uc?.valid,
+      diameterMm: Number.isFinite(uc?.diameterMm) ? Math.max(0, Number(uc.diameterMm)) : 0,
+      radiusMm: Number.isFinite(uc?.radiusMm) ? Math.max(0, Number(uc.radiusMm)) : 0,
+      thresholdRel: Number.isFinite(uc?.thresholdRel)
+        ? Number(uc.thresholdRel)
+        : Number(cfg?.thresholdRel || SOFT_IC_CFG.thresholdRel || 0.35),
+      relAtCutoff: Number.isFinite(uc?.relAtCutoff) ? Number(uc.relAtCutoff) : 0,
+      samples,
+    };
   }
 
   function formatLutDistortionBadgeText(distMetrics, compact = false) {
@@ -3454,6 +3583,14 @@
       distOptIters: ui.distOptIters?.value || "12000",
       optPop: ui.optPop?.value || "safe",
       optAutoApply: !!ui.optAutoApply?.checked,
+      cockpitIters: ui.cockpitIters?.value || "2400",
+      cockpitStep: ui.cockpitStep?.value || "0.06",
+      cockpitSurfaceMode: ui.cockpitSurfaceMode?.value || "auto",
+      cockpitSurfaceStart: ui.cockpitSurfaceStart?.value || "1",
+      cockpitSurfaceEnd: ui.cockpitSurfaceEnd?.value || "10",
+      cockpitStrictness: ui.cockpitStrictness?.value || "normal",
+      cockpitMacroPasses: ui.cockpitMacroPasses?.value || "2",
+      cockpitAnneal: !!ui.cockpitAnneal?.checked,
     };
   }
 
@@ -3476,9 +3613,21 @@
     set(ui.optIters, snap.optIters);
     set(ui.distOptIters, snap.distOptIters);
     set(ui.optPop, snap.optPop);
+    set(ui.cockpitIters, snap.cockpitIters);
+    set(ui.cockpitStep, snap.cockpitStep);
+    set(ui.cockpitSurfaceMode, snap.cockpitSurfaceMode);
+    set(ui.cockpitSurfaceStart, snap.cockpitSurfaceStart);
+    set(ui.cockpitSurfaceEnd, snap.cockpitSurfaceEnd);
+    set(ui.cockpitStrictness, snap.cockpitStrictness);
+    set(ui.cockpitMacroPasses, snap.cockpitMacroPasses);
     if (ui.optAutoApply && Object.prototype.hasOwnProperty.call(snap, "optAutoApply")) {
       ui.optAutoApply.checked = !!snap.optAutoApply;
     }
+    if (ui.cockpitAnneal && Object.prototype.hasOwnProperty.call(snap, "cockpitAnneal")) {
+      ui.cockpitAnneal.checked = !!snap.cockpitAnneal;
+    }
+    markCockpitStepLabel();
+    syncCockpitRangeInputs();
   }
 
   let _autosaveTimer = 0;
@@ -4543,6 +4692,62 @@
         ` • FrontOD ${Number.isFinite(realismPenaltyRes?.envelope?.frontOD) ? realismPenaltyRes.envelope.frontOD.toFixed(1) : "—"}mm` +
         ` • MaxOD ${Number.isFinite(realismPenaltyRes?.envelope?.maxOD) ? realismPenaltyRes.envelope.maxOD.toFixed(1) : "—"}mm`;
     }
+
+    const cockpitFieldDeg = Number.isFinite(sharpBadgeEval?.maxFieldDeg)
+      ? Number(sharpBadgeEval.maxFieldDeg)
+      : Number.NaN;
+    const reqFieldDeg = (Number.isFinite(efl) && efl > 1e-9)
+      ? (Math.atan((0.5 * Math.hypot(sensorW, sensorH)) / efl) * 180 / Math.PI)
+      : Number.NaN;
+    const cockpitReasons = [];
+    const bflShortMm = Number.isFinite(bfl) ? Math.max(0, Number(MERIT_CFG.bflMin || 52) - bfl) : Infinity;
+    if (phys.hardFail) cockpitReasons.push("physics");
+    if (rayCross.invalid) cockpitReasons.push("xover");
+    if (!(intrusion <= Number(COCKPIT_CFG.plIntrusionRejectMm || 0.5))) cockpitReasons.push("pl");
+    if (!(bflShortMm <= Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0))) cockpitReasons.push("bfl");
+    if (!Number.isFinite(T) || T <= 0) cockpitReasons.push("t");
+    if (!Number.isFinite(efl) || efl <= 0) cockpitReasons.push("efl");
+    const cockpitLive = {
+      feasible: {
+        ok: cockpitReasons.length === 0,
+        reasons: cockpitReasons,
+        plIntrusionMm: intrusion,
+        overlapOk: !phys.hardFail && Number(phys.worstOverlap || 0) <= 1e-4,
+        thicknessOk: !phys.hardFail && Number(phys.worstPinch || 0) <= 1e-4,
+        stopOk: findStopSurfaceIndex(lens.surfaces) >= 0,
+        validCenterFrac: clamp(1 - (vigPct / 100), 0, 1),
+        bflShortMm,
+      },
+      efl,
+      bfl,
+      T,
+      maxFieldDeg: cockpitFieldDeg,
+      fovDeg: fov,
+      coversGeom: Number.isFinite(cockpitFieldDeg) && Number.isFinite(reqFieldDeg) ? cockpitFieldDeg >= reqFieldDeg - 1e-3 : false,
+      usableIC: {
+        valid: softIcValid,
+        diameterMm: softIcValid ? icDiameterMm : 0,
+        radiusMm: softIcValid ? (icDiameterMm * 0.5) : 0,
+        thresholdRel: Number(softIc?.thresholdRel || SOFT_IC_CFG.thresholdRel || 0.35),
+      },
+      distortion: {
+        dist70Pct: Number(lutDistMetrics?.distPctAt70),
+        rmsPct: Number(lutDistMetrics?.rmsDistPct),
+        samples: Array.isArray(lutDistMetrics?.samples) ? lutDistMetrics.samples : [],
+      },
+      sharpness: {
+        rmsCenter: Number(sharpBadgeEval?.centerRmsMm),
+        rmsEdge: Number(sharpBadgeEval?.edgeRmsMm),
+        rmsByAngle: Array.isArray(sharpBadgeEval?.rmsByAngle) ? sharpBadgeEval.rmsByAngle : [],
+      },
+      context: {
+        sensorW,
+        sensorH,
+        wavePreset,
+        reqFieldDeg,
+      },
+    };
+    updateCockpitMetricsTable(cockpitLive);
 
     resizeCanvasToCSS();
     const r = canvas.getBoundingClientRect();
@@ -6182,6 +6387,15 @@
   let scratchStopRequested = false;
   let optimizerRunSerial = 0;
   let optRunContext = null;
+  let cockpitOptRunning = false;
+  let cockpitMacroRunning = false;
+  let cockpitStopRequested = false;
+  let cockpitBaselineSnapshot = null;
+  let cockpitHistory = [];
+  let cockpitHistoryIndex = -1;
+  let cockpitCompareSnapshot = null;
+  let cockpitLiveMetrics = null;
+  let cockpitLastEngineResult = null;
 
   function setOptLog(lines){
     if (!ui.optLog) return;
@@ -6211,6 +6425,324 @@
     const stepTxt = (c.stepIndex && c.stepTotal) ? ` • Step ${c.stepIndex}/${c.stepTotal}` : "";
     const labelTxt = c.label ? ` • ${c.label}` : "";
     return `${base}${modeTxt}${stepTxt}${labelTxt}`;
+  }
+
+  function setCockpitProgress(ratio, text = "") {
+    const r = clamp(Number(ratio || 0), 0, 1);
+    if (ui.cockpitProgress) ui.cockpitProgress.value = r;
+    if (ui.cockpitProgressText) {
+      ui.cockpitProgressText.textContent = text
+        ? String(text)
+        : (r <= 1e-6 ? "Idle" : `${Math.round(r * 100)}%`);
+    }
+  }
+
+  function setCockpitButtonsBusy(busy) {
+    const on = !!busy;
+    [
+      ui.btnBaselineLens,
+      ui.btnOptEfl,
+      ui.btnOptTLocal,
+      ui.btnOptICLocal,
+      ui.btnOptDistLocal,
+      ui.btnOptSharpLocal,
+      ui.btnOptAllMacro,
+      ui.btnSnapshotSave,
+      ui.btnSnapshotUndo,
+      ui.btnSnapshotRedo,
+      ui.btnSnapshotCompare,
+    ].forEach((el) => {
+      if (el) el.disabled = on;
+    });
+  }
+
+  function getCockpitSettings() {
+    const stepSize = clamp(num(ui.cockpitStep?.value, COCKPIT_CFG.defaultStepSize), 0.01, 0.20);
+    const iters = clamp(
+      Math.round(num(ui.cockpitIters?.value, num(ui.optIters?.value, COCKPIT_CFG.defaultIters))),
+      COCKPIT_CFG.minIterations,
+      COCKPIT_CFG.maxIterations
+    );
+    const strictness = String(ui.cockpitStrictness?.value || "normal").toLowerCase() === "strict"
+      ? "strict"
+      : "normal";
+    const surfaceMode = String(ui.cockpitSurfaceMode?.value || "auto").toLowerCase() === "manual"
+      ? "manual"
+      : "auto";
+    const macroPasses = clamp(
+      Math.round(num(ui.cockpitMacroPasses?.value, COCKPIT_CFG.defaultMacroPasses)),
+      1,
+      3
+    );
+    return {
+      iterations: iters,
+      stepSize,
+      strictness,
+      surfaceMode,
+      rangeStart: Math.max(1, Math.round(num(ui.cockpitSurfaceStart?.value, 1))),
+      rangeEnd: Math.max(1, Math.round(num(ui.cockpitSurfaceEnd?.value, 12))),
+      anneal: !!ui.cockpitAnneal?.checked,
+      macroPasses,
+    };
+  }
+
+  function getCockpitTargets() {
+    return {
+      targetEfl: clamp(Math.abs(num(ui.optTargetFL?.value, 50)), 5, 500),
+      targetT: Math.max(0.25, num(ui.optTargetT?.value, 2.0)),
+      targetIC: Math.max(0, num(ui.optTargetIC?.value, 0)),
+    };
+  }
+
+  function snapshotHash(snapshotObj) {
+    if (!snapshotObj) return "";
+    return JSON.stringify({
+      lens: snapshotObj?.lens?.surfaces || [],
+      focus: snapshotObj?.focus || {},
+    });
+  }
+
+  function captureCurrentCockpitSnapshot(label = "Snapshot", metricsOverride = null) {
+    const focus = getFocusStateFromUi();
+    const sensor = getSensorWH();
+    const wavePreset = ui.wavePreset?.value || "d";
+    const metrics = metricsOverride || computeMetrics({
+      surfaces: lens.surfaces,
+      wavePreset,
+      focusMode: focus.focusMode,
+      sensorX: focus.sensorX,
+      lensShift: focus.lensShift,
+      sensorW: sensor.w,
+      sensorH: sensor.h,
+      rayCount: clamp(num(ui.rayCount?.value, 21) | 0, 11, 41),
+      lutN: 240,
+      includeDistortion: true,
+      includeSharpness: true,
+      autofocus: false,
+      useCache: true,
+    });
+    const snap = {
+      label: String(label || "Snapshot"),
+      at: Date.now(),
+      lens: sanitizeLens(clone(lens)),
+      focus: {
+        focusMode: focus.focusMode,
+        sensorX: Number(focus.sensorX || 0),
+        lensShift: Number(focus.lensShift || 0),
+      },
+      metrics,
+    };
+    snap.hash = snapshotHash(snap);
+    return snap;
+  }
+
+  function pushCockpitSnapshot(snapshotObj) {
+    if (!snapshotObj?.lens?.surfaces) return false;
+    const last = cockpitHistoryIndex >= 0 ? cockpitHistory[cockpitHistoryIndex] : null;
+    if (last?.hash && snapshotObj.hash && last.hash === snapshotObj.hash) return false;
+    if (cockpitHistoryIndex < cockpitHistory.length - 1) {
+      cockpitHistory = cockpitHistory.slice(0, cockpitHistoryIndex + 1);
+    }
+    cockpitHistory.push(snapshotObj);
+    if (cockpitHistory.length > 80) cockpitHistory.shift();
+    cockpitHistoryIndex = cockpitHistory.length - 1;
+    return true;
+  }
+
+  function recordCockpitSnapshot(label = "Snapshot", metricsOverride = null) {
+    const snap = captureCurrentCockpitSnapshot(label, metricsOverride);
+    const pushed = pushCockpitSnapshot(snap);
+    updateSnapshotButtonsState();
+    return { pushed, snapshot: snap };
+  }
+
+  function applyCockpitSnapshot(snapshotObj, toastMsg = "") {
+    if (!snapshotObj?.lens?.surfaces) return false;
+    loadLens(snapshotObj.lens);
+    const f = snapshotObj.focus || {};
+    const fm = String(f.focusMode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
+    if (ui.focusMode) ui.focusMode.value = fm;
+    if (ui.sensorOffset) ui.sensorOffset.value = Number(f.sensorX || 0).toFixed(3);
+    if (ui.lensFocus) ui.lensFocus.value = Number(f.lensShift || 0).toFixed(3);
+    renderAll();
+    scheduleRenderPreviewIfAvailable();
+    scheduleAutosave();
+    if (toastMsg) toast(toastMsg);
+    return true;
+  }
+
+  function setCockpitBaselineFromCurrent(label = "Baseline") {
+    const snap = captureCurrentCockpitSnapshot(label);
+    cockpitBaselineSnapshot = snap;
+    cockpitCompareSnapshot = snap;
+    if (ui.cockpitCompareInfo) {
+      ui.cockpitCompareInfo.textContent = `Baseline: ${snap.label} (${new Date(snap.at).toLocaleTimeString()})`;
+    }
+    updateSnapshotButtonsState();
+    return snap;
+  }
+
+  function updateSnapshotButtonsState() {
+    if (ui.btnSnapshotUndo) ui.btnSnapshotUndo.disabled = cockpitOptRunning || cockpitMacroRunning || cockpitHistoryIndex <= 0;
+    if (ui.btnSnapshotRedo) ui.btnSnapshotRedo.disabled = cockpitOptRunning || cockpitMacroRunning || cockpitHistoryIndex >= cockpitHistory.length - 1;
+    if (ui.btnSnapshotCompare) ui.btnSnapshotCompare.disabled = cockpitOptRunning || cockpitMacroRunning || cockpitHistory.length <= 0;
+  }
+
+  function markCockpitStepLabel() {
+    if (!ui.cockpitStepOut || !ui.cockpitStep) return;
+    ui.cockpitStepOut.textContent = num(ui.cockpitStep.value, COCKPIT_CFG.defaultStepSize).toFixed(3);
+  }
+
+  function syncCockpitRangeInputs() {
+    const manual = String(ui.cockpitSurfaceMode?.value || "auto").toLowerCase() === "manual";
+    if (ui.cockpitSurfaceStart) ui.cockpitSurfaceStart.disabled = !manual;
+    if (ui.cockpitSurfaceEnd) ui.cockpitSurfaceEnd.disabled = !manual;
+  }
+
+  function deltaToneClass(metricKey, currentVal, baseVal, ctx = {}) {
+    const cur = Number(currentVal);
+    const base = Number(baseVal);
+    if (!Number.isFinite(cur) || !Number.isFinite(base)) return "neutral";
+    const targetEfl = Number(ctx.targetEfl);
+    const targetT = Number(ctx.targetT);
+    if (metricKey === "efl" && Number.isFinite(targetEfl) && targetEfl > 0) {
+      const cErr = Math.abs(cur - targetEfl);
+      const bErr = Math.abs(base - targetEfl);
+      return cErr < bErr - 1e-6 ? "good" : (cErr > bErr + 1e-6 ? "bad" : "neutral");
+    }
+    if (metricKey === "t" && Number.isFinite(targetT) && targetT > 0) {
+      const cSlow = Math.max(0, cur - targetT);
+      const bSlow = Math.max(0, base - targetT);
+      return cSlow < bSlow - 1e-6 ? "good" : (cSlow > bSlow + 1e-6 ? "bad" : "neutral");
+    }
+    if (metricKey === "dist" || metricKey === "sharp" || metricKey === "feas") {
+      return cur < base - 1e-6 ? "good" : (cur > base + 1e-6 ? "bad" : "neutral");
+    }
+    return cur > base + 1e-6 ? "good" : (cur < base - 1e-6 ? "bad" : "neutral");
+  }
+
+  function setCockpitDelta(el, text, tone = "neutral") {
+    if (!el) return;
+    el.textContent = String(text || "—");
+    el.classList.remove("good", "bad", "neutral");
+    el.classList.add(tone === "good" ? "good" : (tone === "bad" ? "bad" : "neutral"));
+  }
+
+  function updateCockpitMetricsTable(metricsObj) {
+    if (!metricsObj || typeof metricsObj !== "object") return;
+    cockpitLiveMetrics = metricsObj;
+    const targetEfl = num(ui.optTargetFL?.value, NaN);
+    const targetT = num(ui.optTargetT?.value, NaN);
+    const base = cockpitCompareSnapshot?.metrics || cockpitBaselineSnapshot?.metrics || null;
+
+    const efl = Number(metricsObj?.efl);
+    const bfl = Number(metricsObj?.bfl);
+    const t = Number(metricsObj?.T);
+    const cov = Number(metricsObj?.maxFieldDeg);
+    const covYes = !!metricsObj?.coversGeom;
+    const ic = Number(metricsObj?.usableIC?.diameterMm);
+    const d70 = Number(metricsObj?.distortion?.dist70Pct);
+    const drms = Number(metricsObj?.distortion?.rmsPct);
+    const sc = Number(metricsObj?.sharpness?.rmsCenter);
+    const se = Number(metricsObj?.sharpness?.rmsEdge);
+    const feasOk = !!metricsObj?.feasible?.ok;
+    const intr = Number(metricsObj?.feasible?.plIntrusionMm);
+    const reasons = Array.isArray(metricsObj?.feasible?.reasons) ? metricsObj.feasible.reasons : [];
+
+    if (ui.cockpitValEfl) ui.cockpitValEfl.textContent = Number.isFinite(efl) ? `${efl.toFixed(2)} mm` : "—";
+    if (ui.cockpitValBfl) ui.cockpitValBfl.textContent = Number.isFinite(bfl) ? `${bfl.toFixed(2)} mm` : "—";
+    if (ui.cockpitValT) ui.cockpitValT.textContent = Number.isFinite(t) ? `T${t.toFixed(2)}` : "—";
+    if (ui.cockpitValCov) ui.cockpitValCov.textContent = Number.isFinite(cov) ? `${cov.toFixed(2)}° • COV ${covYes ? "YES" : "NO"}` : "—";
+    if (ui.cockpitValIc) ui.cockpitValIc.textContent = Number.isFinite(ic) ? `Ø${ic.toFixed(2)} mm` : "—";
+    if (ui.cockpitValDist) {
+      ui.cockpitValDist.textContent =
+        `${Number.isFinite(d70) ? d70.toFixed(2) : "—"}% @0.7D • RMS ${Number.isFinite(drms) ? drms.toFixed(2) : "—"}%`;
+    }
+    if (ui.cockpitValSharp) {
+      ui.cockpitValSharp.textContent =
+        `C/E ${Number.isFinite(sc) ? sc.toFixed(3) : "—"} / ${Number.isFinite(se) ? se.toFixed(3) : "—"} mm`;
+    }
+    if (ui.cockpitValFeas) {
+      ui.cockpitValFeas.textContent = feasOk
+        ? `OK • intr ${Number.isFinite(intr) ? intr.toFixed(2) : "—"}mm`
+        : `FAIL • intr ${Number.isFinite(intr) ? intr.toFixed(2) : "—"}mm${reasons.length ? ` • ${reasons.join(",")}` : ""}`;
+    }
+
+    if (!base) {
+      [
+        ui.cockpitDeltaEfl,
+        ui.cockpitDeltaBfl,
+        ui.cockpitDeltaT,
+        ui.cockpitDeltaCov,
+        ui.cockpitDeltaIc,
+        ui.cockpitDeltaDist,
+        ui.cockpitDeltaSharp,
+        ui.cockpitDeltaFeas,
+      ].forEach((el) => setCockpitDelta(el, "—", "neutral"));
+      if (ui.cockpitCompareInfo && !cockpitCompareSnapshot) ui.cockpitCompareInfo.textContent = "No baseline yet";
+      updateSnapshotButtonsState();
+      return;
+    }
+
+    const bEfl = Number(base?.efl);
+    const bBfl = Number(base?.bfl);
+    const bT = Number(base?.T);
+    const bCov = Number(base?.maxFieldDeg);
+    const bIc = Number(base?.usableIC?.diameterMm);
+    const bD = Number(base?.distortion?.rmsPct);
+    const bSc = Number(base?.sharpness?.rmsCenter);
+    const bSe = Number(base?.sharpness?.rmsEdge);
+    const bFeas = !!base?.feasible?.ok;
+    const bIntr = Number(base?.feasible?.plIntrusionMm);
+
+    const ctx = { targetEfl, targetT };
+    setCockpitDelta(
+      ui.cockpitDeltaEfl,
+      (Number.isFinite(efl) && Number.isFinite(bEfl)) ? `${(efl - bEfl) >= 0 ? "+" : ""}${(efl - bEfl).toFixed(2)} mm` : "—",
+      deltaToneClass("efl", efl, bEfl, ctx)
+    );
+    setCockpitDelta(
+      ui.cockpitDeltaBfl,
+      (Number.isFinite(bfl) && Number.isFinite(bBfl)) ? `${(bfl - bBfl) >= 0 ? "+" : ""}${(bfl - bBfl).toFixed(2)} mm` : "—",
+      deltaToneClass("bfl", bfl, bBfl, ctx)
+    );
+    setCockpitDelta(
+      ui.cockpitDeltaT,
+      (Number.isFinite(t) && Number.isFinite(bT)) ? `${(t - bT) >= 0 ? "+" : ""}${(t - bT).toFixed(2)}` : "—",
+      deltaToneClass("t", t, bT, ctx)
+    );
+    setCockpitDelta(
+      ui.cockpitDeltaCov,
+      (Number.isFinite(cov) && Number.isFinite(bCov)) ? `${(cov - bCov) >= 0 ? "+" : ""}${(cov - bCov).toFixed(2)}°` : "—",
+      deltaToneClass("cov", cov, bCov, ctx)
+    );
+    setCockpitDelta(
+      ui.cockpitDeltaIc,
+      (Number.isFinite(ic) && Number.isFinite(bIc)) ? `${(ic - bIc) >= 0 ? "+" : ""}${(ic - bIc).toFixed(2)} mm` : "—",
+      deltaToneClass("ic", ic, bIc, ctx)
+    );
+    setCockpitDelta(
+      ui.cockpitDeltaDist,
+      (Number.isFinite(drms) && Number.isFinite(bD)) ? `${(drms - bD) >= 0 ? "+" : ""}${(drms - bD).toFixed(2)}%` : "—",
+      deltaToneClass("dist", Math.abs(drms), Math.abs(bD), ctx)
+    );
+    const sCur = Number.isFinite(sc) && Number.isFinite(se) ? (0.40 * sc + 0.60 * se) : NaN;
+    const sBase = Number.isFinite(bSc) && Number.isFinite(bSe) ? (0.40 * bSc + 0.60 * bSe) : NaN;
+    setCockpitDelta(
+      ui.cockpitDeltaSharp,
+      (Number.isFinite(sCur) && Number.isFinite(sBase)) ? `${(sCur - sBase) >= 0 ? "+" : ""}${(sCur - sBase).toFixed(3)} mm` : "—",
+      deltaToneClass("sharp", sCur, sBase, ctx)
+    );
+    const feasScore = (feasOk ? 0 : 1) + Math.max(0, intr);
+    const bFeasScore = (bFeas ? 0 : 1) + Math.max(0, bIntr);
+    setCockpitDelta(
+      ui.cockpitDeltaFeas,
+      (Number.isFinite(intr) && Number.isFinite(bIntr))
+        ? `${(intr - bIntr) >= 0 ? "+" : ""}${(intr - bIntr).toFixed(2)} mm`
+        : "—",
+      deltaToneClass("feas", feasScore, bFeasScore, ctx)
+    );
+    updateSnapshotButtonsState();
   }
 
   function postOptAutoApplyEnabled() {
@@ -6292,6 +6824,7 @@
     if (optRunning || distOptRunning || sharpOptRunning || scratchBuildRunning) {
       return toast("Stop running optimizer/build first.");
     }
+    recordCockpitSnapshot("Dist pre-apply");
     loadLens(distOptBest.lens);
     const m = distOptBest.meta || {};
     const fm = String(m.focusMode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
@@ -6305,6 +6838,7 @@
     renderAll();
     scheduleRenderPreviewIfAvailable();
     scheduleAutosave();
+    recordCockpitSnapshot("Dist applied");
     const d70 = Number(distOptBest?.state?.dist70Pct);
     toast(`Applied Dist best${Number.isFinite(d70) ? ` (@0.7D ${d70.toFixed(2)}%)` : ""}`);
   }
@@ -6338,6 +6872,7 @@
     if (optRunning || distOptRunning || sharpOptRunning || scratchBuildRunning) {
       return toast("Stop running optimizer/build first.");
     }
+    recordCockpitSnapshot("Sharp pre-apply");
     loadLens(sharpOptBest.lens);
     const m = sharpOptBest.meta || {};
     const fm = String(m.focusMode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
@@ -6351,9 +6886,996 @@
     renderAll();
     scheduleRenderPreviewIfAvailable();
     scheduleAutosave();
+    recordCockpitSnapshot("Sharp applied");
     const c = Number(sharpOptBest?.state?.centerRmsMm);
     const e = Number(sharpOptBest?.state?.edgeRmsMm);
     toast(`Applied Sharp best${Number.isFinite(c) && Number.isFinite(e) ? ` (C/E ${c.toFixed(3)}/${e.toFixed(3)}mm)` : ""}`);
+  }
+
+  function cockpitResolveSurfaceIndices(surfaces, settings, preferRear = false) {
+    const n = Math.max(0, Number(surfaces?.length || 0));
+    if (n < 3) return [];
+    let start = 1;
+    let end = n - 2;
+    if (String(settings?.surfaceMode || "auto").toLowerCase() === "manual") {
+      start = clamp(Math.round(Number(settings?.rangeStart || 1)), 1, n - 2);
+      end = clamp(Math.round(Number(settings?.rangeEnd || (n - 2))), 1, n - 2);
+      if (end < start) [start, end] = [end, start];
+    } else {
+      const stopIdx = findStopSurfaceIndex(surfaces);
+      if (stopIdx >= 0) {
+        start = Math.max(1, stopIdx - 6);
+        end = Math.min(n - 2, Math.max(stopIdx + 8, n - 8));
+      }
+    }
+    const idx = [];
+    for (let i = start; i <= end; i++) {
+      const s = surfaces[i];
+      if (!s || surfaceIsLocked(s)) continue;
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      idx.push(i);
+    }
+    if (!preferRear) return idx;
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    const rear = idx.filter((i) => i > stopIdx);
+    return rear.length ? rear : idx;
+  }
+
+  function cockpitScaleLensByFactor(surfaces, k) {
+    const kk = Number(k);
+    if (!Array.isArray(surfaces) || !(Number.isFinite(kk) && kk > 0)) return false;
+    const rearIdx = findScratchRearSurfaceIndex(surfaces);
+    const apScale = Math.sqrt(Math.max(1e-6, kk));
+    for (let i = 0; i < surfaces.length; i++) {
+      const s = surfaces[i];
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      s.R = Number(s.R || 0) * kk;
+      if (i === rearIdx) {
+        s.t = Math.max(PHYS_CFG.minAirGap, Number(s.t || 0));
+        s.glass = "AIR";
+      } else {
+        s.t = clamp(Number(s.t || 0) * kk, PHYS_CFG.minThickness, PHYS_CFG.maxThickness);
+      }
+      s.ap = clamp(Number(s.ap || 0) * apScale, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+      enforceApertureRadiusCoupling(s, 1.08);
+    }
+    enforceRearMountStart(surfaces);
+    quickSanity(surfaces);
+    return true;
+  }
+
+  function mutateEflCandidate(lensObj, ctx = {}) {
+    const surfaces = lensObj?.surfaces;
+    if (!Array.isArray(surfaces)) return { ok: false, reason: "lens" };
+    const curEfl = Number(ctx?.currentMetrics?.efl);
+    const targetEfl = Number(ctx?.targets?.targetEfl);
+    if (!(Number.isFinite(curEfl) && curEfl > 1e-6 && Number.isFinite(targetEfl) && targetEfl > 1e-6)) {
+      return { ok: false, reason: "efl" };
+    }
+    const step = clamp(Number(ctx?.settings?.stepSize || COCKPIT_CFG.defaultStepSize), 0.01, 0.20);
+    const kGoal = targetEfl / curEfl;
+    const blend = randRange(0.40, 1.00);
+    let k = 1 + (kGoal - 1) * blend;
+    k = clamp(k, 1 - step, 1 + step);
+    if (!(Number.isFinite(k) && k > 0)) return { ok: false, reason: "scale" };
+    cockpitScaleLensByFactor(surfaces, k);
+    return { ok: true, kind: "scale", scale: k };
+  }
+
+  function mutateTCandidate(lensObj, ctx = {}) {
+    const surfaces = lensObj?.surfaces;
+    if (!Array.isArray(surfaces)) return { ok: false, reason: "lens" };
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 0) return { ok: false, reason: "stop" };
+    const stop = surfaces[stopIdx];
+    const step = clamp(Number(ctx?.settings?.stepSize || COCKPIT_CFG.defaultStepSize), 0.01, 0.20);
+    const curT = Number(ctx?.currentMetrics?.T);
+    const tgtT = Number(ctx?.targets?.targetT);
+    let dir = 1;
+    if (Number.isFinite(curT) && Number.isFinite(tgtT)) {
+      if (curT < tgtT * 0.80) dir = -1;
+      else if (curT > tgtT) dir = 1;
+      else dir = Math.random() < 0.75 ? 1 : -1;
+    }
+    const pct = randRange(Math.max(0.002, step * 0.05), Math.max(0.006, step * 0.35));
+    const factor = 1 + dir * pct;
+    stop.ap = clamp(Number(stop.ap || 0) * factor, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+    for (let d = 1; d <= 2; d++) {
+      const idx = stopIdx + d;
+      if (idx <= 0 || idx >= surfaces.length - 1) continue;
+      const s = surfaces[idx];
+      if (!s || surfaceIsLocked(s)) continue;
+      if (dir > 0) {
+        const floor = Number(stop.ap || 0) * (0.88 - d * 0.12);
+        if (Number(s.ap || 0) < floor) s.ap = clamp(floor, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+      }
+      enforceApertureRadiusCoupling(s, 1.08);
+    }
+    quickSanity(surfaces);
+    return { ok: true, kind: "stop_ap", factor };
+  }
+
+  function mutateIcCandidate(lensObj, ctx = {}) {
+    const surfaces = lensObj?.surfaces;
+    if (!Array.isArray(surfaces)) return { ok: false, reason: "lens" };
+    const settings = ctx?.settings || {};
+    const step = clamp(Number(settings.stepSize || COCKPIT_CFG.defaultStepSize), 0.01, 0.20);
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 0) return { ok: false, reason: "stop" };
+    const idxAll = cockpitResolveSurfaceIndices(surfaces, settings, false);
+    const idxRear = cockpitResolveSurfaceIndices(surfaces, settings, true);
+    if (!idxAll.length) return { ok: false, reason: "range" };
+
+    const airCandidates = idxRear.filter((i) => {
+      const s = surfaces[i];
+      if (!s || surfaceIsLocked(s)) return false;
+      const mediumAfter = String(resolveGlassName(s?.glass || "AIR")).toUpperCase();
+      return mediumAfter === "AIR";
+    });
+    const apCandidates = idxRear.length ? idxRear : idxAll;
+    const bendCandidates = idxAll.filter((i) => {
+      const s = surfaces[i];
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "STOP" || t === "OBJ" || t === "IMS") return false;
+      return Math.abs(Number(s?.R || 0)) > 1e-6;
+    });
+
+    const r = Math.random();
+    if (r < 0.42 && airCandidates.length) {
+      const idx = pick(airCandidates);
+      const s = surfaces[idx];
+      const baseDelta = clamp(0.05 + step * 1.1, 0.05, 0.80);
+      const needIc = Number(ctx?.targets?.targetIC || 0) > Number(ctx?.currentMetrics?.usableIC?.diameterMm || 0);
+      const delta = needIc
+        ? randRange(0.03, baseDelta)
+        : randRange(-baseDelta, baseDelta);
+      s.t = clamp(Number(s.t || 0) + delta, PHYS_CFG.minAirGap, 24);
+      quickSanity(surfaces);
+      return { ok: true, kind: "air_gap", idx };
+    }
+
+    if (r < 0.78 && apCandidates.length) {
+      const idx = pick(apCandidates);
+      const s = surfaces[idx];
+      const gain = 1 + randRange(0.004, Math.max(0.01, step * 0.65));
+      s.ap = clamp(Number(s.ap || 0) * gain, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+      enforceApertureRadiusCoupling(s, 1.08);
+      quickSanity(surfaces);
+      return { ok: true, kind: "aperture", idx };
+    }
+
+    if (bendCandidates.length) {
+      const idx = pick(bendCandidates);
+      const s = surfaces[idx];
+      const R0 = Number(s?.R || 0);
+      const sign = Math.sign(R0 || 1) || 1;
+      const absR = Math.max(PHYS_CFG.minRadius, Math.abs(R0));
+      const frac = randRange(0.002, Math.max(0.004, step * 0.20));
+      const delta = Math.random() < 0.5 ? -frac : frac;
+      s.R = sign * clamp(absR * (1 + delta), PHYS_CFG.minRadius, 650);
+      enforceApertureRadiusCoupling(s, 1.08);
+      quickSanity(surfaces);
+      return { ok: true, kind: "bend", idx };
+    }
+
+    return { ok: false, reason: "mut" };
+  }
+
+  function cockpitSummaryToast(label, before, after) {
+    const bEfl = Number(before?.efl);
+    const aEfl = Number(after?.efl);
+    const bT = Number(before?.T);
+    const aT = Number(after?.T);
+    const bIc = Number(before?.usableIC?.diameterMm);
+    const aIc = Number(after?.usableIC?.diameterMm);
+    const bDr = Number(before?.distortion?.rmsPct);
+    const aDr = Number(after?.distortion?.rmsPct);
+    const bSe = Number(before?.sharpness?.rmsEdge);
+    const aSe = Number(after?.sharpness?.rmsEdge);
+    return `${label}: ` +
+      `Dist ${Number.isFinite(bDr) ? bDr.toFixed(2) : "—"}%→${Number.isFinite(aDr) ? aDr.toFixed(2) : "—"}% | ` +
+      `EFL drift ${Number.isFinite(aEfl) && Number.isFinite(bEfl) ? ((aEfl - bEfl) >= 0 ? "+" : "") + (aEfl - bEfl).toFixed(2) : "—"}mm | ` +
+      `T ${Number.isFinite(bT) ? bT.toFixed(2) : "—"}→${Number.isFinite(aT) ? aT.toFixed(2) : "—"} | ` +
+      `IC ${Number.isFinite(bIc) ? bIc.toFixed(1) : "—"}→${Number.isFinite(aIc) ? aIc.toFixed(1) : "—"}mm | ` +
+      `SharpE ${Number.isFinite(bSe) ? bSe.toFixed(3) : "—"}→${Number.isFinite(aSe) ? aSe.toFixed(3) : "—"}mm`;
+  }
+
+  async function runCockpitOptimizerEngine({
+    label = "Local Optimizer",
+    objectiveFn = null,
+    mutateFn = null,
+    guardFn = null,
+    iterations = null,
+    includeUsableIC = true,
+    includeDistortion = true,
+    includeSharpness = true,
+    autofocusCandidates = false,
+    rayCount = null,
+    lutN = null,
+    anneal = null,
+    applyBestNow = true,
+    nested = false,
+    runContext = null,
+    silent = false,
+  } = {}) {
+    if (!nested) {
+      if (cockpitOptRunning || cockpitMacroRunning) return null;
+      if (optRunning || scratchBuildRunning || distOptRunning || sharpOptRunning) {
+        toast("Stop other optimizer/build runs first.");
+        return null;
+      }
+    }
+    if (typeof objectiveFn !== "function" || typeof mutateFn !== "function") return null;
+
+    const settings = getCockpitSettings();
+    const targets = getCockpitTargets();
+    const sensor = getSensorWH();
+    const focus = getFocusStateFromUi();
+    const wavePreset = ui.wavePreset?.value || "d";
+    const iters = clamp(
+      Math.round(Number(iterations ?? settings.iterations)),
+      COCKPIT_CFG.minIterations,
+      COCKPIT_CFG.maxIterations
+    );
+    const useAnneal = anneal == null ? !!settings.anneal : !!anneal;
+    const evalRayCount = clamp(Number(rayCount ?? num(ui.rayCount?.value, COCKPIT_CFG.defaultRayCount)) | 0, 11, 41);
+    const evalLutN = clamp(Number(lutN ?? COCKPIT_CFG.defaultLutN) | 0, 120, 900);
+    const runNo = ++optimizerRunSerial;
+    const prevCtx = optRunContext;
+    const ctxObj = runContext && typeof runContext === "object"
+      ? {
+          mode: runContext.mode || label,
+          label: runContext.label || "local tune",
+          stepIndex: runContext.stepIndex,
+          stepTotal: runContext.stepTotal,
+        }
+      : { mode: label, label: "local tune" };
+    setOptRunContext(ctxObj);
+    const runHeader = formatOptimizerRunHeader(runNo);
+
+    if (!nested) {
+      cockpitOptRunning = true;
+      cockpitStopRequested = false;
+      setCockpitButtonsBusy(true);
+      setCockpitProgress(0, `${label} • init`);
+    }
+
+    try {
+      const baseLens = sanitizeLens(clone(lens));
+      const baseMetrics = computeMetrics({
+        surfaces: baseLens.surfaces,
+        wavePreset,
+        focusMode: focus.focusMode,
+        sensorX: focus.sensorX,
+        lensShift: focus.lensShift,
+        sensorW: sensor.w,
+        sensorH: sensor.h,
+        objDist: COCKPIT_CFG.defaultObjDistMm,
+        rayCount: evalRayCount,
+        lutN: evalLutN,
+        includeUsableIC,
+        includeDistortion,
+        includeSharpness,
+        autofocus: false,
+        useCache: false,
+      });
+      if (!nested) recordCockpitSnapshot(`${label} • start`, baseMetrics);
+      const hardBase = failsHardConstraints(baseLens.surfaces, baseMetrics, { strictness: settings.strictness });
+      if (hardBase.fail) {
+        setOptLog(
+          `${runHeader}\n` +
+          `failed: baseline violates hard constraints (${hardBase.reasons.join(", ")})\n` +
+          `No changes applied.`
+        );
+        if (!silent) toast(`${label} aborted: baseline invalid`);
+        return { ok: false, reason: "baseline", hard: hardBase, before: baseMetrics, after: baseMetrics };
+      }
+
+      let curLens = clone(baseLens);
+      let curFocus = { ...focus };
+      let curMetrics = baseMetrics;
+
+      const baseGuard = (typeof guardFn === "function")
+        ? (guardFn(baseMetrics, baseMetrics, { targets, settings }) || {})
+        : {};
+      const basePenalty = Number(baseGuard?.penalty || 0);
+      const baseMerit = Number(objectiveFn(baseMetrics, baseMetrics, { targets, settings })) + basePenalty;
+      let curMerit = baseMerit;
+
+      let bestLens = clone(curLens);
+      let bestFocus = { ...curFocus };
+      let bestMetrics = baseMetrics;
+      let bestMerit = baseMerit;
+      let bestIter = 0;
+
+      const rejects = { mut: 0, hard: 0, guard: 0 };
+      const batch = Math.max(20, Number(COCKPIT_CFG.progressBatch || 60) | 0);
+      const t0 = performance.now();
+
+      setOptLog(
+        `${runHeader}\n` +
+        `running… 0/${iters}\n` +
+        `objective ${label}\n` +
+        `baseline EFL ${Number(baseMetrics?.efl).toFixed(2)}mm • T ${Number(baseMetrics?.T).toFixed(2)} • field ${Number(baseMetrics?.maxFieldDeg).toFixed(2)}° • IC ${Number(baseMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm\n` +
+        `baseline Dist@0.7 ${Number.isFinite(baseMetrics?.distortion?.dist70Pct) ? Number(baseMetrics.distortion.dist70Pct).toFixed(2) : "—"}% • RMS ${Number.isFinite(baseMetrics?.distortion?.rmsPct) ? Number(baseMetrics.distortion.rmsPct).toFixed(2) : "—"}%`
+      );
+
+      let itersRan = 0;
+      for (let i = 1; i <= iters; i++) {
+        if ((!nested && (!cockpitOptRunning || cockpitStopRequested)) || (nested && cockpitStopRequested)) break;
+        itersRan = i;
+
+        const alpha = i / iters;
+        const temp = useAnneal ? (0.8 * (1 - alpha) + 0.12 * alpha) : 0;
+        const useBestParent = Math.random() < 0.62;
+        const parentLens = useBestParent ? bestLens : curLens;
+        const parentFocus = useBestParent ? bestFocus : curFocus;
+        const parentMetrics = useBestParent ? bestMetrics : curMetrics;
+
+        const candLens = clone(parentLens);
+        let candFocus = { ...parentFocus };
+        const mut = mutateFn(candLens, {
+          iter: i,
+          iterations: iters,
+          settings,
+          targets,
+          baselineMetrics: baseMetrics,
+          currentMetrics: parentMetrics,
+          bestMetrics,
+          focus: candFocus,
+          wavePreset,
+        }) || { ok: false, reason: "mut" };
+        if (!mut.ok) {
+          rejects.mut++;
+          continue;
+        }
+        if (mut.focus && typeof mut.focus === "object") {
+          candFocus = {
+            focusMode: String(mut.focus.focusMode || candFocus.focusMode || focus.focusMode),
+            sensorX: Number(mut.focus.sensorX ?? candFocus.sensorX ?? 0),
+            lensShift: Number(mut.focus.lensShift ?? candFocus.lensShift ?? 0),
+          };
+        }
+
+        const candMetrics = computeMetrics({
+          surfaces: candLens.surfaces,
+          wavePreset,
+          focusMode: candFocus.focusMode,
+          sensorX: candFocus.sensorX,
+          lensShift: candFocus.lensShift,
+          sensorW: sensor.w,
+          sensorH: sensor.h,
+          objDist: COCKPIT_CFG.defaultObjDistMm,
+          rayCount: evalRayCount,
+          lutN: evalLutN,
+          includeUsableIC,
+          includeDistortion,
+          includeSharpness,
+          autofocus: !!autofocusCandidates,
+          autofocusOptions: SHARP_OPT_CFG.autofocus,
+          useCache: false,
+        });
+        if (autofocusCandidates && candMetrics?.focus) {
+          candFocus = {
+            focusMode: candFocus.focusMode,
+            sensorX: Number(candMetrics.focus.sensorX || candFocus.sensorX || 0),
+            lensShift: Number(candMetrics.focus.lensShift || candFocus.lensShift || 0),
+          };
+        }
+
+        const hard = failsHardConstraints(candLens.surfaces, candMetrics, { strictness: settings.strictness });
+        if (hard.fail) {
+          rejects.hard++;
+          continue;
+        }
+        const g = (typeof guardFn === "function")
+          ? (guardFn(candMetrics, baseMetrics, { targets, settings, iter: i }) || {})
+          : {};
+        if (g?.reject) {
+          rejects.guard++;
+          continue;
+        }
+        const penalty = Number(g?.penalty || 0);
+        const merit = Number(objectiveFn(candMetrics, baseMetrics, { targets, settings, iter: i })) + penalty;
+        if (!Number.isFinite(merit)) {
+          rejects.guard++;
+          continue;
+        }
+
+        let accept = merit < curMerit;
+        if (!accept && useAnneal) {
+          const uphill = merit - curMerit;
+          const pAcc = Math.exp(-uphill / Math.max(1e-6, temp));
+          accept = Math.random() < pAcc;
+        }
+        if (accept) {
+          curLens = candLens;
+          curFocus = candFocus;
+          curMetrics = candMetrics;
+          curMerit = merit;
+        }
+
+        if (merit + 1e-9 < bestMerit) {
+          bestLens = clone(candLens);
+          bestFocus = { ...candFocus };
+          bestMetrics = candMetrics;
+          bestMerit = merit;
+          bestIter = i;
+        }
+
+        if (i % batch === 0) {
+          const dt = Math.max(1e-6, (performance.now() - t0) / 1000);
+          const ips = i / dt;
+          setOptLog(
+            `${runHeader}\n` +
+            `running… ${i}/${iters} (${ips.toFixed(1)} it/s)\n` +
+            `current merit ${curMerit.toFixed(4)} • best merit ${bestMerit.toFixed(4)} @${bestIter}\n` +
+            `base EFL ${Number(baseMetrics?.efl).toFixed(2)}mm • T ${Number(baseMetrics?.T).toFixed(2)} • IC ${Number(baseMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm\n` +
+            `best EFL ${Number(bestMetrics?.efl).toFixed(2)}mm • T ${Number(bestMetrics?.T).toFixed(2)} • IC ${Number(bestMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm • field ${Number(bestMetrics?.maxFieldDeg).toFixed(2)}°\n` +
+            `best Dist@0.7 ${Number.isFinite(bestMetrics?.distortion?.dist70Pct) ? Number(bestMetrics.distortion.dist70Pct).toFixed(2) : "—"}% • RMS ${Number.isFinite(bestMetrics?.distortion?.rmsPct) ? Number(bestMetrics.distortion.rmsPct).toFixed(2) : "—"}%\n` +
+            `rejects mut ${rejects.mut} • hard ${rejects.hard} • guard ${rejects.guard}`
+          );
+          if (!nested) setCockpitProgress(i / iters, `${label} • ${i}/${iters}`);
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+
+      const improved = Number.isFinite(bestMerit) && Number.isFinite(baseMerit) && (bestMerit + 1e-9 < baseMerit);
+      let applied = false;
+      if (improved && applyBestNow) {
+        recordCockpitSnapshot(`${label} • pre-apply`);
+        loadLens(bestLens);
+        const fm = String(bestFocus?.focusMode || focus.focusMode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
+        if (ui.focusMode) ui.focusMode.value = fm;
+        if (ui.sensorOffset) ui.sensorOffset.value = Number(bestFocus?.sensorX || 0).toFixed(3);
+        if (ui.lensFocus) ui.lensFocus.value = Number(bestFocus?.lensShift || 0).toFixed(3);
+        renderAll();
+        scheduleRenderPreviewIfAvailable();
+        scheduleAutosave();
+        recordCockpitSnapshot(`${label} • applied`);
+        applied = true;
+      }
+      const afterMetrics = improved ? bestMetrics : baseMetrics;
+      cockpitLastEngineResult = {
+        label,
+        improved,
+        applied,
+        bestIter,
+        iters,
+        before: baseMetrics,
+        after: afterMetrics,
+        bestLens: improved ? bestLens : baseLens,
+        bestFocus: improved ? bestFocus : focus,
+        bestMerit,
+        baseMerit,
+      };
+
+      setOptLog(
+        `${runHeader}\n` +
+        `${cockpitStopRequested ? "stopped" : "done"} ${itersRan}/${iters}\n` +
+        `best iteration ${bestIter > 0 ? `${bestIter}/${iters}` : "baseline (0)"}\n` +
+        `${improved ? (applied ? "APPLIED ✅" : "improved (not applied)") : "no better candidate"}\n` +
+        `before EFL ${Number(baseMetrics?.efl).toFixed(2)}mm • T ${Number(baseMetrics?.T).toFixed(2)} • IC ${Number(baseMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm • DistRMS ${Number.isFinite(baseMetrics?.distortion?.rmsPct) ? Number(baseMetrics.distortion.rmsPct).toFixed(2) : "—"}%\n` +
+        `after  EFL ${Number(afterMetrics?.efl).toFixed(2)}mm • T ${Number(afterMetrics?.T).toFixed(2)} • IC ${Number(afterMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm • DistRMS ${Number.isFinite(afterMetrics?.distortion?.rmsPct) ? Number(afterMetrics.distortion.rmsPct).toFixed(2) : "—"}%\n` +
+        `rejects mut ${rejects.mut} • hard ${rejects.hard} • guard ${rejects.guard}`
+      );
+      if (!nested) setCockpitProgress(1, `${label} • done`);
+      if (!silent) toast(cockpitSummaryToast(label, baseMetrics, afterMetrics));
+      return { ok: true, improved, applied, before: baseMetrics, after: afterMetrics, bestIter, iters };
+    } finally {
+      if (!nested) {
+        cockpitOptRunning = false;
+        setCockpitButtonsBusy(false);
+        setTimeout(() => {
+          if (!cockpitOptRunning && !cockpitMacroRunning && !optRunning && !distOptRunning && !sharpOptRunning) {
+            setCockpitProgress(0, "Idle");
+          }
+        }, 450);
+      }
+      setOptRunContext(prevCtx);
+      updateSnapshotButtonsState();
+      scheduleRenderAll();
+    }
+  }
+
+  async function runOptimizeEflLocal(opts = {}) {
+    const settings = getCockpitSettings();
+    const targets = getCockpitTargets();
+    const covTol = settings.strictness === "strict"
+      ? COCKPIT_CFG.maxCoverageDropStrictDeg
+      : COCKPIT_CFG.maxCoverageDropNormalDeg;
+    return runCockpitOptimizerEngine({
+      label: "Optimize EFL",
+      objectiveFn: (m) => {
+        const eflErr = Number.isFinite(m?.efl) ? (Number(m.efl) - targets.targetEfl) : 999;
+        return eflErr * eflErr;
+      },
+      mutateFn: mutateEflCandidate,
+      guardFn: (m, b) => {
+        const covDrop = Math.max(0, Number(b?.maxFieldDeg || 0) - Number(m?.maxFieldDeg || 0));
+        if (covDrop > covTol) return { reject: true };
+        return { reject: false, penalty: 6.0 * covDrop * covDrop };
+      },
+      iterations: Number(opts?.iterations || settings.iterations),
+      includeUsableIC: false,
+      includeDistortion: false,
+      includeSharpness: false,
+      autofocusCandidates: false,
+      anneal: opts?.anneal,
+      nested: !!opts?.nested,
+      runContext: opts?.runContext || null,
+      silent: !!opts?.silent,
+    });
+  }
+
+  async function runOptimizeTLocal(opts = {}) {
+    const settings = getCockpitSettings();
+    const targets = getCockpitTargets();
+    const eflTol = settings.strictness === "strict"
+      ? COCKPIT_CFG.maxEflDriftStrictMm
+      : COCKPIT_CFG.maxEflDriftNormalMm;
+    const covTol = settings.strictness === "strict"
+      ? COCKPIT_CFG.maxCoverageDropStrictDeg
+      : COCKPIT_CFG.maxCoverageDropNormalDeg;
+    return runCockpitOptimizerEngine({
+      label: "Optimize T",
+      objectiveFn: (m) => {
+        const tNow = Number(m?.T);
+        const slow = Number.isFinite(tNow) ? Math.max(0, tNow - targets.targetT) : 99;
+        return slow * slow;
+      },
+      mutateFn: mutateTCandidate,
+      guardFn: (m, b) => {
+        const eflDrift = Math.abs(Number(m?.efl || 0) - Number(b?.efl || 0));
+        const covDrop = Math.max(0, Number(b?.maxFieldDeg || 0) - Number(m?.maxFieldDeg || 0));
+        if (eflDrift > eflTol || covDrop > covTol) return { reject: true };
+        return { reject: false, penalty: 3.0 * eflDrift * eflDrift + 6.0 * covDrop * covDrop };
+      },
+      iterations: Number(opts?.iterations || settings.iterations),
+      includeUsableIC: false,
+      includeDistortion: false,
+      includeSharpness: false,
+      autofocusCandidates: false,
+      anneal: opts?.anneal,
+      nested: !!opts?.nested,
+      runContext: opts?.runContext || null,
+      silent: !!opts?.silent,
+    });
+  }
+
+  async function runOptimizeImageCircleLocal(opts = {}) {
+    const settings = getCockpitSettings();
+    const targets = getCockpitTargets();
+    const sensor = getSensorWH();
+    const icGoal = Math.max(Number(targets.targetIC || 0), Math.hypot(sensor.w, sensor.h));
+    const eflTol = settings.strictness === "strict"
+      ? COCKPIT_CFG.maxEflDriftStrictMm
+      : COCKPIT_CFG.maxEflDriftNormalMm;
+    const tTol = settings.strictness === "strict"
+      ? COCKPIT_CFG.maxTDriftStrict
+      : COCKPIT_CFG.maxTDriftNormal;
+    const distTol = settings.strictness === "strict"
+      ? COCKPIT_CFG.maxDistWorsenStrictPct
+      : COCKPIT_CFG.maxDistWorsenNormalPct;
+    return runCockpitOptimizerEngine({
+      label: "Optimize Image Circle",
+      objectiveFn: (m) => {
+        const icNow = Number(m?.usableIC?.diameterMm || 0);
+        const icShort = Math.max(0, icGoal - icNow);
+        const reqField = Number(m?.context?.reqFieldDeg || 0);
+        const covShort = Math.max(0, reqField - Number(m?.maxFieldDeg || 0));
+        return icShort * icShort * 10.0 + covShort * covShort * 5.0 - 0.03 * Math.max(0, icNow);
+      },
+      mutateFn: mutateIcCandidate,
+      guardFn: (m, b) => {
+        const eflDrift = Math.abs(Number(m?.efl || 0) - Number(b?.efl || 0));
+        const tDrift = Math.abs(Number(m?.T || 0) - Number(b?.T || 0));
+        const distWorse = Math.max(0, Math.abs(Number(m?.distortion?.dist70Pct || 0)) - Math.abs(Number(b?.distortion?.dist70Pct || 0)));
+        if (eflDrift > eflTol || tDrift > tTol || distWorse > distTol) return { reject: true };
+        return {
+          reject: false,
+          penalty: 5.0 * eflDrift * eflDrift + 10.0 * tDrift * tDrift + 8.0 * distWorse * distWorse,
+        };
+      },
+      iterations: Number(opts?.iterations || settings.iterations),
+      includeUsableIC: true,
+      includeDistortion: true,
+      includeSharpness: false,
+      autofocusCandidates: false,
+      anneal: opts?.anneal,
+      nested: !!opts?.nested,
+      runContext: opts?.runContext || null,
+      silent: !!opts?.silent,
+    });
+  }
+
+  async function runOptimizeDistortionLocal(opts = {}) {
+    const nested = !!opts?.nested;
+    const silent = !!opts?.silent;
+    const runContext = opts?.runContext || null;
+    const prevCtx = optRunContext;
+    const prevAuto = !!ui.optAutoApply?.checked;
+    if (!nested) {
+      if (cockpitOptRunning || cockpitMacroRunning) return null;
+      cockpitOptRunning = true;
+      cockpitStopRequested = false;
+      setCockpitButtonsBusy(true);
+      setCockpitProgress(0, "Optimize Distortion • init");
+    }
+    try {
+      const before = computeMetrics({
+        surfaces: lens.surfaces,
+        wavePreset: ui.wavePreset?.value || "d",
+        ...getFocusStateFromUi(),
+        ...getSensorWH(),
+        includeDistortion: true,
+        includeSharpness: true,
+        rayCount: clamp(num(ui.rayCount?.value, 21) | 0, 11, 41),
+        lutN: 260,
+        useCache: false,
+      });
+      if (!nested) recordCockpitSnapshot("Optimize Distortion • start", before);
+      if (ui.optAutoApply) ui.optAutoApply.checked = true;
+      if (runContext && typeof runContext === "object") {
+        setOptRunContext({
+          mode: runContext.mode || "Optimize Distortion",
+          label: runContext.label || "local tune",
+          stepIndex: runContext.stepIndex,
+          stepTotal: runContext.stepTotal,
+        });
+      }
+      await runDistortionOptimizer();
+      if (runContext && typeof runContext === "object") setOptRunContext(prevCtx);
+      const after = computeMetrics({
+        surfaces: lens.surfaces,
+        wavePreset: ui.wavePreset?.value || "d",
+        ...getFocusStateFromUi(),
+        ...getSensorWH(),
+        includeDistortion: true,
+        includeSharpness: true,
+        rayCount: clamp(num(ui.rayCount?.value, 21) | 0, 11, 41),
+        lutN: 260,
+        useCache: false,
+      });
+      recordCockpitSnapshot("Optimize Distortion");
+      if (!silent) toast(cockpitSummaryToast("Distortion", before, after));
+      return { ok: true, before, after, improved: Number(after?.distortion?.rmsPct) < Number(before?.distortion?.rmsPct) };
+    } finally {
+      if (ui.optAutoApply) ui.optAutoApply.checked = prevAuto;
+      if (runContext && typeof runContext === "object") setOptRunContext(prevCtx);
+      if (!nested) {
+        cockpitOptRunning = false;
+        setCockpitButtonsBusy(false);
+        setCockpitProgress(0, "Idle");
+        updateSnapshotButtonsState();
+      }
+    }
+  }
+
+  async function runOptimizeSharpnessLocal(opts = {}) {
+    const nested = !!opts?.nested;
+    const silent = !!opts?.silent;
+    const runContext = opts?.runContext || null;
+    const prevCtx = optRunContext;
+    const prevAuto = !!ui.optAutoApply?.checked;
+    if (!nested) {
+      if (cockpitOptRunning || cockpitMacroRunning) return null;
+      cockpitOptRunning = true;
+      cockpitStopRequested = false;
+      setCockpitButtonsBusy(true);
+      setCockpitProgress(0, "Optimize Sharpness • init");
+    }
+    try {
+      const before = computeMetrics({
+        surfaces: lens.surfaces,
+        wavePreset: ui.wavePreset?.value || "d",
+        ...getFocusStateFromUi(),
+        ...getSensorWH(),
+        includeDistortion: true,
+        includeSharpness: true,
+        rayCount: clamp(num(ui.rayCount?.value, 21) | 0, 11, 41),
+        lutN: 240,
+        useCache: false,
+      });
+      if (!nested) recordCockpitSnapshot("Optimize Sharpness • start", before);
+      if (ui.optAutoApply) ui.optAutoApply.checked = true;
+      if (runContext && typeof runContext === "object") {
+        setOptRunContext({
+          mode: runContext.mode || "Optimize Sharpness",
+          label: runContext.label || "local tune",
+          stepIndex: runContext.stepIndex,
+          stepTotal: runContext.stepTotal,
+        });
+      }
+      await runSharpnessOptimizer();
+      if (runContext && typeof runContext === "object") setOptRunContext(prevCtx);
+      const after = computeMetrics({
+        surfaces: lens.surfaces,
+        wavePreset: ui.wavePreset?.value || "d",
+        ...getFocusStateFromUi(),
+        ...getSensorWH(),
+        includeDistortion: true,
+        includeSharpness: true,
+        rayCount: clamp(num(ui.rayCount?.value, 21) | 0, 11, 41),
+        lutN: 240,
+        useCache: false,
+      });
+      recordCockpitSnapshot("Optimize Sharpness");
+      if (!silent) toast(cockpitSummaryToast("Sharpness", before, after));
+      return { ok: true, before, after, improved: Number(after?.sharpness?.rmsEdge) < Number(before?.sharpness?.rmsEdge) };
+    } finally {
+      if (ui.optAutoApply) ui.optAutoApply.checked = prevAuto;
+      if (runContext && typeof runContext === "object") setOptRunContext(prevCtx);
+      if (!nested) {
+        cockpitOptRunning = false;
+        setCockpitButtonsBusy(false);
+        setCockpitProgress(0, "Idle");
+        updateSnapshotButtonsState();
+      }
+    }
+  }
+
+  async function runOptimizeAllMacro() {
+    if (cockpitMacroRunning || cockpitOptRunning) return;
+    if (optRunning || scratchBuildRunning || distOptRunning || sharpOptRunning) {
+      toast("Stop current optimizer/build first.");
+      return;
+    }
+    cockpitMacroRunning = true;
+    cockpitStopRequested = false;
+    setCockpitButtonsBusy(true);
+    setCockpitProgress(0, "Optimize All • init");
+    const settings = getCockpitSettings();
+    const passes = Math.max(1, Number(settings.macroPasses || 1) | 0);
+    const stepsPerPass = 5;
+    const totalSteps = passes * stepsPerPass;
+    const startMetrics = computeMetrics({
+      surfaces: lens.surfaces,
+      wavePreset: ui.wavePreset?.value || "d",
+      ...getFocusStateFromUi(),
+      ...getSensorWH(),
+      includeDistortion: true,
+      includeSharpness: true,
+      rayCount: clamp(num(ui.rayCount?.value, 21) | 0, 11, 41),
+      lutN: 260,
+      useCache: false,
+    });
+    recordCockpitSnapshot("Optimize All • start", startMetrics);
+    let curMetrics = startMetrics;
+    let step = 0;
+    setOptLog(
+      `Optimize All (Macro)\n` +
+      `passes ${passes} • steps ${totalSteps}\n` +
+      `start EFL ${Number(startMetrics?.efl).toFixed(2)}mm • T ${Number(startMetrics?.T).toFixed(2)} • IC ${Number(startMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm`
+    );
+    try {
+      for (let p = 0; p < passes; p++) {
+        if (cockpitStopRequested) break;
+        const tag = `pass ${p + 1}/${passes}`;
+
+        step++;
+        await runOptimizeEflLocal({
+          nested: true,
+          silent: true,
+          runContext: { mode: "Optimize All", label: `${tag} • EFL`, stepIndex: step, stepTotal: totalSteps },
+        });
+        if (cockpitStopRequested) break;
+        setCockpitProgress(step / totalSteps, `Optimize All • ${tag} • EFL`);
+
+        step++;
+        await runOptimizeTLocal({
+          nested: true,
+          silent: true,
+          runContext: { mode: "Optimize All", label: `${tag} • T`, stepIndex: step, stepTotal: totalSteps },
+        });
+        if (cockpitStopRequested) break;
+        setCockpitProgress(step / totalSteps, `Optimize All • ${tag} • T`);
+
+        step++;
+        await runOptimizeImageCircleLocal({
+          nested: true,
+          silent: true,
+          runContext: { mode: "Optimize All", label: `${tag} • IC`, stepIndex: step, stepTotal: totalSteps },
+        });
+        if (cockpitStopRequested) break;
+        setCockpitProgress(step / totalSteps, `Optimize All • ${tag} • IC`);
+
+        step++;
+        await runOptimizeSharpnessLocal({
+          nested: true,
+          silent: true,
+          runContext: { mode: "Optimize All", label: `${tag} • sharpness`, stepIndex: step, stepTotal: totalSteps },
+        });
+        if (cockpitStopRequested) break;
+        setCockpitProgress(step / totalSteps, `Optimize All • ${tag} • sharpness`);
+
+        step++;
+        await runOptimizeDistortionLocal({
+          nested: true,
+          silent: true,
+          runContext: { mode: "Optimize All", label: `${tag} • distortion`, stepIndex: step, stepTotal: totalSteps },
+        });
+        setCockpitProgress(step / totalSteps, `Optimize All • ${tag} • distortion`);
+
+        const m = computeMetrics({
+          surfaces: lens.surfaces,
+          wavePreset: ui.wavePreset?.value || "d",
+          ...getFocusStateFromUi(),
+          ...getSensorWH(),
+          includeDistortion: true,
+          includeSharpness: true,
+          rayCount: clamp(num(ui.rayCount?.value, 21) | 0, 11, 41),
+          lutN: 260,
+          useCache: false,
+        });
+        const prevScore =
+          Math.abs(Number(curMetrics?.efl || 0) - Number(getCockpitTargets().targetEfl || 0)) * 0.8 +
+          Math.max(0, Number(curMetrics?.T || 0) - Number(getCockpitTargets().targetT || 0)) * 3.0 +
+          Math.max(0, Number(getCockpitTargets().targetIC || 0) - Number(curMetrics?.usableIC?.diameterMm || 0)) * 1.2 +
+          Math.abs(Number(curMetrics?.distortion?.rmsPct || 0)) * 0.35 +
+          Number(curMetrics?.sharpness?.rmsEdge || 0) * 40;
+        const nowScore =
+          Math.abs(Number(m?.efl || 0) - Number(getCockpitTargets().targetEfl || 0)) * 0.8 +
+          Math.max(0, Number(m?.T || 0) - Number(getCockpitTargets().targetT || 0)) * 3.0 +
+          Math.max(0, Number(getCockpitTargets().targetIC || 0) - Number(m?.usableIC?.diameterMm || 0)) * 1.2 +
+          Math.abs(Number(m?.distortion?.rmsPct || 0)) * 0.35 +
+          Number(m?.sharpness?.rmsEdge || 0) * 40;
+        curMetrics = m;
+        if (p > 0 && (prevScore - nowScore) < 0.02) break;
+      }
+      recordCockpitSnapshot("Optimize All (Macro)");
+      toast(cockpitSummaryToast("Optimize All", startMetrics, curMetrics));
+    } finally {
+      cockpitMacroRunning = false;
+      setCockpitButtonsBusy(false);
+      setCockpitProgress(0, "Idle");
+      updateSnapshotButtonsState();
+      scheduleRenderAll();
+    }
+  }
+
+  async function makeBaselineLensFromCockpit() {
+    if (cockpitOptRunning || cockpitMacroRunning || optRunning || scratchBuildRunning || distOptRunning || sharpOptRunning) {
+      toast("Stop current optimizer/build first.");
+      return;
+    }
+    cockpitOptRunning = true;
+    cockpitStopRequested = false;
+    setCockpitButtonsBusy(true);
+    setCockpitProgress(0, "Baseline • generating");
+    try {
+      const sensor = getSensorWH();
+      const wavePreset = ui.wavePreset?.value || "d";
+      const targets = getCockpitTargets();
+      const family = resolveScratchFamily("auto", targets.targetEfl);
+      const base = generateBaseLens(
+        family,
+        targets,
+        { w: sensor.w, h: sensor.h },
+        { aggressiveness: "normal" }
+      );
+      const prepared = prepareScratchLensForTargets(
+        base,
+        targets,
+        { w: sensor.w, h: sensor.h },
+        { wavePreset }
+      );
+
+      recordCockpitSnapshot("Pre-baseline");
+      loadLens(prepared);
+      if (ui.focusMode) ui.focusMode.value = "lens";
+      if (ui.sensorOffset) ui.sensorOffset.value = "0.000";
+      autoFocus();
+      renderAll();
+      scheduleAutosave();
+      const m = computeMetrics({
+        surfaces: lens.surfaces,
+        wavePreset,
+        ...getFocusStateFromUi(),
+        sensorW: sensor.w,
+        sensorH: sensor.h,
+        includeDistortion: true,
+        includeSharpness: true,
+        rayCount: clamp(num(ui.rayCount?.value, 21) | 0, 11, 41),
+        lutN: 260,
+        useCache: false,
+      });
+      setCockpitBaselineFromCurrent(`Baseline ${scratchFamilyLabel(family)}`);
+      recordCockpitSnapshot(`Baseline ${scratchFamilyLabel(family)}`, m);
+      toast(`Baseline ready: ${scratchFamilyLabel(family)} • EFL ${Number(m?.efl).toFixed(2)}mm`);
+    } finally {
+      cockpitOptRunning = false;
+      setCockpitButtonsBusy(false);
+      setCockpitProgress(0, "Idle");
+      updateSnapshotButtonsState();
+      scheduleRenderAll();
+    }
+  }
+
+  function saveCockpitSnapshotManual() {
+    const res = recordCockpitSnapshot("Manual Snapshot");
+    if (res?.pushed) {
+      if (ui.cockpitCompareInfo) {
+        ui.cockpitCompareInfo.textContent = `Snapshot saved • ${new Date(res.snapshot.at).toLocaleTimeString()}`;
+      }
+      toast("Snapshot saved");
+    } else {
+      toast("No changes since last snapshot");
+    }
+  }
+
+  function undoCockpitSnapshot() {
+    if (cockpitOptRunning || cockpitMacroRunning || optRunning || scratchBuildRunning || distOptRunning || sharpOptRunning) {
+      return toast("Stop current run first.");
+    }
+    if (cockpitHistoryIndex <= 0) return toast("Nothing to undo");
+    cockpitHistoryIndex--;
+    const snap = cockpitHistory[cockpitHistoryIndex];
+    if (applyCockpitSnapshot(snap, "Undo snapshot")) {
+      if (ui.cockpitCompareInfo) ui.cockpitCompareInfo.textContent = `Undo → ${snap.label}`;
+      updateSnapshotButtonsState();
+    }
+  }
+
+  function redoCockpitSnapshot() {
+    if (cockpitOptRunning || cockpitMacroRunning || optRunning || scratchBuildRunning || distOptRunning || sharpOptRunning) {
+      return toast("Stop current run first.");
+    }
+    if (cockpitHistoryIndex >= cockpitHistory.length - 1) return toast("Nothing to redo");
+    cockpitHistoryIndex++;
+    const snap = cockpitHistory[cockpitHistoryIndex];
+    if (applyCockpitSnapshot(snap, "Redo snapshot")) {
+      if (ui.cockpitCompareInfo) ui.cockpitCompareInfo.textContent = `Redo → ${snap.label}`;
+      updateSnapshotButtonsState();
+    }
+  }
+
+  function compareCockpitSnapshot() {
+    if (!cockpitHistory.length) return toast("No snapshots yet");
+    const snap = cockpitHistory[cockpitHistoryIndex >= 0 ? cockpitHistoryIndex : (cockpitHistory.length - 1)];
+    if (!snap) return toast("No snapshot selected");
+    if (cockpitCompareSnapshot?.hash && snap?.hash && cockpitCompareSnapshot.hash === snap.hash) {
+      cockpitCompareSnapshot = null;
+      if (ui.cockpitCompareInfo) {
+        ui.cockpitCompareInfo.textContent = cockpitBaselineSnapshot
+          ? `Baseline: ${cockpitBaselineSnapshot.label} (${new Date(cockpitBaselineSnapshot.at).toLocaleTimeString()})`
+          : "No baseline yet";
+      }
+      if (cockpitLiveMetrics) updateCockpitMetricsTable(cockpitLiveMetrics);
+      else scheduleRenderAll();
+      toast("Snapshot compare cleared");
+      return;
+    }
+    cockpitCompareSnapshot = snap;
+    const cur = cockpitLiveMetrics || computeMetrics({
+      surfaces: lens.surfaces,
+      wavePreset: ui.wavePreset?.value || "d",
+      ...getFocusStateFromUi(),
+      ...getSensorWH(),
+      includeDistortion: true,
+      includeSharpness: true,
+      rayCount: clamp(num(ui.rayCount?.value, 21) | 0, 11, 41),
+      lutN: 240,
+      useCache: false,
+    });
+    const base = snap.metrics || {};
+    setOptLog(
+      `Snapshot Compare\n` +
+      `snapshot ${snap.label} • ${new Date(snap.at).toLocaleString()}\n` +
+      `EFL ${Number(base?.efl).toFixed(2)} → ${Number(cur?.efl).toFixed(2)} mm (${(Number(cur?.efl || 0) - Number(base?.efl || 0)).toFixed(2)}mm)\n` +
+      `T ${Number(base?.T).toFixed(2)} → ${Number(cur?.T).toFixed(2)} (${(Number(cur?.T || 0) - Number(base?.T || 0)).toFixed(2)})\n` +
+      `IC ${Number(base?.usableIC?.diameterMm || 0).toFixed(2)} → ${Number(cur?.usableIC?.diameterMm || 0).toFixed(2)} mm\n` +
+      `Dist RMS ${Number(base?.distortion?.rmsPct || 0).toFixed(2)} → ${Number(cur?.distortion?.rmsPct || 0).toFixed(2)} %\n` +
+      `Sharp C/E ${Number(base?.sharpness?.rmsCenter || 0).toFixed(3)}/${Number(base?.sharpness?.rmsEdge || 0).toFixed(3)} → ${Number(cur?.sharpness?.rmsCenter || 0).toFixed(3)}/${Number(cur?.sharpness?.rmsEdge || 0).toFixed(3)} mm\n` +
+      `PL intrusion ${Number(base?.feasible?.plIntrusionMm || 0).toFixed(2)} → ${Number(cur?.feasible?.plIntrusionMm || 0).toFixed(2)} mm`
+    );
+    if (ui.cockpitCompareInfo) {
+      ui.cockpitCompareInfo.textContent = `Comparing against: ${snap.label}`;
+    }
+    updateCockpitMetricsTable(cur);
+    updateSnapshotButtonsState();
   }
 
   function makeEvalPerfBucket() {
@@ -8150,6 +9672,326 @@
     return val;
   }
 
+  function getFocusStateFromUi() {
+    const focusMode = String(ui.focusMode?.value || "lens").toLowerCase() === "cam" ? "cam" : "lens";
+    const sensorX = focusMode === "cam" ? num(ui.sensorOffset?.value, 0) : 0;
+    const lensShift = focusMode === "lens" ? num(ui.lensFocus?.value, 0) : 0;
+    return { focusMode, sensorX, lensShift };
+  }
+
+  function computeMetrics({
+    surfaces,
+    wavePreset = "d",
+    focusMode = "lens",
+    sensorX = 0,
+    lensShift = 0,
+    sensorW = null,
+    sensorH = null,
+    objDist = COCKPIT_CFG.defaultObjDistMm,
+    rayCount = COCKPIT_CFG.defaultRayCount,
+    lutN = COCKPIT_CFG.defaultLutN,
+    lutPupilSqrt = 1,
+    includeUsableIC = true,
+    includeDistortion = true,
+    includeSharpness = true,
+    autofocus = false,
+    autofocusOptions = null,
+    useCache = false,
+  } = {}) {
+    if (!Array.isArray(surfaces) || surfaces.length < 3) {
+      return {
+        feasible: {
+          ok: false,
+          reasons: ["lens"],
+          plIntrusionMm: Infinity,
+          overlapOk: false,
+          thicknessOk: false,
+          stopOk: false,
+          validCenterFrac: 0,
+          bflShortMm: Infinity,
+        },
+        efl: NaN,
+        bfl: NaN,
+        T: NaN,
+        maxFieldDeg: NaN,
+        fovDeg: null,
+        coversGeom: false,
+        usableIC: { valid: false, diameterMm: 0, radiusMm: 0, thresholdRel: SOFT_IC_CFG.thresholdRel },
+        distortion: { dist70Pct: NaN, rmsPct: NaN, samples: [] },
+        sharpness: { rmsCenter: NaN, rmsEdge: NaN, rmsByAngle: [], score: Infinity, validCounts: [] },
+      };
+    }
+
+    const sensor = getSensorWH();
+    const wMm = Number.isFinite(sensorW) ? Number(sensorW) : Number(sensor.w || 36.7);
+    const hMm = Number.isFinite(sensorH) ? Number(sensorH) : Number(sensor.h || 25.54);
+    const focusModeNorm = String(focusMode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
+    const sxIn = Number(sensorX || 0);
+    const lsIn = Number(lensShift || 0);
+    const rays = clamp(Number(rayCount || 21) | 0, 11, 61);
+    const lutSamples = clamp(Number(lutN || COCKPIT_CFG.defaultLutN) | 0, 80, 1200);
+    const lutPupil = clamp(Number(lutPupilSqrt || 1) | 0, 1, 8);
+
+    const keyObj = {
+      wavePreset: String(wavePreset || "d"),
+      focusMode: focusModeNorm,
+      sensorX: sxIn.toFixed(5),
+      lensShift: lsIn.toFixed(5),
+      sensorW: wMm.toFixed(4),
+      sensorH: hMm.toFixed(4),
+      objDist: Number(objDist || COCKPIT_CFG.defaultObjDistMm).toFixed(2),
+      rayCount: rays,
+      lutN: lutSamples,
+      lutPupilSqrt: lutPupil,
+      includeDistortion: !!includeDistortion,
+      includeUsableIC: !!includeUsableIC,
+      includeSharpness: !!includeSharpness,
+      autofocus: !!autofocus,
+      surfaces: surfaces.map((s) => ({
+        type: String(s?.type || ""),
+        R: Number(s?.R || 0).toFixed(6),
+        t: Number(s?.t || 0).toFixed(6),
+        ap: Number(s?.ap || 0).toFixed(6),
+        glass: String(s?.glass || "AIR"),
+        stop: !!s?.stop,
+      })),
+    };
+    const key = JSON.stringify(keyObj);
+    if (useCache && key === _cockpitMetricsCacheKey && _cockpitMetricsCacheVal) {
+      return _cockpitMetricsCacheVal;
+    }
+
+    const work = clone(surfaces);
+    ensureStopExists(work);
+    enforceSingleStopSurface(work);
+    ensureStopInAirBothSides(work);
+    quickSanity(work);
+
+    let sx = sxIn;
+    let ls = lsIn;
+    if (autofocus) {
+      const af = findBestFocusShift(work, focusModeNorm, sxIn, lsIn, wavePreset, {
+        sensorW: wMm,
+        sensorH: hMm,
+        ...(autofocusOptions || SHARP_OPT_CFG.autofocus || {}),
+      });
+      if (af?.ok) {
+        sx = Number(af.sensorX || sx);
+        ls = Number(af.lensShift || ls);
+      }
+    }
+
+    computeVertices(work, ls, sx);
+    const stopIdx = findStopSurfaceIndex(work);
+    const phys = evaluatePhysicalConstraints(work);
+    const rearVx = lastPhysicalVertexX(work);
+    const plIntrusionMm = Number.isFinite(rearVx) ? (rearVx - (-PL_FFD)) : Infinity;
+
+    const centerRays = buildRays(work, 0, Math.max(11, Math.min(31, rays)));
+    const centerTraces = centerRays.map((r) => traceRayForward(clone(r), work, wavePreset));
+    const centerTotal = Math.max(1, centerTraces.length);
+    let centerValid = 0;
+    for (const tr of centerTraces) {
+      if (!tr || tr.vignetted || tr.tir || !tr.endRay) continue;
+      const y = rayHitYAtX(tr.endRay, sx);
+      if (Number.isFinite(y)) centerValid++;
+    }
+    const validCenterFrac = centerValid / centerTotal;
+    const cross = detectInternalRayCrossings(centerTraces, work, wavePreset);
+
+    const parax = estimateEflBflParaxial(work, wavePreset);
+    const efl = Number(parax?.efl);
+    const bfl = Number(parax?.bfl);
+    const bflShortMm = Number.isFinite(bfl) ? Math.max(0, Number(MERIT_CFG.bflMin || 52) - bfl) : Infinity;
+    const T = estimateTStopApprox(efl, work);
+    const maxFieldDeg = coverageTestMaxFieldDeg(work, wavePreset, sx, {
+      sensorW: wMm,
+      sensorH: hMm,
+      stepDeg: 1.0,
+      maxDeg: 65,
+    });
+    const fovDeg = computeFovDeg(efl, wMm, hMm);
+    const halfDiag = 0.5 * Math.hypot(wMm, hMm);
+    const reqFieldDeg = (Number.isFinite(efl) && efl > 1e-9)
+      ? (Math.atan(halfDiag / efl) * 180 / Math.PI)
+      : NaN;
+    const coversGeom = Number.isFinite(maxFieldDeg) && Number.isFinite(reqFieldDeg)
+      ? (maxFieldDeg >= reqFieldDeg - 1e-3)
+      : false;
+
+    let usableIC = {
+      valid: false,
+      diameterMm: 0,
+      radiusMm: 0,
+      thresholdRel: Number(SOFT_IC_CFG.thresholdRel || 0.35),
+      relAtCutoff: 0,
+      samples: [],
+    };
+    let distortion = {
+      dist70Pct: NaN,
+      rmsPct: NaN,
+      maxAbsPct: NaN,
+      flavor: "unknown",
+      samples: [],
+    };
+
+    if (includeUsableIC || includeDistortion) {
+      const lutPack = getLutOnlyCached({
+        surfaces: work,
+        wavePreset,
+        sensorX: sx,
+        lensShift: ls,
+        objDist,
+        lutN: lutSamples,
+        lutPupilSqrt: lutPupil,
+        doCA: false,
+        sensorW: wMm,
+        sensorH: hMm,
+      });
+      if (includeUsableIC) {
+        const uc = computeUsableIcFromLUTPack(lutPack, {
+          thresholdRel: Number(SOFT_IC_CFG.thresholdRel || 0.35),
+          smoothingHalfWindow: 1,
+          minSamplesForCurve: 5,
+        });
+        usableIC = {
+          valid: !!uc?.valid,
+          diameterMm: Number.isFinite(uc?.diameterMm) ? Number(uc.diameterMm) : 0,
+          radiusMm: Number.isFinite(uc?.radiusMm) ? Number(uc.radiusMm) : 0,
+          thresholdRel: Number(uc?.thresholdRel || SOFT_IC_CFG.thresholdRel || 0.35),
+          relAtCutoff: Number(uc?.relAtCutoff || 0),
+          samples: Array.isArray(uc?.samples) ? uc.samples : [],
+        };
+      }
+
+      if (includeDistortion) {
+        const distLut = computeDistortionFromLUT(lutPack, {
+          efl,
+          objDist,
+          sampleFracs: DIST_OPT_CFG.sampleFracs,
+        });
+        if (distLut) {
+          distortion = {
+            dist70Pct: Number(distLut?.distPctAt70),
+            rmsPct: Number(distLut?.rmsDistPct),
+            maxAbsPct: Number(distLut?.maxAbsDistPct),
+            flavor: String(distLut?.flavor || "unknown"),
+            samples: Array.isArray(distLut?.samples) ? distLut.samples : [],
+          };
+        }
+      }
+    }
+
+    let sharpness = {
+      rmsCenter: NaN,
+      rmsEdge: NaN,
+      rmsByAngle: [],
+      validCounts: [],
+      score: Infinity,
+      maxFieldDeg: Number.isFinite(maxFieldDeg) ? maxFieldDeg : NaN,
+    };
+    if (includeSharpness) {
+      const sh = evaluateSharpness(work, wavePreset, sx, rays, {
+        sensorW: wMm,
+        sensorH: hMm,
+        lensShift: ls,
+        maxFieldDeg: Number.isFinite(maxFieldDeg) ? maxFieldDeg : undefined,
+        angleFractions: SHARP_OPT_CFG.angleFractions,
+        angleWeights: SHARP_OPT_CFG.angleWeights,
+        maxFieldStepDeg: SHARP_OPT_CFG.maxFieldStepDeg,
+        maxFieldScanDeg: SHARP_OPT_CFG.maxFieldScanDeg,
+        minValidFrac: SHARP_OPT_CFG.minValidFrac,
+        lowValidPenaltyMm: SHARP_OPT_CFG.lowValidPenaltyMm,
+        noDataPenaltyMm: SHARP_OPT_CFG.noDataPenaltyMm,
+      });
+      sharpness = {
+        rmsCenter: Number(sh?.centerRmsMm),
+        rmsEdge: Number(sh?.edgeRmsMm),
+        rmsByAngle: Array.isArray(sh?.rmsByAngle) ? sh.rmsByAngle : [],
+        validCounts: Array.isArray(sh?.validCounts) ? sh.validCounts : [],
+        score: Number(sh?.score),
+        maxFieldDeg: Number(sh?.maxFieldDeg),
+      };
+    }
+
+    const reasons = [];
+    if (stopIdx < 0) reasons.push("stop");
+    if (!!phys?.hardFail) reasons.push("physics");
+    if (cross?.invalid) reasons.push("xover");
+    if (!(plIntrusionMm <= Number(COCKPIT_CFG.plIntrusionRejectMm || 0.5))) reasons.push("pl");
+    if (!(validCenterFrac >= Number(COCKPIT_CFG.hardMinValidCenterFrac || 0.28))) reasons.push("vignette");
+    if (!(bflShortMm <= Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0))) reasons.push("bfl");
+
+    const result = {
+      feasible: {
+        ok: reasons.length === 0,
+        reasons,
+        plIntrusionMm,
+        overlapOk: Number(phys?.worstOverlap || 0) <= 1e-4,
+        thicknessOk: Number(phys?.worstPinch || 0) <= 1e-4 && !phys?.hardFail,
+        stopOk: stopIdx >= 0,
+        validCenterFrac,
+        bflShortMm,
+        hardPhysics: !!phys?.hardFail,
+        crossPairs: Number(cross?.crossPairs || 0),
+      },
+      efl,
+      bfl,
+      T,
+      maxFieldDeg,
+      fovDeg,
+      coversGeom,
+      usableIC,
+      distortion,
+      sharpness,
+      focus: {
+        mode: focusModeNorm,
+        sensorX: sx,
+        lensShift: ls,
+      },
+      context: {
+        sensorW: wMm,
+        sensorH: hMm,
+        wavePreset,
+        objDist: Number(objDist || COCKPIT_CFG.defaultObjDistMm),
+        reqFieldDeg,
+      },
+      phys,
+      cross,
+      stopIdx,
+    };
+
+    if (useCache) {
+      _cockpitMetricsCacheKey = key;
+      _cockpitMetricsCacheVal = result;
+    }
+    return result;
+  }
+
+  function failsHardConstraints(surfaces, metrics, opts = {}) {
+    const strict = String(opts?.strictness || "normal").toLowerCase() === "strict";
+    const plLimit = strict ? 0.10 : Number(COCKPIT_CFG.plIntrusionRejectMm || 0.50);
+    const minValid = strict ? 0.35 : Number(COCKPIT_CFG.hardMinValidCenterFrac || 0.28);
+    const bflLimit = strict ? 0.45 : Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0);
+    const reasons = [];
+
+    if (!Array.isArray(surfaces) || surfaces.length < 3) reasons.push("lens");
+    if (!metrics || typeof metrics !== "object") reasons.push("metrics");
+    if (!Number.isFinite(metrics?.efl) || Number(metrics?.efl) <= 1e-6) reasons.push("efl");
+    if (!Number.isFinite(metrics?.T) || Number(metrics?.T) <= 0) reasons.push("t");
+    if (!metrics?.feasible?.stopOk) reasons.push("stop");
+    if (metrics?.feasible?.hardPhysics) reasons.push("physics");
+    if (!(Number(metrics?.feasible?.plIntrusionMm) <= plLimit)) reasons.push("pl");
+    if (!(Number(metrics?.feasible?.validCenterFrac) >= minValid)) reasons.push("valid");
+    if (!(Number(metrics?.feasible?.bflShortMm) <= bflLimit)) reasons.push("bfl");
+    if (Number(metrics?.feasible?.crossPairs || 0) > 0) reasons.push("xover");
+
+    return {
+      fail: reasons.length > 0,
+      reasons,
+    };
+  }
+
   function fmtIntrusion(evalRes) {
     const v = Number(evalRes?.intrusion);
     return Number.isFinite(v) ? `${v.toFixed(2)}mm` : "—";
@@ -8873,6 +10715,7 @@
     sharpOptStopRequested = false;
     if (ui.btnOptSharp) ui.btnOptSharp.disabled = true;
     if (ui.btnOptDist) ui.btnOptDist.disabled = true;
+    if (!cockpitMacroRunning) setCockpitProgress(0, "Optimize Sharpness • init");
 
     const runNo = ++optimizerRunSerial;
     const prevRunCtx = optRunContext;
@@ -9055,6 +10898,7 @@
             `focus ${focusMode === "cam" ? `sensor ${Number(bestState?.focus?.sensorX || 0).toFixed(3)}mm` : `lens ${Number(bestState?.focus?.lensShift || 0).toFixed(3)}mm`}\n` +
             `rejects phys ${rejects.phys} • pl ${rejects.pl} • xover ${rejects.xover} • bfl ${rejects.bfl} • af ${rejects.af} • sharp ${rejects.sharp} • efl ${rejects.efl_guard} • t ${rejects.t_guard} • cov ${rejects.cov_guard} • dist ${rejects.dist_guard} • mut ${rejects.mutation}`
           );
+          if (!cockpitMacroRunning) setCockpitProgress(i / Math.max(1, iters), `Optimize Sharpness • ${i}/${iters}`);
           await new Promise((r) => setTimeout(r, 0));
         }
       }
@@ -9135,11 +10979,13 @@
             : "Sharpness optimized: candidate queued, click Apply best")
           : "Sharpness optimizer: no better lens within guards"
       );
+      if (!cockpitMacroRunning) setCockpitProgress(1, "Optimize Sharpness • done");
     } finally {
       sharpOptStopRequested = false;
       sharpOptRunning = false;
       if (ui.btnOptSharp) ui.btnOptSharp.disabled = false;
       if (ui.btnOptDist && !distOptRunning) ui.btnOptDist.disabled = false;
+      if (!cockpitOptRunning && !cockpitMacroRunning) setCockpitProgress(0, "Idle");
       setOptRunContext(prevRunCtx);
     }
   }
@@ -9161,6 +11007,7 @@
     distOptStopRequested = false;
     if (ui.btnOptDist) ui.btnOptDist.disabled = true;
     if (ui.btnOptSharp) ui.btnOptSharp.disabled = true;
+    if (!cockpitMacroRunning) setCockpitProgress(0, "Optimize Distortion • init");
 
     const runNo = ++optimizerRunSerial;
     const prevRunCtx = optRunContext;
@@ -9340,6 +11187,7 @@
             `best drift EFL ${eflDrift.toFixed(3)}mm • T ${tDrift.toFixed(3)} • field drop ${fieldDrop.toFixed(2)}° • IC drift ${formatSignedMm(icDriftMm, 2)} • stop #${bestState.stopIdx}\n` +
             `rejects phys ${rejects.phys} • pl ${rejects.pl} • xover ${rejects.xover} • bfl ${rejects.bfl} • dist ${rejects.dist} • efl ${rejects.efl_guard} • t ${rejects.t_guard} • cov ${rejects.cov_guard} • mut ${rejects.mutation}`
           );
+          if (!cockpitMacroRunning) setCockpitProgress(i / Math.max(1, iters), `Optimize Distortion • ${i}/${iters}`);
           await new Promise((r) => setTimeout(r, 0));
         }
       }
@@ -9414,11 +11262,13 @@
             : "Distortion optimized: candidate queued, click Apply best")
           : "Distortion optimizer: no better lens within guards"
       );
+      if (!cockpitMacroRunning) setCockpitProgress(1, "Optimize Distortion • done");
     } finally {
       distOptStopRequested = false;
       distOptRunning = false;
       if (ui.btnOptDist) ui.btnOptDist.disabled = false;
       if (ui.btnOptSharp && !sharpOptRunning) ui.btnOptSharp.disabled = false;
+      if (!cockpitOptRunning && !cockpitMacroRunning) setCockpitProgress(0, "Idle");
       setOptRunContext(prevRunCtx);
     }
   }
@@ -9430,6 +11280,7 @@
       return;
     }
     optRunning = true;
+    if (!cockpitOptRunning && !cockpitMacroRunning) setCockpitProgress(0, "Optimize • init");
     const runNo = ++optimizerRunSerial;
     const runHeader = formatOptimizerRunHeader(runNo);
 
@@ -9979,6 +11830,9 @@
             `best ${fmtPhysOpt(best.eval, targets)}\n`
           );
         }
+        if (!cockpitOptRunning && !cockpitMacroRunning) {
+          setCockpitProgress(i / Math.max(1, iters), `Optimize • ${i}/${iters}`);
+        }
         // yield to UI
         await new Promise(r => setTimeout(r, 0));
       }
@@ -10016,6 +11870,12 @@
         ? `Optimize done. Score ${optBest.eval.score.toFixed(2)} • FL ${Number.isFinite(optBest.eval.efl) ? Number(optBest.eval.efl).toFixed(1) : "—"}mm${targetIC > 0 ? ` • IC ${Number(optBest.eval.softIcMm || 0).toFixed(1)}mm` : ""}`
         : "Optimize stopped"
     );
+    if (!cockpitOptRunning && !cockpitMacroRunning) {
+      setCockpitProgress(1, "Optimize • done");
+      setTimeout(() => {
+        if (!optRunning && !cockpitOptRunning && !cockpitMacroRunning) setCockpitProgress(0, "Idle");
+      }, 500);
+    }
   }
 
   function stopOptimizer(){
@@ -10023,26 +11883,21 @@
     const stoppingOpt = !!optRunning;
     const stoppingDist = !!distOptRunning;
     const stoppingSharp = !!sharpOptRunning;
-    if (!stoppingScratch && !stoppingOpt && !stoppingDist && !stoppingSharp) return;
+    const stoppingCockpit = !!cockpitOptRunning || !!cockpitMacroRunning;
+    if (!stoppingScratch && !stoppingOpt && !stoppingDist && !stoppingSharp && !stoppingCockpit) return;
     if (stoppingScratch) scratchStopRequested = true;
     if (stoppingOpt) optRunning = false;
     if (stoppingDist) distOptStopRequested = true;
     if (stoppingSharp) sharpOptStopRequested = true;
-    if (stoppingScratch && stoppingOpt && stoppingDist && stoppingSharp) toast("Stopping build + optimizer + distortion + sharpness run…");
-    else if (stoppingScratch && stoppingOpt && stoppingDist) toast("Stopping build + optimizer + distortion run…");
-    else if (stoppingScratch && stoppingOpt && stoppingSharp) toast("Stopping build + optimizer + sharpness run…");
-    else if (stoppingScratch && stoppingDist && stoppingSharp) toast("Stopping build + distortion + sharpness run…");
-    else if (stoppingOpt && stoppingDist && stoppingSharp) toast("Stopping optimizer + distortion + sharpness run…");
-    else if (stoppingScratch && stoppingOpt) toast("Stopping build + optimizer…");
-    else if (stoppingScratch && stoppingDist) toast("Stopping build + distortion run…");
-    else if (stoppingScratch && stoppingSharp) toast("Stopping build + sharpness run…");
-    else if (stoppingOpt && stoppingDist) toast("Stopping optimizer + distortion run…");
-    else if (stoppingOpt && stoppingSharp) toast("Stopping optimizer + sharpness run…");
-    else if (stoppingDist && stoppingSharp) toast("Stopping distortion + sharpness run…");
-    else if (stoppingScratch) toast("Stopping build from scratch…");
-    else if (stoppingDist) toast("Stopping distortion run…");
-    else if (stoppingSharp) toast("Stopping sharpness run…");
-    else toast("Stopping…");
+    if (stoppingCockpit) cockpitStopRequested = true;
+
+    const parts = [];
+    if (stoppingScratch) parts.push("build");
+    if (stoppingOpt) parts.push("optimizer");
+    if (stoppingDist) parts.push("distortion");
+    if (stoppingSharp) parts.push("sharpness");
+    if (stoppingCockpit) parts.push("cockpit");
+    toast(`Stopping ${parts.join(" + ")} run${parts.length > 1 ? "s" : ""}…`);
   }
 
   function applyBest(){
@@ -10056,6 +11911,7 @@
     if (!p.feasible) {
       return toast("Best is fysiek ongeldig (intrusion/overlap/BFL). Eerst verder optimaliseren.");
     }
+    recordCockpitSnapshot("Main pre-apply");
     loadLens(optBest.lens);
     const m = optBest?.meta || {};
     const fm = String(m.focusMode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
@@ -10076,6 +11932,7 @@
         : Number(optBest.eval.lensShift || 0).toFixed(3);
     }
     renderAll();
+    recordCockpitSnapshot("Main applied");
     toast(`Applied best${m?.source ? ` (${String(m.source)})` : ""}`);
   }
 
@@ -10176,6 +12033,24 @@
     ui.btnOptApply?.addEventListener("click", applyBest);
     ui.btnOptBench?.addEventListener("click", benchOptimizer);
 
+    // cockpit
+    ui.btnBaselineLens?.addEventListener("click", makeBaselineLensFromCockpit);
+    ui.btnOptEfl?.addEventListener("click", () => runOptimizeEflLocal());
+    ui.btnOptTLocal?.addEventListener("click", () => runOptimizeTLocal());
+    ui.btnOptICLocal?.addEventListener("click", () => runOptimizeImageCircleLocal());
+    ui.btnOptDistLocal?.addEventListener("click", () => runOptimizeDistortionLocal());
+    ui.btnOptSharpLocal?.addEventListener("click", () => runOptimizeSharpnessLocal());
+    ui.btnOptAllMacro?.addEventListener("click", runOptimizeAllMacro);
+
+    ui.btnSnapshotSave?.addEventListener("click", saveCockpitSnapshotManual);
+    ui.btnSnapshotUndo?.addEventListener("click", undoCockpitSnapshot);
+    ui.btnSnapshotRedo?.addEventListener("click", redoCockpitSnapshot);
+    ui.btnSnapshotCompare?.addEventListener("click", compareCockpitSnapshot);
+
+    ui.cockpitStep?.addEventListener("input", () => { markCockpitStepLabel(); scheduleAutosave(); });
+    ui.cockpitStep?.addEventListener("change", () => { markCockpitStepLabel(); scheduleAutosave(); });
+    ui.cockpitSurfaceMode?.addEventListener("change", () => { syncCockpitRangeInputs(); scheduleAutosave(); });
+
     ["optTargetFL","optTargetT","optTargetIC","optIters","distOptIters","optPop","optAutoApply"].forEach((id)=>{
       ui[id]?.addEventListener("change", () => { scheduleRenderAll(); scheduleAutosave(); });
       ui[id]?.addEventListener("input", () => {
@@ -10184,6 +12059,12 @@
         scheduleAutosave();
       });
     });
+
+    ["cockpitIters","cockpitSurfaceMode","cockpitSurfaceStart","cockpitSurfaceEnd","cockpitStrictness","cockpitMacroPasses","cockpitAnneal"].forEach((id) => {
+      ui[id]?.addEventListener("change", () => { scheduleRenderAll(); scheduleAutosave(); });
+      ui[id]?.addEventListener("input", () => { scheduleAutosave(); });
+    });
+    syncCockpitRangeInputs();
   }
 
   function bindKeyboardShortcuts() {
@@ -10214,6 +12095,7 @@
   function boot() {
     wireUI();
     bindKeyboardShortcuts();
+    markCockpitStepLabel();
 
     // Force top on boot
     try {
@@ -10229,6 +12111,12 @@
     }
     bindViewControls();
     renderAll();
+    recordCockpitSnapshot("Session start");
+    updateSnapshotButtonsState();
+    if (ui.cockpitCompareInfo && !cockpitBaselineSnapshot) {
+      ui.cockpitCompareInfo.textContent = "No baseline yet";
+    }
+    setCockpitProgress(0, "Idle");
 
     window.addEventListener("resize", () => renderAll());
     document.addEventListener("fullscreenchange", () => renderAll());

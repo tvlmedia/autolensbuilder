@@ -182,6 +182,145 @@
               <label for="optLog">Optimizer log</label>
               <textarea id="optLog" class="glassNote" rows="3" readonly>—</textarea>
             </div>
+
+            <div class="ctrl two ctrlDivider"></div>
+
+            <div class="ctrl two">
+              <div class="subTitle">Optimization Panel</div>
+              <div class="hint" style="margin-top:6px">
+                Baseline + lokale optimizers per parameter. Elke run toont delta en blijft rollbackbaar via snapshots.
+              </div>
+            </div>
+
+            <div class="ctrl two">
+              <div class="cockpitProgressWrap" aria-label="Optimizer progress">
+                <div id="cockpitProgressText" class="cockpitProgressText">Idle</div>
+                <progress id="cockpitProgress" max="1" value="0"></progress>
+              </div>
+            </div>
+
+            <div class="ctrl two">
+              <table class="cockpitMetricsTbl" aria-label="Live optimization metrics">
+                <thead>
+                  <tr>
+                    <th>Metric</th>
+                    <th>Current</th>
+                    <th>Delta vs baseline</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>EFL (mm)</td>
+                    <td id="cockpitValEfl">—</td>
+                    <td id="cockpitDeltaEfl" class="cockpitDelta">—</td>
+                  </tr>
+                  <tr>
+                    <td>BFL (mm)</td>
+                    <td id="cockpitValBfl">—</td>
+                    <td id="cockpitDeltaBfl" class="cockpitDelta">—</td>
+                  </tr>
+                  <tr>
+                    <td>T (approx)</td>
+                    <td id="cockpitValT">—</td>
+                    <td id="cockpitDeltaT" class="cockpitDelta">—</td>
+                  </tr>
+                  <tr>
+                    <td>Coverage</td>
+                    <td id="cockpitValCov">—</td>
+                    <td id="cockpitDeltaCov" class="cockpitDelta">—</td>
+                  </tr>
+                  <tr>
+                    <td>Usable IC</td>
+                    <td id="cockpitValIc">—</td>
+                    <td id="cockpitDeltaIc" class="cockpitDelta">—</td>
+                  </tr>
+                  <tr>
+                    <td>Distortion</td>
+                    <td id="cockpitValDist">—</td>
+                    <td id="cockpitDeltaDist" class="cockpitDelta">—</td>
+                  </tr>
+                  <tr>
+                    <td>Sharpness</td>
+                    <td id="cockpitValSharp">—</td>
+                    <td id="cockpitDeltaSharp" class="cockpitDelta">—</td>
+                  </tr>
+                  <tr>
+                    <td>Feasibility</td>
+                    <td id="cockpitValFeas">—</td>
+                    <td id="cockpitDeltaFeas" class="cockpitDelta">—</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="ctrl two">
+              <div class="cockpitBtnGrid">
+                <button id="btnBaselineLens" class="btn btnPrimary" type="button">Make Baseline Lens</button>
+                <button id="btnOptEfl" class="btn" type="button">Optimize EFL</button>
+                <button id="btnOptTLocal" class="btn" type="button">Optimize T</button>
+                <button id="btnOptICLocal" class="btn" type="button">Optimize Image Circle</button>
+                <button id="btnOptDistLocal" class="btn" type="button">Optimize Distortion</button>
+                <button id="btnOptSharpLocal" class="btn" type="button">Optimize Sharpness</button>
+                <button id="btnOptAllMacro" class="btn btnPrimary" type="button">Optimize All (Macro)</button>
+              </div>
+            </div>
+
+            <div class="ctrl two">
+              <div class="cockpitBtnGrid cockpitSnapGrid">
+                <button id="btnSnapshotSave" class="btn" type="button">Save Snapshot</button>
+                <button id="btnSnapshotUndo" class="btn" type="button">Undo</button>
+                <button id="btnSnapshotRedo" class="btn" type="button">Redo</button>
+                <button id="btnSnapshotCompare" class="btn" type="button">Compare Snapshot</button>
+              </div>
+              <div id="cockpitCompareInfo" class="hint" style="margin-top:8px">No baseline yet</div>
+            </div>
+
+            <div class="ctrl two">
+              <details id="cockpitAdvanced" class="cockpitAdvanced">
+                <summary>Advanced settings</summary>
+                <div class="cockpitAdvancedGrid">
+                  <div class="field">
+                    <label for="cockpitIters">Iterations</label>
+                    <input id="cockpitIters" type="number" step="1" min="50" value="2400" />
+                  </div>
+                  <div class="field">
+                    <label for="cockpitStep">Step size</label>
+                    <input id="cockpitStep" type="range" min="0.01" max="0.20" step="0.005" value="0.06" />
+                    <div class="hint">Current: <span id="cockpitStepOut">0.060</span></div>
+                  </div>
+                  <div class="field">
+                    <label for="cockpitSurfaceMode">Allowed surfaces range</label>
+                    <select id="cockpitSurfaceMode">
+                      <option value="auto" selected>Auto</option>
+                      <option value="manual">Manual</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="cockpitStrictness">Constraint strictness</label>
+                    <select id="cockpitStrictness">
+                      <option value="normal" selected>Normal</option>
+                      <option value="strict">Strict</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="cockpitSurfaceStart">Range start idx</label>
+                    <input id="cockpitSurfaceStart" type="number" step="1" min="1" value="1" />
+                  </div>
+                  <div class="field">
+                    <label for="cockpitSurfaceEnd">Range end idx</label>
+                    <input id="cockpitSurfaceEnd" type="number" step="1" min="1" value="10" />
+                  </div>
+                  <div class="field">
+                    <label for="cockpitMacroPasses">Macro passes</label>
+                    <input id="cockpitMacroPasses" type="number" step="1" min="1" max="3" value="2" />
+                  </div>
+                  <div class="field">
+                    <label for="cockpitAnneal">Use annealing</label>
+                    <input id="cockpitAnneal" type="checkbox" checked />
+                  </div>
+                </div>
+              </details>
+            </div>
           </div>
         </section>
 

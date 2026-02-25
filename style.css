@@ -228,6 +228,106 @@ body{
 }
 .ctrl input[type="range"]{ padding:0; height:34px; }
 
+.cockpitProgressWrap{
+  width:100%;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.cockpitProgressText{
+  font-size:12px;
+  color:var(--muted);
+}
+#cockpitProgress{
+  width:100%;
+  height:12px;
+  border-radius:999px;
+  overflow:hidden;
+}
+#cockpitProgress::-webkit-progress-bar{
+  background:rgba(255,255,255,.08);
+  border-radius:999px;
+}
+#cockpitProgress::-webkit-progress-value{
+  background:linear-gradient(90deg, #2a6ef2, #42d18f);
+  border-radius:999px;
+}
+#cockpitProgress::-moz-progress-bar{
+  background:linear-gradient(90deg, #2a6ef2, #42d18f);
+  border-radius:999px;
+}
+
+.cockpitMetricsTbl{
+  width:100%;
+  border-collapse:separate;
+  border-spacing:0;
+  border:1px solid var(--stroke);
+  border-radius:12px;
+  overflow:hidden;
+  background:rgba(0,0,0,.20);
+}
+.cockpitMetricsTbl th{
+  font-size:11px;
+  color:var(--muted);
+  text-align:left;
+  padding:8px 10px;
+  border-bottom:1px solid rgba(255,255,255,.08);
+  background:rgba(255,255,255,.02);
+}
+.cockpitMetricsTbl td{
+  font-size:12px;
+  padding:8px 10px;
+  border-bottom:1px solid rgba(255,255,255,.05);
+  vertical-align:top;
+}
+.cockpitMetricsTbl tbody tr:last-child td{ border-bottom:none; }
+
+.cockpitDelta{
+  font-family:var(--mono);
+  color:var(--muted);
+}
+.cockpitDelta.good{ color:var(--ok); }
+.cockpitDelta.bad{ color:var(--danger); }
+.cockpitDelta.neutral{ color:var(--muted); }
+
+.cockpitBtnGrid{
+  display:grid;
+  grid-template-columns:repeat(2, minmax(0, 1fr));
+  gap:8px;
+}
+.cockpitBtnGrid .btn{
+  width:100%;
+  justify-self:stretch;
+}
+.cockpitSnapGrid{
+  grid-template-columns:repeat(4, minmax(0, 1fr));
+}
+
+.cockpitAdvanced{
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:12px;
+  background:rgba(255,255,255,.02);
+  padding:8px 10px;
+}
+.cockpitAdvanced > summary{
+  cursor:pointer;
+  font-size:12px;
+  color:var(--muted);
+  user-select:none;
+}
+.cockpitAdvancedGrid{
+  margin-top:10px;
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:10px;
+}
+
+@media (max-width: 740px){
+  .cockpitBtnGrid{ grid-template-columns:1fr; }
+  .cockpitSnapGrid{ grid-template-columns:1fr 1fr; }
+  .cockpitAdvancedGrid{ grid-template-columns:1fr; }
+}
+
 /* ===========================
    TABLE
    =========================== */
