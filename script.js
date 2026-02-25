@@ -34,6 +34,8 @@
     vig: $("#badgeVig"),
     softIC: $("#badgeSoftIC"),
     dist: $("#badgeDist"),
+    od: $("#badgeOD"),
+    realism: $("#badgeRealism"),
     fov: $("#badgeFov"),
     merit: $("#badgeMerit"),
 
@@ -46,6 +48,8 @@
     softICTop: $("#badgeSoftICTop"),
     fovTop: $("#badgeFovTop"),
     distTop: $("#badgeDistTop"),
+    odTop: $("#badgeODTop"),
+    realismTop: $("#badgeRealismTop"),
     meritTop: $("#badgeMeritTop"),
 
     sensorPreset: $("#sensorPreset"),
@@ -117,6 +121,9 @@
   const SENSOR_PRESETS = {
     "ARRI Alexa Mini (S35)": { w: 28.25, h: 18.17 },
     "ARRI Alexa Mini LF (LF)": { w: 36.7, h: 25.54 },
+    "IMAX 15/70 (70mm)": { w: 70.41, h: 56.62 },
+    "65mm Analoog (5-perf)": { w: 52.15, h: 23.07 },
+    "ARRI ALEXA 265": { w: 54.12, h: 25.58 },
     "Sony VENICE (FF)": { w: 36.0, h: 24.0 },
     "Fuji GFX (MF)": { w: 43.8, h: 32.9 },
   };
@@ -743,6 +750,85 @@
     planeRefractiveWeight: 520.0,
     planeNearStopExtraWeight: 880.0,
   };
+
+  const REALISM_CFG = {
+    // OD = clear semi-diameter + mechanical margin.
+    mechMarginSmall: 3.0,
+    mechMarginLarge: 6.0,
+    mechMarginSmallApMm: 10.0,
+    mechMarginLargeApMm: 32.0,
+
+    // Family envelopes (soft preferred, hard invalid).
+    presets: {
+      cinePrimeFF: {
+        key: "cinePrimeFF",
+        label: "Cine Prime FF",
+        preferredFrontODMin: 95.0,
+        preferredFrontODMax: 125.0,
+        hardFrontOD: 140.0,
+        preferredMaxOD: 130.0,
+        hardMaxOD: 140.0,
+      },
+      cinePrimeLFMF: {
+        key: "cinePrimeLFMF",
+        label: "Cine Prime LF/MF",
+        preferredFrontODMin: 110.0,
+        preferredFrontODMax: 140.0,
+        hardFrontOD: 160.0,
+        preferredMaxOD: 148.0,
+        hardMaxOD: 160.0,
+      },
+    },
+    largeIcThresholdMm: 44.0,
+    largeIcFullReliefMm: 65.0,
+    largeSensorPenaltyReliefMax: 0.35,
+    largeSensorStageRelief: 0.86,
+
+    // OD / package penalties.
+    rearCheckDepthMm: 14.0,
+    rearMountClearanceMm: 0.35,
+    odFrontHighWeight: 2.2,
+    odFrontLowWeight: 0.24,
+    odMaxWeight: 1.9,
+    odRearMountWeight: 3.8,
+
+    // Thickness / spacing realism.
+    glassCtStrongStartMm: 18.0,
+    glassCtNearInvalidMm: 25.0,
+    glassCtStrongWeight: 3.0,
+    glassCtNearInvalidWeight: 13.0,
+    airGapRareStartMm: 10.0,
+    airGapVeryRareMm: 12.0,
+    airGapRareWeight: 1.5,
+    airGapVeryRareWeight: 4.5,
+
+    // Radius realism.
+    preferredRadiusMm: 13.5,
+    radiusSmallWeight: 2.8,
+    radiusDifficultyWeight: 8.8,
+    radiusDifficultyPower: 2.4,
+    preferredApOverR: 0.36,
+    nearPlaneRadiusMm: 1.2,
+    nearPlaneRadiusWeight: 18.0,
+    hugeRadiusMm: 1200.0,
+    hugeRadiusWeight: 0.45,
+    hugeRadiusPowerTol: 8e-5,
+
+    // Edge/wedge robustness.
+    edgeRobustMarginMm: 0.22,
+    edgeRobustWeight: 14.0,
+
+    // Grouping / architecture.
+    packagingIsolatedWeight: 9.5,
+    packagingManyGroupsWeight: 1.2,
+    preferredGroupCount: 4,
+    stopTooCloseMm: 0.30,
+    stopTooCloseWeight: 8.0,
+
+    // Stage weights (FL acquire -> T tune -> IC growth -> polish).
+    stageWeights: [0.08, 0.24, 0.40, 1.20],
+  };
+
   const MOUNT_TRACE_CFG = {
     enabled: true,
     throatR: 27.0,      // PL throat radius (Ø54)
@@ -1464,6 +1550,8 @@
   let _softIcCacheVal = null;
   let _distCacheKey = "";
   let _distCacheVal = null;
+  let _realismCacheKey = "";
+  let _realismCacheVal = null;
 
   function chiefRadiusAtFieldDeg(workSurfaces, fieldDeg, wavePreset, sensorX) {
     const chief = buildChiefRay(workSurfaces, fieldDeg);
@@ -2502,6 +2590,490 @@
     };
   }
 
+  function realismCoverageNeedMm(targets = {}) {
+    const targetIC = Math.max(0, Number(targets?.targetIC || 0));
+    const sensorW = Math.max(0, Number(targets?.sensorW || 0));
+    const sensorH = Math.max(0, Number(targets?.sensorH || 0));
+    const sensorDiag = Math.hypot(sensorW, sensorH);
+    return Math.max(targetIC, sensorDiag);
+  }
+
+  function realismProfileForTargets(targets = {}) {
+    const needMm = realismCoverageNeedMm(targets);
+    const largeStart = Math.max(1, Number(REALISM_CFG.largeIcThresholdMm || 44));
+    const largeEnd = Math.max(largeStart + 1, Number(REALISM_CFG.largeIcFullReliefMm || 65));
+    const largeT = clamp((needMm - largeStart) / (largeEnd - largeStart), 0, 1);
+    const largeSensor = needMm >= largeStart - 1e-6;
+    const preset = largeSensor
+      ? REALISM_CFG.presets.cinePrimeLFMF
+      : REALISM_CFG.presets.cinePrimeFF;
+    return {
+      needMm,
+      largeSensor,
+      largeT,
+      relief: largeT * Math.max(0, Number(REALISM_CFG.largeSensorPenaltyReliefMax || 0)),
+      preset,
+    };
+  }
+
+  function mechanicalMarginForAperture(ap) {
+    const apMm = Math.max(0, Number(ap || 0));
+    const a0 = Math.max(0.1, Number(REALISM_CFG.mechMarginSmallApMm || 10));
+    const a1 = Math.max(a0 + 0.1, Number(REALISM_CFG.mechMarginLargeApMm || 32));
+    const m0 = Math.max(0.1, Number(REALISM_CFG.mechMarginSmall || 3));
+    const m1 = Math.max(m0, Number(REALISM_CFG.mechMarginLarge || 6));
+    const t = clamp((apMm - a0) / (a1 - a0), 0, 1);
+    return m0 + (m1 - m0) * t;
+  }
+
+  function computeMechanicalEnvelope(surfaces, targets = {}) {
+    const profile = realismProfileForTargets(targets);
+    const preset = profile.preset || REALISM_CFG.presets.cinePrimeFF;
+    const points = [];
+    for (let i = 0; i < (surfaces?.length || 0); i++) {
+      const s = surfaces[i];
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      const ap = Math.max(0, Number(s?.ap || 0));
+      const margin = mechanicalMarginForAperture(ap);
+      const odRadius = ap + margin;
+      const od = odRadius * 2;
+      const vx = Number(s?.vx);
+      points.push({
+        i,
+        vx: Number.isFinite(vx) ? vx : i,
+        ap,
+        margin,
+        odRadius,
+        od,
+      });
+    }
+    if (!points.length) {
+      const rearLimitR = Math.max(
+        0.1,
+        Number(MOUNT_TRACE_CFG.throatR || 27) - Math.max(
+          Number(MOUNT_TRACE_CFG.clearanceMm || 0),
+          Number(REALISM_CFG.rearMountClearanceMm || 0)
+        )
+      );
+      const rearLimitOD = 2 * rearLimitR;
+      return {
+        profileKey: preset.key,
+        profileLabel: preset.label,
+        frontOD: 0,
+        maxOD: 0,
+        rearOD: 0,
+        rearNearMountOD: 0,
+        hasRearNearMountPoints: false,
+        rearMountLimitOD: rearLimitOD,
+        preferredFrontODMin: Number(preset.preferredFrontODMin || 0),
+        preferredFrontODMax: Number(preset.preferredFrontODMax || 0),
+        hardFrontOD: Number(preset.hardFrontOD || Infinity),
+        preferredMaxOD: Number(preset.preferredMaxOD || 0),
+        hardMaxOD: Number(preset.hardMaxOD || Infinity),
+        overPreferred: {
+          frontLowMm: 0,
+          frontHighMm: 0,
+          maxMm: 0,
+          rearMountMm: 0,
+          totalMm: 0,
+        },
+        overHard: {
+          frontMm: 0,
+          maxMm: 0,
+          rearMountMm: 0,
+          totalMm: 0,
+        },
+        hardInvalid: false,
+        points,
+      };
+    }
+
+    let front = points[0];
+    let rear = points[0];
+    let maxPt = points[0];
+    for (const p of points) {
+      if (p.vx < front.vx) front = p;
+      if (p.vx > rear.vx) rear = p;
+      if (p.od > maxPt.od) maxPt = p;
+    }
+
+    const plX = -PL_FFD;
+    const rearDepth = Math.max(1, Number(REALISM_CFG.rearCheckDepthMm || 14));
+    const rearNear = points.filter((p) => p.vx >= (plX - rearDepth));
+    const hasRearNearMountPoints = rearNear.length > 0;
+    const rearNearMountOD = rearNear.length
+      ? Math.max(...rearNear.map((p) => p.od))
+      : rear.od;
+
+    const rearLimitR = Math.max(
+      0.1,
+      Number(MOUNT_TRACE_CFG.throatR || 27) - Math.max(
+        Number(MOUNT_TRACE_CFG.clearanceMm || 0),
+        Number(REALISM_CFG.rearMountClearanceMm || 0)
+      )
+    );
+    const rearMountLimitOD = 2 * rearLimitR;
+
+    const preferredFrontODMin = Number(preset.preferredFrontODMin || 0);
+    const preferredFrontODMax = Number(preset.preferredFrontODMax || preferredFrontODMin);
+    const hardFrontOD = Number(preset.hardFrontOD || Infinity);
+    const preferredMaxOD = Number(preset.preferredMaxOD || preferredFrontODMax);
+    const hardMaxOD = Number(preset.hardMaxOD || Infinity);
+
+    const frontOD = front.od;
+    const maxOD = maxPt.od;
+    const rearOD = rear.od;
+
+    const overPreferred = {
+      frontLowMm: Math.max(0, preferredFrontODMin - frontOD),
+      frontHighMm: Math.max(0, frontOD - preferredFrontODMax),
+      maxMm: Math.max(0, maxOD - preferredMaxOD),
+      rearMountMm: hasRearNearMountPoints ? Math.max(0, rearNearMountOD - rearMountLimitOD) : 0,
+    };
+    overPreferred.totalMm =
+      overPreferred.frontLowMm +
+      overPreferred.frontHighMm +
+      overPreferred.maxMm +
+      overPreferred.rearMountMm;
+
+    const overHard = {
+      frontMm: Math.max(0, frontOD - hardFrontOD),
+      maxMm: Math.max(0, maxOD - hardMaxOD),
+      rearMountMm: hasRearNearMountPoints ? Math.max(0, rearNearMountOD - rearMountLimitOD) : 0,
+    };
+    overHard.totalMm = overHard.frontMm + overHard.maxMm + overHard.rearMountMm;
+
+    return {
+      profileKey: preset.key,
+      profileLabel: preset.label,
+      frontOD,
+      maxOD,
+      rearOD,
+      rearNearMountOD,
+      hasRearNearMountPoints,
+      rearMountLimitOD,
+      preferredFrontODMin,
+      preferredFrontODMax,
+      hardFrontOD,
+      preferredMaxOD,
+      hardMaxOD,
+      overPreferred,
+      overHard,
+      hardInvalid: overHard.totalMm > 1e-6,
+      points,
+    };
+  }
+
+  function evaluateRealismPenalty(surfaces, targets = {}) {
+    const profile = realismProfileForTargets(targets);
+    const env = computeMechanicalEnvelope(surfaces, targets);
+    const reliefScale = 1 - Math.max(0, Number(profile.relief || 0));
+    const apertureReliefScale = 1 - Math.max(0, Number(profile.relief || 0)) * 0.85;
+
+    let odPenalty =
+      Number(REALISM_CFG.odFrontLowWeight || 0) * Math.pow(env.overPreferred.frontLowMm, 2) +
+      Number(REALISM_CFG.odFrontHighWeight || 0) * Math.pow(env.overPreferred.frontHighMm, 2) +
+      Number(REALISM_CFG.odMaxWeight || 0) * Math.pow(env.overPreferred.maxMm, 2) +
+      Number(REALISM_CFG.odRearMountWeight || 0) * Math.pow(env.overPreferred.rearMountMm, 2);
+    odPenalty *= reliefScale;
+
+    const hardOverMm = Math.max(0, Number(env.overHard?.totalMm || 0));
+    if (hardOverMm > 0) {
+      odPenalty += 120.0 * hardOverMm * hardOverMm;
+    }
+
+    let thicknessPenalty = 0;
+    let radiusPenalty = 0;
+    let edgePenalty = 0;
+    let packagingPenalty = 0;
+    let longGlassCount = 0;
+    let longAirCount = 0;
+    let isolatedSurfaceCount = 0;
+    let groupCount = 0;
+    let stopClearanceMinMm = Infinity;
+
+    const lastSegIdx = (() => {
+      for (let i = (surfaces?.length || 0) - 2; i >= 0; i--) {
+        const t = String(surfaces[i]?.type || "").toUpperCase();
+        if (t !== "OBJ" && t !== "IMS") return i;
+      }
+      return -1;
+    })();
+
+    const refrFlags = [];
+    for (let i = 0; i < (surfaces?.length || 0); i++) {
+      const s = surfaces[i];
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") {
+        refrFlags.push(false);
+        continue;
+      }
+
+      const prevName = i > 0 ? resolveGlassName(surfaces[i - 1]?.glass || "AIR") : "AIR";
+      const nextName = resolveGlassName(s?.glass || "AIR");
+      const prevMedium = String(prevName || "AIR").toUpperCase();
+      const nextMedium = String(nextName || "AIR").toUpperCase();
+      const isRefractive = prevMedium !== nextMedium;
+      refrFlags.push(isRefractive);
+
+      if (!isRefractive) continue;
+
+      const absR = Math.abs(Number(s?.R || 0));
+      const ap = Math.max(0.1, Number(s?.ap || 0));
+      const prefR = Math.max(1, Number(REALISM_CFG.preferredRadiusMm || 13.5));
+      if (absR < prefR) {
+        const d = (prefR - Math.max(1e-6, absR)) / prefR;
+        const apScale = Math.pow(clamp(ap / 12.0, 0.5, 3.2), 1.5);
+        radiusPenalty += Number(REALISM_CFG.radiusSmallWeight || 0) * d * d * apScale;
+      }
+
+      const ratio = ap / Math.max(1e-6, absR);
+      const steep = Math.max(0, ratio - Number(REALISM_CFG.preferredApOverR || 0.36));
+      if (steep > 0) {
+        const powP = Math.max(1.5, Number(REALISM_CFG.radiusDifficultyPower || 2.4));
+        const apScale = Math.pow(clamp(ap / 14.0, 0.6, 3.8), 1.2);
+        radiusPenalty += Number(REALISM_CFG.radiusDifficultyWeight || 0) * Math.pow(steep, powP) * apScale;
+      }
+
+      if (absR > 1e-9 && absR < Number(REALISM_CFG.nearPlaneRadiusMm || 1.2)) {
+        const d = Number(REALISM_CFG.nearPlaneRadiusMm || 1.2) - absR;
+        radiusPenalty += Number(REALISM_CFG.nearPlaneRadiusWeight || 0) * d * d;
+      }
+
+      const nBefore = Number(GLASS_DB[resolveGlassName(prevName)]?.nd || 1.0);
+      const nAfter = Number(GLASS_DB[resolveGlassName(nextName)]?.nd || 1.0);
+      if (absR > Number(REALISM_CFG.hugeRadiusMm || 1200)) {
+        const approxPower = Math.abs((nAfter - nBefore) / Math.max(1e-6, absR));
+        if (approxPower < Number(REALISM_CFG.hugeRadiusPowerTol || 8e-5)) {
+          const d = (absR - Number(REALISM_CFG.hugeRadiusMm || 1200)) / Math.max(1, Number(REALISM_CFG.hugeRadiusMm || 1200));
+          radiusPenalty += Number(REALISM_CFG.hugeRadiusWeight || 0) * d * d;
+        }
+      }
+    }
+    radiusPenalty *= apertureReliefScale;
+
+    for (let i = 0; i < Math.max(0, (surfaces?.length || 0) - 1); i++) {
+      const sA = surfaces[i];
+      const sB = surfaces[i + 1];
+      const tA = String(sA?.type || "").toUpperCase();
+      const tB = String(sB?.type || "").toUpperCase();
+      if (tA === "OBJ" || tA === "IMS" || tB === "OBJ" || tB === "IMS") continue;
+
+      const mediumAfterA = String(resolveGlassName(sA?.glass || "AIR")).toUpperCase();
+      const segT = Math.max(0, Number(sA?.t || 0));
+      const isFinalImageGap = mediumAfterA === "AIR" && i === lastSegIdx;
+
+      if (mediumAfterA === "AIR") {
+        if (!isFinalImageGap) {
+          if (segT > Number(REALISM_CFG.airGapRareStartMm || 10)) {
+            const d = segT - Number(REALISM_CFG.airGapRareStartMm || 10);
+            thicknessPenalty += Number(REALISM_CFG.airGapRareWeight || 0) * d * d;
+            longAirCount++;
+          }
+          if (segT > Number(REALISM_CFG.airGapVeryRareMm || 12)) {
+            const d = segT - Number(REALISM_CFG.airGapVeryRareMm || 12);
+            thicknessPenalty += Number(REALISM_CFG.airGapVeryRareWeight || 0) * d * d;
+          }
+        }
+      } else {
+        if (segT > Number(REALISM_CFG.glassCtStrongStartMm || 18)) {
+          const d = segT - Number(REALISM_CFG.glassCtStrongStartMm || 18);
+          thicknessPenalty += Number(REALISM_CFG.glassCtStrongWeight || 0) * d * d;
+          longGlassCount++;
+        }
+        if (segT > Number(REALISM_CFG.glassCtNearInvalidMm || 25)) {
+          const d = segT - Number(REALISM_CFG.glassCtNearInvalidMm || 25);
+          thicknessPenalty += Number(REALISM_CFG.glassCtNearInvalidWeight || 0) * d * d;
+        }
+      }
+
+      if (mediumAfterA !== "AIR") {
+        const apShared = Math.max(
+          0.1,
+          Math.min(
+            Number(sA?.ap || 0),
+            Number(sB?.ap || 0),
+            maxApForSurface(sA),
+            maxApForSurface(sB)
+          )
+        );
+        const minGap = minGapBetweenSurfaces(sA, sB, apShared, 11);
+        if (Number.isFinite(minGap)) {
+          const robustNeed = Number(PHYS_CFG.minGlassCT || 0.35) + Number(REALISM_CFG.edgeRobustMarginMm || 0.22);
+          if (minGap < robustNeed) {
+            const d = robustNeed - minGap;
+            edgePenalty += Number(REALISM_CFG.edgeRobustWeight || 0) * d * d;
+          }
+        }
+      }
+    }
+
+    let inGroup = false;
+    for (let i = 0; i < refrFlags.length; i++) {
+      const here = !!refrFlags[i];
+      if (here && !inGroup) {
+        groupCount++;
+        inGroup = true;
+      } else if (!here) {
+        inGroup = false;
+      }
+
+      if (!here) continue;
+      const prev = i > 0 ? !!refrFlags[i - 1] : false;
+      const next = i + 1 < refrFlags.length ? !!refrFlags[i + 1] : false;
+      if (!prev && !next) isolatedSurfaceCount++;
+    }
+
+    if (isolatedSurfaceCount > 0) {
+      packagingPenalty += Number(REALISM_CFG.packagingIsolatedWeight || 0) * isolatedSurfaceCount * isolatedSurfaceCount;
+    }
+    const preferredGroups = Math.max(1, Number(REALISM_CFG.preferredGroupCount || 4));
+    if (groupCount > preferredGroups + 2) {
+      const d = groupCount - (preferredGroups + 2);
+      packagingPenalty += Number(REALISM_CFG.packagingManyGroupsWeight || 0) * d * d;
+    }
+
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx >= 0) {
+      const leftGap = stopIdx > 0 ? Math.max(0, Number(surfaces[stopIdx - 1]?.t || 0)) : Infinity;
+      const rightGap = Math.max(0, Number(surfaces[stopIdx]?.t || 0));
+      stopClearanceMinMm = Math.min(leftGap, rightGap);
+      const stopMin = Number(REALISM_CFG.stopTooCloseMm || 0.30);
+      if (Number.isFinite(stopClearanceMinMm) && stopClearanceMinMm < stopMin) {
+        const d = stopMin - stopClearanceMinMm;
+        packagingPenalty += Number(REALISM_CFG.stopTooCloseWeight || 0) * d * d;
+      }
+    }
+
+    const basePenalty = odPenalty + thicknessPenalty + radiusPenalty + edgePenalty + packagingPenalty;
+    return {
+      penalty: basePenalty,
+      hardInvalid: !!env.hardInvalid,
+      hardOverMm,
+      envelope: env,
+      breakdown: {
+        profileKey: env.profileKey,
+        profileLabel: env.profileLabel,
+        largeSensor: !!profile.largeSensor,
+        relief: Number(profile.relief || 0),
+        odPenalty,
+        thicknessPenalty,
+        radiusPenalty,
+        edgePenalty,
+        packagingPenalty,
+        frontOD: Number(env.frontOD || 0),
+        maxOD: Number(env.maxOD || 0),
+        rearOD: Number(env.rearOD || 0),
+        rearNearMountOD: Number(env.rearNearMountOD || 0),
+        rearMountLimitOD: Number(env.rearMountLimitOD || 0),
+        overPreferredMm: Number(env.overPreferred?.totalMm || 0),
+        hardOverMm,
+        isolatedSurfaceCount,
+        groupCount,
+        longGlassCount,
+        longAirCount,
+        stopClearanceMinMm: Number.isFinite(stopClearanceMinMm) ? stopClearanceMinMm : null,
+      },
+    };
+  }
+
+  function getRealismPenaltyCached(surfaces, targets = {}) {
+    const t = targets || {};
+    const keyObj = {
+      targetIC: Number(t.targetIC || 0).toFixed(4),
+      sensorW: Number(t.sensorW || 0).toFixed(4),
+      sensorH: Number(t.sensorH || 0).toFixed(4),
+      surfaces: (surfaces || []).map((s) => ({
+        type: String(s?.type || ""),
+        R: Number(s?.R || 0).toFixed(6),
+        ap: Number(s?.ap || 0).toFixed(6),
+        t: Number(s?.t || 0).toFixed(6),
+        vx: Number(s?.vx || 0).toFixed(6),
+        glass: String(s?.glass || "AIR"),
+        stop: !!s?.stop,
+      })),
+    };
+    const key = JSON.stringify(keyObj);
+    if (key === _realismCacheKey && _realismCacheVal) return _realismCacheVal;
+    const val = evaluateRealismPenalty(surfaces, t);
+    _realismCacheKey = key;
+    _realismCacheVal = val;
+    return val;
+  }
+
+  function realismWeightForStage(stage) {
+    const st = Number(stage);
+    if (st === 0) return Number(REALISM_CFG.stageWeights?.[0] || 0);
+    if (st === 1) return Number(REALISM_CFG.stageWeights?.[1] || 0);
+    if (st === 2) return Number(REALISM_CFG.stageWeights?.[2] || 0);
+    if (st >= 3) return Number(REALISM_CFG.stageWeights?.[3] || 0);
+    return 0;
+  }
+
+  function realismWeightForPriority(pri, targets = {}) {
+    if (!pri || !pri.feasible) return 0;
+    let w = realismWeightForStage(pri.stage);
+    if (!pri.flInBand) {
+      w = Math.min(w, Number(REALISM_CFG.stageWeights?.[0] || w));
+    }
+    if (pri.stage >= 3 && !pri.tGood) {
+      w = Math.min(w, Number(REALISM_CFG.stageWeights?.[1] || w));
+    }
+    const profile = realismProfileForTargets(targets);
+    if (profile.largeSensor && pri.stage <= 2) {
+      w *= Math.max(0.25, Number(REALISM_CFG.largeSensorStageRelief || 0.86));
+    }
+    return Math.max(0, w);
+  }
+
+  function realismPenaltyFromBase(realismBase, realismWeight = 0) {
+    const weight = Math.max(0, Number(realismWeight || 0));
+    const base = realismBase || { penalty: 0, hardInvalid: false, hardOverMm: 0, breakdown: {}, envelope: null };
+    const basePenalty = Math.max(0, Number(base.penalty || 0));
+    return {
+      weight,
+      basePenalty,
+      penalty: basePenalty * weight,
+      hardInvalid: !!base.hardInvalid,
+      hardOverMm: Math.max(0, Number(base.hardOverMm || 0)),
+      breakdown: base.breakdown || {},
+      envelope: base.envelope || null,
+    };
+  }
+
+  function formatEnvelopeBadgeText(envelope, compact = false) {
+    if (!envelope || !Number.isFinite(envelope.frontOD) || !Number.isFinite(envelope.maxOD)) {
+      return compact ? "OD F— • M—" : "Front OD: — • Max OD: —";
+    }
+    const f = Number(envelope.frontOD).toFixed(1);
+    const m = Number(envelope.maxOD).toFixed(1);
+    const rear = Number.isFinite(envelope.rearOD) ? Number(envelope.rearOD).toFixed(1) : "—";
+    const hardTag = envelope.hardInvalid ? " ❌" : "";
+    return compact
+      ? `OD F${f} • M${m}${hardTag}`
+      : `Front OD: ${f}mm • Max OD: ${m}mm • Rear OD: ${rear}mm${hardTag}`;
+  }
+
+  function formatRealismBadgeText(realismEval, compact = false) {
+    const pen = Number(realismEval?.penalty);
+    const base = Number(realismEval?.basePenalty);
+    if (!Number.isFinite(pen) && !Number.isFinite(base)) {
+      return compact ? "Realism —" : "Realism: —";
+    }
+    const b = realismEval?.breakdown || {};
+    const od = Number(b.odPenalty || 0);
+    const th = Number(b.thicknessPenalty || 0);
+    const rr = Number(b.radiusPenalty || 0);
+    const ed = Number(b.edgePenalty || 0);
+    const pk = Number(b.packagingPenalty || 0);
+    const hard = realismEval?.hardInvalid ? " • hard❌" : "";
+    if (compact) {
+      return `Realism ${Number.isFinite(pen) ? pen.toFixed(1) : "—"}${hard}`;
+    }
+    return `Realism: ${Number.isFinite(pen) ? pen.toFixed(1) : "—"} (OD ${od.toFixed(1)} • t ${th.toFixed(1)} • R ${rr.toFixed(1)} • edge ${ed.toFixed(1)} • pack ${pk.toFixed(1)}${Number.isFinite(base) ? ` • base ${base.toFixed(1)}` : ""}${hard})`;
+  }
+
   function collectUiSnapshot() {
     return {
       sensorPreset: ui.sensorPreset?.value || "ARRI Alexa Mini LF (LF)",
@@ -2756,6 +3328,12 @@
     distortionStats = null,
     distortionPenalty = 0,
     distortionWeight = 0,
+    realismPenalty = 0,
+    realismBasePenalty = 0,
+    realismWeight = 0,
+    realismHardInvalid = false,
+    realismBreakdown = null,
+    envelopeStats = null,
   }){
     const edge = Number.isFinite(fov?.dfov) ? clamp(fov.dfov * 0.5, 4, 60) : 15;
     const f0 = 0;
@@ -2836,6 +3414,7 @@
     if (Number.isFinite(internalCrossPenalty) && internalCrossPenalty > 0) merit += internalCrossPenalty;
     if (hardInvalid) merit += MERIT_CFG.hardInvalidPenalty;
     if (Number.isFinite(distortionPenalty) && distortionPenalty > 0) merit += distortionPenalty;
+    if (Number.isFinite(realismPenalty) && realismPenalty > 0) merit += realismPenalty;
 
     const breakdown = {
       rmsCenter, rmsEdge,
@@ -2857,6 +3436,23 @@
       distWeight: Number.isFinite(distortionWeight) ? Number(distortionWeight) : 0,
       distSampleCount: Number.isFinite(distortionStats?.sampleCount) ? Number(distortionStats.sampleCount) : 0,
       distValidSamples: Number.isFinite(distortionStats?.validSamples) ? Number(distortionStats.validSamples) : 0,
+      frontOD: Number.isFinite(envelopeStats?.frontOD) ? Number(envelopeStats.frontOD) : null,
+      maxOD: Number.isFinite(envelopeStats?.maxOD) ? Number(envelopeStats.maxOD) : null,
+      rearOD: Number.isFinite(envelopeStats?.rearOD) ? Number(envelopeStats.rearOD) : null,
+      realismPenalty: Number.isFinite(realismPenalty) ? Number(realismPenalty) : 0,
+      realismBasePenalty: Number.isFinite(realismBasePenalty) ? Number(realismBasePenalty) : 0,
+      realismWeight: Number.isFinite(realismWeight) ? Number(realismWeight) : 0,
+      realismHardInvalid: !!realismHardInvalid,
+      realismHardOverMm: Number.isFinite(realismBreakdown?.hardOverMm)
+        ? Number(realismBreakdown.hardOverMm)
+        : Number.isFinite(envelopeStats?.overHard?.totalMm) ? Number(envelopeStats.overHard.totalMm) : 0,
+      realismOdPenalty: Number.isFinite(realismBreakdown?.odPenalty) ? Number(realismBreakdown.odPenalty) : 0,
+      realismThicknessPenalty: Number.isFinite(realismBreakdown?.thicknessPenalty) ? Number(realismBreakdown.thicknessPenalty) : 0,
+      realismRadiusPenalty: Number.isFinite(realismBreakdown?.radiusPenalty) ? Number(realismBreakdown.radiusPenalty) : 0,
+      realismEdgePenalty: Number.isFinite(realismBreakdown?.edgePenalty) ? Number(realismBreakdown.edgePenalty) : 0,
+      realismPackagingPenalty: Number.isFinite(realismBreakdown?.packagingPenalty) ? Number(realismBreakdown.packagingPenalty) : 0,
+      realismProfileLabel: String(realismBreakdown?.profileLabel || envelopeStats?.profileLabel || ""),
+      realismLargeSensor: !!realismBreakdown?.largeSensor,
     };
 
     return { merit, breakdown };
@@ -3377,6 +3973,14 @@
     const targetEflUi = num(ui.optTargetFL?.value, NaN);
     const targetTUi = num(ui.optTargetT?.value, NaN);
     const targetICUi = Math.max(0, num(ui.optTargetIC?.value, 0));
+    const realismBase = getRealismPenaltyCached(
+      lens.surfaces,
+      {
+        targetIC: targetICUi,
+        sensorW,
+        sensorH,
+      }
+    );
     const distStats = getDistortionChiefStatsCached(
       lens.surfaces,
       wavePreset,
@@ -3394,12 +3998,18 @@
         T,
         softIcMm: softIcValid ? icDiameterMm : 0,
         intrusion,
-        hardInvalid: !!phys.hardFail || !!rayCross.invalid,
+        hardInvalid: !!phys.hardFail || !!rayCross.invalid || !!realismBase?.hardInvalid,
         physPenalty: physPenaltyBase,
         worstOverlap: Number(phys.worstOverlap || 0),
         worstPinch: Number(phys.worstPinch || 0),
         internalCrossPairs: Number(rayCross.crossPairs || 0),
         internalCrossSegments: Number(rayCross.crossSegments || 0),
+        realismPenalty: Number(realismBase?.penalty || 0),
+        realismHardInvalid: !!realismBase?.hardInvalid,
+        realismHardOverMm: Number(realismBase?.hardOverMm || 0),
+        frontOD: Number(realismBase?.envelope?.frontOD || 0),
+        maxOD: Number(realismBase?.envelope?.maxOD || 0),
+        rearOD: Number(realismBase?.envelope?.rearOD || 0),
       },
       {
         targetEfl: targetEflUi,
@@ -3411,6 +4021,19 @@
     const distPenaltyRes = distortionPenaltyFromStats(distStats, distWeight);
     const distBadgeText = formatDistortionBadgeText(distStats, false);
     const distBadgeTopText = formatDistortionBadgeText(distStats, true);
+    const realismWeight = realismWeightForPriority(
+      previewPri,
+      {
+        targetIC: targetICUi,
+        sensorW,
+        sensorH,
+      }
+    );
+    const realismPenaltyRes = realismPenaltyFromBase(realismBase, realismWeight);
+    const odBadgeText = formatEnvelopeBadgeText(realismPenaltyRes.envelope, false);
+    const odBadgeTopText = formatEnvelopeBadgeText(realismPenaltyRes.envelope, true);
+    const realismBadgeText = formatRealismBadgeText(realismPenaltyRes, false);
+    const realismBadgeTopText = formatRealismBadgeText(realismPenaltyRes, true);
 
     const meritRes = computeMeritV1({
       surfaces: lens.surfaces,
@@ -3423,13 +4046,19 @@
       targetEfl: targetEflUi,
       targetT: targetTUi,
       physPenalty: physPenaltyBase,
-      hardInvalid: !!phys.hardFail || !!rayCross.invalid,
+      hardInvalid: !!phys.hardFail || !!rayCross.invalid || !!realismPenaltyRes.hardInvalid,
       internalCrossPairs: Number(rayCross.crossPairs || 0),
       internalCrossSegments: Number(rayCross.crossSegments || 0),
       internalCrossPenalty: crossPenalty,
       distortionStats: distStats,
       distortionPenalty: distPenaltyRes.penalty,
       distortionWeight: distPenaltyRes.weight,
+      realismPenalty: realismPenaltyRes.penalty,
+      realismBasePenalty: realismPenaltyRes.basePenalty,
+      realismWeight: realismPenaltyRes.weight,
+      realismHardInvalid: realismPenaltyRes.hardInvalid,
+      realismBreakdown: realismPenaltyRes.breakdown,
+      envelopeStats: realismPenaltyRes.envelope,
     });
 
     const m = meritRes.merit;
@@ -3442,6 +4071,9 @@
       `${Number.isFinite(bd.vigMidPct) ? ` • Vmid ${bd.vigMidPct}%` : ""}` +
       `${Number.isFinite(bd.distRmsPct) ? ` • DistRMS ${bd.distRmsPct.toFixed(2)}%` : ""}` +
       `${Number.isFinite(bd.distMaxPct) ? ` • DistMAX ${bd.distMaxPct.toFixed(2)}%` : ""}` +
+      `${Number.isFinite(bd.frontOD) ? ` • FrontOD ${bd.frontOD.toFixed(1)}mm` : ""}` +
+      `${Number.isFinite(bd.maxOD) ? ` • MaxOD ${bd.maxOD.toFixed(1)}mm` : ""}` +
+      `${Number.isFinite(bd.realismPenalty) ? ` • Realism ${bd.realismPenalty.toFixed(1)}` : ""}` +
       `${Number(bd.internalCrossPairs || 0) > 0 ? ` • XOVER ${Number(bd.internalCrossPairs || 0)}` : ""}` +
       `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""}` +
       `${bd.physPenalty > 0 ? ` • PHYS +${bd.physPenalty.toFixed(1)}` : ""}` +
@@ -3469,6 +4101,8 @@
     if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
     if (ui.softIC) ui.softIC.textContent = softIcDetailTxt;
     if (ui.dist) ui.dist.textContent = distBadgeText;
+    if (ui.od) ui.od.textContent = odBadgeText;
+    if (ui.realism) ui.realism.textContent = realismBadgeText;
     if (ui.fov) ui.fov.textContent = fovTxt;
 
     if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
@@ -3477,6 +4111,8 @@
     if (ui.softICTop) ui.softICTop.textContent = softIcTxt;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.distTop) ui.distTop.textContent = distBadgeTopText;
+    if (ui.odTop) ui.odTop.textContent = odBadgeTopText;
+    if (ui.realismTop) ui.realismTop.textContent = realismBadgeTopText;
 
     if (phys.hardFail && ui.footerWarn) {
       ui.footerWarn.textContent =
@@ -3484,6 +4120,9 @@
     } else if (rayCross.invalid && ui.footerWarn) {
       ui.footerWarn.textContent =
         `INVALID optics: ${rayCross.crossPairs} ray crossings inside glass across ${rayCross.crossSegments} segment(s).`;
+    } else if (realismPenaltyRes.hardInvalid && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `INVALID envelope: OD exceeds hard housing limits (${odBadgeTopText}).`;
     } else if (phys.airGapCount < PHYS_CFG.minAirGapsPreferred && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Few air gaps (${phys.airGapCount}); aim for >= ${PHYS_CFG.minAirGapsPreferred} for practical designs.`;
@@ -3501,7 +4140,9 @@
     if (ui.metaInfo) {
       ui.metaInfo.textContent =
         `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm • ` +
-        (softIcValid ? `IC ${icDiameterMm.toFixed(1)}mm` : "IC —");
+        (softIcValid ? `IC ${icDiameterMm.toFixed(1)}mm` : "IC —") +
+        ` • FrontOD ${Number.isFinite(realismPenaltyRes?.envelope?.frontOD) ? realismPenaltyRes.envelope.frontOD.toFixed(1) : "—"}mm` +
+        ` • MaxOD ${Number.isFinite(realismPenaltyRes?.envelope?.maxOD) ? realismPenaltyRes.envelope.maxOD.toFixed(1) : "—"}mm`;
     }
 
     resizeCanvasToCSS();
@@ -3539,6 +4180,8 @@
       softIcTxt,
       crossTxt,
       distBadgeTopText,
+      odBadgeTopText,
+      realismBadgeTopText,
       fovTxt,
       rearTxt,
       lenTxt,
@@ -5980,6 +6623,14 @@
         distFlavor: "unknown",
         distPenalty: 0,
         distWeight: 0,
+        realismPenalty: 0,
+        realismBasePenalty: 0,
+        realismWeight: 0,
+        realismHardInvalid: false,
+        realismHardOverMm: 0,
+        frontOD: null,
+        maxOD: null,
+        rearOD: null,
         internalCrossPairs: 0,
         internalCrossSegments: 0,
         afOk,
@@ -6002,6 +6653,21 @@
           distWeight: 0,
           distSampleCount: 0,
           distValidSamples: 0,
+          frontOD: null,
+          maxOD: null,
+          rearOD: null,
+          realismPenalty: 0,
+          realismBasePenalty: 0,
+          realismWeight: 0,
+          realismHardInvalid: false,
+          realismHardOverMm: 0,
+          realismOdPenalty: 0,
+          realismThicknessPenalty: 0,
+          realismRadiusPenalty: 0,
+          realismEdgePenalty: 0,
+          realismPackagingPenalty: 0,
+          realismProfileLabel: "",
+          realismLargeSensor: false,
         },
       });
     }
@@ -6012,7 +6678,7 @@
     const rayCross = detectInternalRayCrossings(traces, surfaces, wavePreset);
     const crossPenalty = internalCrossPenaltyFromStats(rayCross);
     const physPenaltyTotal = Number(phys.penalty || 0) + crossPenalty;
-    const hardInvalidCombined = !!phys.hardFail || !!rayCross.invalid;
+    const hardInvalidBase = !!phys.hardFail || !!rayCross.invalid;
 
     const vCount = traces.filter(t=>t.vignetted).length;
     const vigFrac = traces.length ? (vCount / traces.length) : 1;
@@ -6047,6 +6713,14 @@
         distFlavor: "unknown",
         distPenalty: 0,
         distWeight: 0,
+        realismPenalty: 0,
+        realismBasePenalty: 0,
+        realismWeight: 0,
+        realismHardInvalid: false,
+        realismHardOverMm: 0,
+        frontOD: null,
+        maxOD: null,
+        rearOD: null,
         internalCrossPairs: Number(rayCross.crossPairs || 0),
         internalCrossSegments: Number(rayCross.crossSegments || 0),
         breakdown: {
@@ -6070,6 +6744,21 @@
           distWeight: 0,
           distSampleCount: 0,
           distValidSamples: 0,
+          frontOD: null,
+          maxOD: null,
+          rearOD: null,
+          realismPenalty: 0,
+          realismBasePenalty: 0,
+          realismWeight: 0,
+          realismHardInvalid: false,
+          realismHardOverMm: 0,
+          realismOdPenalty: 0,
+          realismThicknessPenalty: 0,
+          realismRadiusPenalty: 0,
+          realismEdgePenalty: 0,
+          realismPackagingPenalty: 0,
+          realismProfileLabel: "",
+          realismLargeSensor: false,
         },
       });
     }
@@ -6120,6 +6809,16 @@
     }
     tIcMs += icEvalMs;
 
+    const realismBase = getRealismPenaltyCached(
+      surfaces,
+      {
+        targetIC,
+        sensorW,
+        sensorH,
+      }
+    );
+    const hardInvalidCombined = hardInvalidBase || !!realismBase?.hardInvalid;
+
     const provisionalPriority = buildOptPriority(
       {
         score: 0,
@@ -6133,6 +6832,12 @@
         worstPinch: Number(phys.worstPinch || 0),
         internalCrossPairs: Number(rayCross.crossPairs || 0),
         internalCrossSegments: Number(rayCross.crossSegments || 0),
+        realismPenalty: Number(realismBase?.penalty || 0),
+        realismHardInvalid: !!realismBase?.hardInvalid,
+        realismHardOverMm: Number(realismBase?.hardOverMm || 0),
+        frontOD: Number(realismBase?.envelope?.frontOD || 0),
+        maxOD: Number(realismBase?.envelope?.maxOD || 0),
+        rearOD: Number(realismBase?.envelope?.rearOD || 0),
       },
       { targetEfl, targetIC, targetT }
     );
@@ -6169,6 +6874,15 @@
       ? distortionWeightForPriority(provisionalPriority)
       : 0;
     const distPenaltyRes = distortionPenaltyFromStats(distortionStats, distortionWeight);
+    const realismWeight = realismWeightForPriority(
+      provisionalPriority,
+      {
+        targetIC,
+        sensorW,
+        sensorH,
+      }
+    );
+    const realismPenaltyRes = realismPenaltyFromBase(realismBase, realismWeight);
 
     const meritRes = computeMeritV1({
       surfaces,
@@ -6190,6 +6904,12 @@
       distortionStats,
       distortionPenalty: distPenaltyRes.penalty,
       distortionWeight: distPenaltyRes.weight,
+      realismPenalty: realismPenaltyRes.penalty,
+      realismBasePenalty: realismPenaltyRes.basePenalty,
+      realismWeight: realismPenaltyRes.weight,
+      realismHardInvalid: realismPenaltyRes.hardInvalid,
+      realismBreakdown: realismPenaltyRes.breakdown,
+      envelopeStats: realismPenaltyRes.envelope,
     });
     tTraceMs += Math.max(0, performance.now() - trace0 - icEvalMs);
 
@@ -6220,6 +6940,14 @@
       distFlavor: meritRes.breakdown.distFlavor,
       distPenalty: meritRes.breakdown.distPenalty,
       distWeight: meritRes.breakdown.distWeight,
+      realismPenalty: meritRes.breakdown.realismPenalty,
+      realismBasePenalty: meritRes.breakdown.realismBasePenalty,
+      realismWeight: meritRes.breakdown.realismWeight,
+      realismHardInvalid: meritRes.breakdown.realismHardInvalid,
+      realismHardOverMm: meritRes.breakdown.realismHardOverMm,
+      frontOD: meritRes.breakdown.frontOD,
+      maxOD: meritRes.breakdown.maxOD,
+      rearOD: meritRes.breakdown.rearOD,
       internalCrossPairs: Number(rayCross.crossPairs || 0),
       internalCrossSegments: Number(rayCross.crossSegments || 0),
       breakdown: meritRes.breakdown,
@@ -6241,7 +6969,49 @@
     const score = Number.isFinite(evalRes?.score) ? Number(evalRes.score) : 1e9;
     const crossPairs = Math.max(0, Number(evalRes?.internalCrossPairs || 0));
     const crossSegments = Math.max(0, Number(evalRes?.internalCrossSegments || 0));
-    const hardInvalid = !!evalRes?.hardInvalid || crossPairs > 0;
+    const realismPenalty = Math.max(
+      0,
+      Number(evalRes?.realismPenalty ?? evalRes?.breakdown?.realismPenalty ?? 0)
+    );
+    const realismBasePenalty = Math.max(
+      0,
+      Number(evalRes?.realismBasePenalty ?? evalRes?.breakdown?.realismBasePenalty ?? 0)
+    );
+    const realismWeight = Math.max(
+      0,
+      Number(evalRes?.realismWeight ?? evalRes?.breakdown?.realismWeight ?? 0)
+    );
+    const realismHardInvalid = !!(evalRes?.realismHardInvalid ?? evalRes?.breakdown?.realismHardInvalid);
+    const realismHardOverMm = Math.max(
+      0,
+      Number(evalRes?.realismHardOverMm ?? evalRes?.breakdown?.realismHardOverMm ?? 0)
+    );
+    const frontOD = Number(evalRes?.frontOD ?? evalRes?.breakdown?.frontOD);
+    const maxOD = Number(evalRes?.maxOD ?? evalRes?.breakdown?.maxOD);
+    const rearOD = Number(evalRes?.rearOD ?? evalRes?.breakdown?.rearOD);
+    const realismOdPenalty = Math.max(
+      0,
+      Number(evalRes?.realismOdPenalty ?? evalRes?.breakdown?.realismOdPenalty ?? 0)
+    );
+    const realismThicknessPenalty = Math.max(
+      0,
+      Number(evalRes?.realismThicknessPenalty ?? evalRes?.breakdown?.realismThicknessPenalty ?? 0)
+    );
+    const realismRadiusPenalty = Math.max(
+      0,
+      Number(evalRes?.realismRadiusPenalty ?? evalRes?.breakdown?.realismRadiusPenalty ?? 0)
+    );
+    const realismEdgePenalty = Math.max(
+      0,
+      Number(evalRes?.realismEdgePenalty ?? evalRes?.breakdown?.realismEdgePenalty ?? 0)
+    );
+    const realismPackagingPenalty = Math.max(
+      0,
+      Number(evalRes?.realismPackagingPenalty ?? evalRes?.breakdown?.realismPackagingPenalty ?? 0)
+    );
+    const realismProfileLabel = String(evalRes?.realismProfileLabel ?? evalRes?.breakdown?.realismProfileLabel ?? "");
+    const realismLargeSensor = !!(evalRes?.realismLargeSensor ?? evalRes?.breakdown?.realismLargeSensor);
+    const hardInvalid = !!evalRes?.hardInvalid || crossPairs > 0 || realismHardInvalid;
     const intrusionMm = Math.max(0, Number(evalRes?.intrusion || 0));
     const overlapMm = Math.max(0, Number(evalRes?.worstOverlap || 0));
     const pinchMm = Math.max(0, Number(evalRes?.worstPinch || 0));
@@ -6260,7 +7030,9 @@
       Math.max(0, pinchMm - 0.35) * 160 +
       crossPairs * 1800 +
       crossSegments * 500 +
-      physPenalty * 0.02;
+      physPenalty * 0.02 +
+      (realismHardInvalid ? (1200 + realismHardOverMm * 1800) : 0) +
+      realismPenalty * 0.015;
 
     const eflErrRel = Number.isFinite(efl) && targetEfl > 1e-9
       ? Math.abs(efl - targetEfl) / targetEfl
@@ -6298,6 +7070,7 @@
     const distRmsScore = Number.isFinite(distRmsPctRaw) ? Math.abs(distRmsPctRaw) : 999;
     const distMaxScore = Number.isFinite(distMaxPctRaw) ? Math.abs(distMaxPctRaw) : 999;
     const distortionScore = distRmsScore + 0.45 * distMaxScore;
+    const realismScore = realismPenalty + 0.25 * realismBasePenalty;
 
     let stage = feasible ? 0 : -1;
     // Stage flow: FL acquire -> T coarse -> IC growth -> fine tune.
@@ -6349,6 +7122,22 @@
       distRmsScore,
       distMaxScore,
       distortionScore,
+      realismPenalty,
+      realismBasePenalty,
+      realismWeight,
+      realismHardInvalid,
+      realismHardOverMm,
+      realismScore,
+      frontOD: Number.isFinite(frontOD) ? frontOD : null,
+      maxOD: Number.isFinite(maxOD) ? maxOD : null,
+      rearOD: Number.isFinite(rearOD) ? rearOD : null,
+      realismOdPenalty,
+      realismThicknessPenalty,
+      realismRadiusPenalty,
+      realismEdgePenalty,
+      realismPackagingPenalty,
+      realismProfileLabel,
+      realismLargeSensor,
     };
   }
 
@@ -6407,6 +7196,7 @@
       const aEdge = Number.isFinite(A.distEdgePct) ? Math.abs(A.distEdgePct) : 999;
       const bEdge = Number.isFinite(B.distEdgePct) ? Math.abs(B.distEdgePct) : 999;
       if (Math.abs(aEdge - bEdge) > 0.003) return aEdge - bEdge;
+      if (Math.abs(A.realismScore - B.realismScore) > 0.05) return A.realismScore - B.realismScore;
       if (Math.abs(A.sharpness - B.sharpness) > 1e-5) return A.sharpness - B.sharpness;
     }
 
@@ -6424,6 +7214,7 @@
     const icW = pri.stage === 2 ? 1400 : 260;
     const tW = pri.stage === 1 ? 520 : (pri.stage === 2 ? 260 : 140);
     const distW = pri.stage >= 3 ? 520 : (pri.stage === 2 ? 85 : 10);
+    const realismW = pri.stage >= 3 ? 45 : (pri.stage === 2 ? 12 : 4);
     return (
       stagePenalty * 100000 +
       pri.eflErrRel * eflW +
@@ -6431,7 +7222,8 @@
       pri.tErrAbs * tW +
       pri.sharpness * 15 +
       pri.distRmsScore * distW +
-      pri.distMaxScore * distW * 0.45
+      pri.distMaxScore * distW * 0.45 +
+      pri.realismScore * realismW
     );
   }
 
@@ -6471,6 +7263,25 @@
     return `Dist RMS ${rmsTxt} • MAX ${maxTxt} • edge ${edgeTxt}${flavor} • target 0.00%`;
   }
 
+  function fmtRealismOpt(evalRes, targets = {}) {
+    const p = buildOptPriority(evalRes, {
+      targetEfl: Number(targets?.targetEfl || 1),
+      targetIC: Number(targets?.targetIC || 0),
+      targetT: Number(targets?.targetT || 0),
+    });
+    const scoreTxt = Number.isFinite(p.realismScore) ? p.realismScore.toFixed(2) : "—";
+    const odTxt = Number.isFinite(p.realismOdPenalty) ? p.realismOdPenalty.toFixed(1) : "—";
+    const tTxt = Number.isFinite(p.realismThicknessPenalty) ? p.realismThicknessPenalty.toFixed(1) : "—";
+    const rTxt = Number.isFinite(p.realismRadiusPenalty) ? p.realismRadiusPenalty.toFixed(1) : "—";
+    const eTxt = Number.isFinite(p.realismEdgePenalty) ? p.realismEdgePenalty.toFixed(1) : "—";
+    const pkTxt = Number.isFinite(p.realismPackagingPenalty) ? p.realismPackagingPenalty.toFixed(1) : "—";
+    const fTxt = Number.isFinite(p.frontOD) ? `${p.frontOD.toFixed(1)}mm` : "—";
+    const mTxt = Number.isFinite(p.maxOD) ? `${p.maxOD.toFixed(1)}mm` : "—";
+    const prof = p.realismProfileLabel ? ` • ${p.realismProfileLabel}` : "";
+    const hardTag = p.realismHardInvalid ? " • HARD ❌" : "";
+    return `Realism ${scoreTxt}${prof}${hardTag} • FrontOD ${fTxt} • MaxOD ${mTxt} • OD ${odTxt} • t ${tTxt} • R ${rTxt} • edge ${eTxt} • pack ${pkTxt}`;
+  }
+
   function fmtPhysOpt(evalRes, targets) {
     const p = buildOptPriority(evalRes, targets);
     if (p.feasible) return "PHYS OK ✅";
@@ -6478,7 +7289,10 @@
     const ovTxt = Number.isFinite(p.overlapMm) ? p.overlapMm.toFixed(2) : "—";
     const bflTxt = Number.isFinite(p.bflShortMm) ? p.bflShortMm.toFixed(2) : "—";
     const xoverTxt = Math.max(0, Number(p.internalCrossPairs || 0)).toFixed(0);
-    return `PHYS INVALID ❌ (intr ${intrTxt}mm • overlap ${ovTxt}mm • BFL short ${bflTxt}mm • xover ${xoverTxt})`;
+    const odTxt = p.realismHardInvalid
+      ? ` • OD hard +${Math.max(0, Number(p.realismHardOverMm || 0)).toFixed(2)}mm`
+      : "";
+    return `PHYS INVALID ❌ (intr ${intrTxt}mm • overlap ${ovTxt}mm • BFL short ${bflTxt}mm • xover ${xoverTxt}${odTxt})`;
   }
 
   function fmtStageStep(stage) {
@@ -6974,6 +7788,7 @@
             `${fmtIcOpt(best.eval, targetIC)}\n` +
             `${fmtTOpt(best.eval, targetT)}\n` +
             `${fmtDistOpt(best.eval)}\n` +
+            `${fmtRealismOpt(best.eval, targets)}\n` +
             `Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}%\n` +
             `INTR ${fmtIntrusion(best.eval)}\n` +
             `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n`
@@ -7033,10 +7848,12 @@
             `current ${fmtIcOpt(curEval, targetIC)}\n` +
             `current ${fmtTOpt(curEval, targetT)}\n` +
             `current ${fmtDistOpt(curEval)}\n` +
+            `current ${fmtRealismOpt(curEval, targets)}\n` +
             `best ${fmtFlOpt(best.eval, targetEfl)}\n` +
             `best ${fmtIcOpt(best.eval, targetIC)}\n` +
             `best ${fmtTOpt(best.eval, targetT)}\n` +
             `best ${fmtDistOpt(best.eval)}\n` +
+            `best ${fmtRealismOpt(best.eval, targets)}\n` +
             `best ${fmtPhysOpt(best.eval, targets)}\n`
           );
         }
@@ -7064,6 +7881,7 @@
         `${fmtIcOpt(best.eval, targetIC)}\n` +
         `${fmtTOpt(best.eval, targetT)}\n` +
         `${fmtDistOpt(best.eval)}\n` +
+        `${fmtRealismOpt(best.eval, targets)}\n` +
         `Tp0 ${Number.isFinite(best.eval.goodFrac0)?(best.eval.goodFrac0*100).toFixed(0):"—"}%\n` +
         `INTR ${fmtIntrusion(best.eval)}\n` +
         `RMS0 ${best.eval.rms0?.toFixed?.(3) ?? "—"}mm • RMSedge ${best.eval.rmsE?.toFixed?.(3) ?? "—"}mm\n` +
