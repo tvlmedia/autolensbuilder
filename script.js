@@ -1405,6 +1405,7 @@
     flHoldRel: 0.05,      // hard FL hold after lock (within +/-5%)
     polishFlDriftRel: 0.0008, // in fine tune, keep FL nearly locked while reducing residual distortion
     icStageDriftRel: 0.006, // allow a bit more FL drift during IC growth
+    bflHardShortMm: 0.80, // hard fail when BFL is too short for mount
     tCoarseAbs: 0.75,     // before IC growth, first reduce too-slow T overshoot
     icPassFrac: 1.00,     // IC is only good when measured IC >= requested IC
     tGoodAbs: 0.25,       // T phase considered good when too-slow T overshoot <= 0.25
@@ -4633,6 +4634,10 @@
     if (ui.btnBuildScratch) ui.btnBuildScratch.disabled = true;
     const prevOptIters = ui.optIters?.value;
     const prevOptPop = ui.optPop?.value;
+    const preBuildLens = sanitizeLens(clone(lens));
+    const preBuildFocusMode = String(ui.focusMode?.value || "lens");
+    const preBuildSensorOffset = Number(ui.sensorOffset?.value || 0);
+    const preBuildLensFocus = Number(ui.lensFocus?.value || 0);
 
     try {
       const sensor = getSensorWH();
@@ -4873,6 +4878,15 @@
         renderAll();
         finalSnap = evaluateCurrentLensPriorityForTargets(targets);
       }
+      if (!finalSnap.pri?.feasible && !bestFeasibleSnapshot?.lens && preBuildLens?.surfaces?.length) {
+        loadLens(preBuildLens);
+        if (ui.focusMode) ui.focusMode.value = preBuildFocusMode;
+        if (ui.sensorOffset) ui.sensorOffset.value = Number.isFinite(preBuildSensorOffset) ? String(preBuildSensorOffset) : "0";
+        if (ui.lensFocus) ui.lensFocus.value = Number.isFinite(preBuildLensFocus) ? preBuildLensFocus.toFixed(2) : "0.00";
+        renderAll();
+        finalSnap = evaluateCurrentLensPriorityForTargets(targets);
+        if (!earlyStopReason) earlyStopReason = "no feasible scratch result; restored previous lens";
+      }
       const p = finalSnap.pri;
       const doneStrict = scratchTargetsReached(p, targets);
       const acceptable = scratchAcceptableReached(p, targets);
@@ -4880,7 +4894,7 @@
       const finalElems = countLensElements(lens.surfaces);
       const headline = abortedByUser
         ? "STOPPED ⏹"
-        : (done ? "DONE ✅" : "DONE (best effort)");
+        : (!p.feasible ? "FAILED ❌" : (done ? "DONE ✅" : "DONE (best effort)"));
       setOptLog(
         `Build From Scratch ${headline}\n` +
         `family ${scratchFamilyLabel(familyResolved)} • aggr ${aggr} • effort x${effortScale.toFixed(2)}\n` +
@@ -4898,7 +4912,7 @@
       );
 
       toast(
-        `Build from scratch ${abortedByUser ? "stopped" : (done ? "done" : "ready (best effort)")} • ${scratchFamilyLabel(familyResolved)} • FL ${Number.isFinite(p.efl) ? p.efl.toFixed(1) : "—"}mm`
+        `Build from scratch ${abortedByUser ? "stopped" : (!p.feasible ? "failed" : (done ? "done" : "ready (best effort)"))} • ${scratchFamilyLabel(familyResolved)} • FL ${Number.isFinite(p.efl) ? p.efl.toFixed(1) : "—"}mm`
       );
       scheduleAutosave();
     } catch (err) {
@@ -6233,10 +6247,13 @@
     const pinchMm = Math.max(0, Number(evalRes?.worstPinch || 0));
     const physPenalty = Math.max(0, Number(evalRes?.physPenalty || 0));
     const bflShortMm = Number.isFinite(bfl) ? Math.max(0, MERIT_CFG.bflMin - bfl) : MERIT_CFG.bflMin;
+    const bflHardShortMm = Math.max(0.1, Number(OPT_STAGE_CFG.bflHardShortMm || 0.8));
+    const bflHardFail = bflShortMm > bflHardShortMm;
     const bflBad = bflShortMm > 0.5;
-    const feasible = !hardInvalid && intrusionMm <= 1e-3 && overlapMm <= 1e-3 && crossPairs <= 0;
+    const feasible = !hardInvalid && !bflHardFail && intrusionMm <= 1e-3 && overlapMm <= 1e-3 && crossPairs <= 0;
     const feasibilityDebt =
       (hardInvalid ? 5000 : 0) +
+      (bflHardFail ? 2400 : 0) +
       intrusionMm * 1200 +
       overlapMm * 2000 +
       bflShortMm * 260 +
@@ -6306,6 +6323,7 @@
       physPenalty,
       bfl,
       bflShortMm,
+      bflHardFail,
       bflBad,
       efl,
       eflErrRel,
