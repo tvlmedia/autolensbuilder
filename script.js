@@ -655,7 +655,7 @@
 
   // -------------------- physical sanity clamps --------------------
   const AP_SAFETY = 0.90;
-  const AP_MAX_PLANE = 30.0;
+  const AP_MAX_PLANE = 45.0;
   const AP_MIN = 0.01;
 
   function maxApForSurface(s) {
@@ -718,7 +718,7 @@
     prefGlassCT: 1.20,
     minRadius: 8.0,
     minAperture: 1.2,
-    maxAperture: 32.0,
+    maxAperture: 40.0,
     minThickness: 0.05,
     maxThickness: 55.0,
     minStopToApertureRatio: 0.28,
@@ -3543,7 +3543,7 @@
 
     // Coverage floor by target IC (kept moderate to avoid instant hard-fails).
     if (targetIC > 0) {
-      const floorBase = clamp(targetIC * (keepFl ? 0.36 : 0.40), 8.0, 25.0);
+      const floorBase = clamp(targetIC * (keepFl ? 0.36 : 0.40), 8.0, 30.0);
       for (let i = 0; i < surfaces.length; i++) {
         const s = surfaces[i];
         if (surfaceIsLocked(s)) continue;
@@ -3558,6 +3558,63 @@
         }
       }
     }
+  }
+
+  function nudgeStopTowardTargetT(surfaces, targetEfl, targetT, strength = 0.75) {
+    if (!Array.isArray(surfaces)) return;
+    if (!(Number.isFinite(targetEfl) && targetEfl > 1 && Number.isFinite(targetT) && targetT > 0.2)) return;
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 0) return;
+    const stop = surfaces[stopIdx];
+    const targetAp = clamp(targetEfl / (2 * targetT), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+    const curAp = Number(stop.ap || targetAp);
+    const s = clamp(Number(strength), 0.05, 1);
+    stop.ap = clamp(curAp + (targetAp - curAp) * s, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+
+    // Keep immediate neighbors compatible with a larger stop.
+    const neighNeed = Number(stop.ap || targetAp) / 1.08;
+    for (let d = 1; d <= 2; d++) {
+      for (const idx of [stopIdx - d, stopIdx + d]) {
+        if (idx < 0 || idx >= surfaces.length) continue;
+        const ss = surfaces[idx];
+        if (surfaceIsLocked(ss)) continue;
+        const t = String(ss?.type || "").toUpperCase();
+        if (t === "OBJ" || t === "IMS") continue;
+        if (Number(ss.ap || 0) < neighNeed) ss.ap = neighNeed;
+      }
+    }
+  }
+
+  function buildGuidedCandidate(baseLens, pri, targets, wavePreset, topo, aggressive = false) {
+    const c = clone(baseLens);
+    const st = Number(pri?.stage ?? 0);
+    const icNeed = Math.max(0, Number(pri?.icNeedMm || 0));
+    const keepFl = !!pri?.flInBand;
+    const hard = !!aggressive;
+
+    if (st <= 0) {
+      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 1.0 : 0.92, hard ? 0.30 : 0.22);
+    } else if (st === 1) {
+      applyCoverageBoostMutation(c.surfaces, {
+        targetIC: targets.targetIC,
+        targetEfl: targets.targetEfl,
+        targetT: targets.targetT,
+        icNeedMm: hard ? (icNeed + 3.0) : icNeed,
+        keepFl,
+      });
+      nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, hard ? 0.88 : 0.72);
+      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 0.55 : 0.40, hard ? 0.07 : 0.05);
+    } else if (st === 2) {
+      nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, hard ? 0.95 : 0.82);
+      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, hard ? 0.60 : 0.45, hard ? 0.07 : 0.05);
+    } else {
+      nudgeStopTowardTargetT(c.surfaces, targets.targetEfl, targets.targetT, 0.55);
+      nudgeLensTowardFocal(c, targets.targetEfl, wavePreset, 0.36, 0.04);
+    }
+
+    quickSanity(c.surfaces);
+    if (topo) enforceTopology(c.surfaces, topo);
+    return c;
   }
 
   function nudgeLensTowardFocal(lensObj, targetEfl, wavePreset, strength = 0.6, maxStep = 0.20) {
@@ -3921,6 +3978,7 @@
     let cur = startLens;
     let curEval = evalLensMerit(cur, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
     let best = { lens: clone(cur), eval: curEval, iter: 0 };
+    let stallIters = 0;
     let flLocked = (() => {
       const p0 = buildOptPriority(curEval, targets);
       return p0.feasible && p0.flInBand;
@@ -3942,12 +4000,33 @@
 
       const curPri = buildOptPriority(curEval, targets);
       const bestPriPre = buildOptPriority(best.eval, targets);
-      const tries = (curPri.stage === 1)
+      const tries = (curPri.stage === 0)
+        ? (curPri.eflErrRel > 0.20 ? 10 : 6)
+        : (curPri.stage === 1)
         ? (flLocked ? (curPri.icNeedMm > 9 ? 8 : 6) : 4)
         : (flLocked ? 3 : 2);
       let cand = null;
       let candEval = null;
       let candPri = null;
+
+      // Deterministic guided candidate each iteration to keep momentum.
+      {
+        const guideBase = best?.lens || cur;
+        const guidePri = best?.lens ? bestPriPre : curPri;
+        const guided = buildGuidedCandidate(
+          guideBase,
+          guidePri,
+          targets,
+          wavePreset,
+          topo,
+          stallIters > 380
+        );
+        const ge = evalLensMerit(guided, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+        cand = guided;
+        candEval = ge;
+        candPri = buildOptPriority(ge, targets);
+      }
+
       for (let trIdx = 0; trIdx < tries; trIdx++) {
         const useBestBase = !!best?.lens && (
           (flLocked && Math.random() < 0.92) ||
@@ -4024,8 +4103,10 @@
         flLocked = flLocked || (candPri.feasible && candPri.flInBand);
       }
 
+      let improvedBest = false;
       if (isEvalBetterByPlan(candEval, best.eval, targets)){
         best = { lens: clone(cand), eval: candEval, iter: i };
+        improvedBest = true;
         const bp = buildOptPriority(best.eval, targets);
         const stageStep = fmtStageStep(bp.stage);
 
@@ -4045,6 +4126,26 @@
           );
         }
       }
+      stallIters = improvedBest ? 0 : (stallIters + 1);
+
+      if (stallIters > 520 && (i % Math.max(40, BATCH / 2) === 0)) {
+        const bpKick = buildOptPriority(best.eval, targets);
+        const kick = buildGuidedCandidate(best.lens, bpKick, targets, wavePreset, topo, true);
+        const kickEval = evalLensMerit(kick, {targetEfl, targetT, targetIC, fieldAngle, rayCount, wavePreset, sensorW, sensorH});
+        if (isEvalBetterByPlan(kickEval, curEval, targets)) {
+          cur = kick;
+          curEval = kickEval;
+          const kp = buildOptPriority(kickEval, targets);
+          flLocked = flLocked || (kp.feasible && kp.flInBand);
+        }
+        if (isEvalBetterByPlan(kickEval, best.eval, targets)) {
+          best = { lens: clone(kick), eval: kickEval, iter: i };
+          stallIters = 0;
+        } else {
+          stallIters = Math.floor(stallIters * 0.6);
+        }
+      }
+
 
       // Re-anchor when current drifts too far from best; keeps learning around elites.
       const bestPriPost = buildOptPriority(best.eval, targets);
