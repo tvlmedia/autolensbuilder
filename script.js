@@ -4852,8 +4852,9 @@
     const p = buildOptPriority(evalRes, { targetEfl: 1, targetIC: 0, targetT: 0 });
     const rmsTxt = Number.isFinite(p.distRmsPct) ? `${Math.abs(p.distRmsPct).toFixed(2)}%` : "—";
     const maxTxt = Number.isFinite(p.distMaxPct) ? `${Math.abs(p.distMaxPct).toFixed(2)}%` : "—";
+    const edgeTxt = Number.isFinite(p.distEdgePct) ? `${Number(p.distEdgePct).toFixed(2)}%` : "—";
     const flavor = (p.distFlavor === "barrel" || p.distFlavor === "pincushion") ? ` • ${p.distFlavor}` : "";
-    return `Dist RMS ${rmsTxt} • MAX ${maxTxt}${flavor}`;
+    return `Dist RMS ${rmsTxt} • MAX ${maxTxt} • edge ${edgeTxt}${flavor} • target 0.00%`;
   }
 
   function fmtPhysOpt(evalRes, targets) {
@@ -5371,7 +5372,11 @@
             `current ${fmtIcOpt(curEval, targetIC)}\n` +
             `current ${fmtTOpt(curEval, targetT)}\n` +
             `current ${fmtDistOpt(curEval)}\n` +
-            `best: ${fmtFlOpt(best.eval, targetEfl)} • ${fmtIcOpt(best.eval, targetIC)} • ${fmtTOpt(best.eval, targetT)} • ${fmtDistOpt(best.eval)} • ${fmtPhysOpt(best.eval, targets)}\n` +
+            `best ${fmtFlOpt(best.eval, targetEfl)}\n` +
+            `best ${fmtIcOpt(best.eval, targetIC)}\n` +
+            `best ${fmtTOpt(best.eval, targetT)}\n` +
+            `best ${fmtDistOpt(best.eval)}\n` +
+            `best ${fmtPhysOpt(best.eval, targets)}\n` +
             `${fmtEvalPerf("perf fast", perf.fast)}\n` +
             `${fmtEvalPerf("perf acc", perf.accurate)}\n`
           );
