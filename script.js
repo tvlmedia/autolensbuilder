@@ -1072,6 +1072,13 @@
   const RAY_BUNDLE_CFG = {
     apFill: 0.999, // sample almost full clear aperture (avoid optimistic vignette estimates)
   };
+  const RAY_CROSS_CFG = {
+    minGlassN: 1.0005,
+    minOverlapX: 1e-4,
+    edgePadFrac: 0.08,
+    edgePadMaxMm: 0.03,
+    yTol: 5e-4,
+  };
 
   function getRayReferencePlane(surfaces) {
     const apFill = Math.max(0.5, Math.min(1.0, Number(RAY_BUNDLE_CFG.apFill || 1.0)));
@@ -1119,6 +1126,108 @@
     const tanT = Math.abs(dir.x) < 1e-9 ? 0 : dir.y / dir.x;
     const y0 = 0 - tanT * (xStop - xStart);
     return { p: { x: xStart, y: y0 }, d: dir };
+  }
+
+  function segmentYAtX(p0, p1, x) {
+    const x0 = Number(p0?.x), y0 = Number(p0?.y);
+    const x1 = Number(p1?.x), y1 = Number(p1?.y);
+    if (![x0, y0, x1, y1, x].every(Number.isFinite)) return null;
+    const dx = x1 - x0;
+    if (Math.abs(dx) < 1e-12) return null;
+    const t = (x - x0) / dx;
+    return y0 + (y1 - y0) * t;
+  }
+
+  function segmentPairCrossesInside(a0, a1, b0, b1) {
+    const ax0 = Number(a0?.x), ax1 = Number(a1?.x);
+    const bx0 = Number(b0?.x), bx1 = Number(b1?.x);
+    if (![ax0, ax1, bx0, bx1].every(Number.isFinite)) return false;
+
+    const xL = Math.max(Math.min(ax0, ax1), Math.min(bx0, bx1));
+    const xR = Math.min(Math.max(ax0, ax1), Math.max(bx0, bx1));
+    const span = xR - xL;
+    if (!(span > Number(RAY_CROSS_CFG.minOverlapX || 1e-4))) return false;
+
+    const pad = Math.min(
+      Number(RAY_CROSS_CFG.edgePadMaxMm || 0.03),
+      span * Math.max(0.01, Number(RAY_CROSS_CFG.edgePadFrac || 0.08))
+    );
+    const xA = xL + pad;
+    const xB = xR - pad;
+    if (!(xB > xA)) return false;
+
+    const yA0 = segmentYAtX(a0, a1, xA);
+    const yA1 = segmentYAtX(a0, a1, xB);
+    const yB0 = segmentYAtX(b0, b1, xA);
+    const yB1 = segmentYAtX(b0, b1, xB);
+    if (![yA0, yA1, yB0, yB1].every(Number.isFinite)) return false;
+
+    const d0 = yA0 - yB0;
+    const d1 = yA1 - yB1;
+    const tol = Math.max(1e-6, Number(RAY_CROSS_CFG.yTol || 5e-4));
+
+    if (Math.abs(d0) <= tol || Math.abs(d1) <= tol) {
+      const xm = 0.5 * (xA + xB);
+      const yAm = segmentYAtX(a0, a1, xm);
+      const yBm = segmentYAtX(b0, b1, xm);
+      if (Number.isFinite(yAm) && Number.isFinite(yBm) && Math.abs(yAm - yBm) <= tol) return true;
+    }
+    return (d0 * d1) < -(tol * tol);
+  }
+
+  function detectInternalRayCrossings(traces, surfaces, wavePreset) {
+    const out = {
+      validRayCount: 0,
+      checkedSegments: 0,
+      checkedPairs: 0,
+      crossPairs: 0,
+      crossSegments: 0,
+      invalid: false,
+    };
+    if (!Array.isArray(traces) || !Array.isArray(surfaces) || surfaces.length < 3) return out;
+
+    const glassSegmentIdx = [];
+    for (let i = 0; i < surfaces.length - 1; i++) {
+      const s = surfaces[i];
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS" || t === "MECH" || t === "BAFFLE" || t === "HOUSING") continue;
+      const nAfter = glassN(String(s?.glass || "AIR"), wavePreset);
+      if (!(Number.isFinite(nAfter) && nAfter > Number(RAY_CROSS_CFG.minGlassN || 1.0005))) continue;
+      glassSegmentIdx.push(i);
+    }
+    if (!glassSegmentIdx.length) return out;
+
+    const valid = traces.filter((tr) =>
+      tr && !tr.vignetted && !tr.tir && Array.isArray(tr.pts) && tr.pts.length >= 4
+    );
+    out.validRayCount = valid.length;
+    if (valid.length < 2) return out;
+
+    const crossedSeg = new Set();
+    for (const segIdx of glassSegmentIdx) {
+      let segPairs = 0;
+      let segHasCross = false;
+      for (let r = 0; r < valid.length - 1; r++) {
+        const ta = valid[r];
+        const tb = valid[r + 1];
+        const a0 = ta.pts[segIdx + 1];
+        const a1 = ta.pts[segIdx + 2];
+        const b0 = tb.pts[segIdx + 1];
+        const b1 = tb.pts[segIdx + 2];
+        if (!a0 || !a1 || !b0 || !b1) continue;
+        segPairs++;
+        if (segmentPairCrossesInside(a0, a1, b0, b1)) {
+          out.crossPairs++;
+          segHasCross = true;
+        }
+      }
+      if (segPairs > 0) out.checkedSegments++;
+      out.checkedPairs += segPairs;
+      if (segHasCross) crossedSeg.add(segIdx);
+    }
+    out.crossSegments = crossedSeg.size;
+    out.invalid = out.crossPairs > 0;
+    return out;
   }
 
   function rayHitYAtX(endRay, x) {
@@ -2553,6 +2662,8 @@
     distMissingWeight: 1.2,   // penalize missing/invalid chief samples
     distStageWeights: [0.10, 0.30, 0.35, 2.25], // stage 0..3
     distFastMeasureOnlyInFlBand: true, // keep fast-tier evals lightweight outside FL lock band
+    crossPairWeight: 3200.0,  // no internal ray crossing in glass
+    crossSegWeight: 900.0,
 
     // target terms (optimizer uses these)
     eflWeight: 0.35,          // penalty per mm error (squared)
@@ -2567,6 +2678,15 @@
     lowValidPenalty: 450.0,
     hardInvalidPenalty: 1_000_000.0,
   };
+
+  function internalCrossPenaltyFromStats(stats) {
+    const pairs = Math.max(0, Number(stats?.crossPairs || 0));
+    const segs = Math.max(0, Number(stats?.crossSegments || 0));
+    if (pairs <= 0) return 0;
+    const wPair = Math.max(0, Number(MERIT_CFG.crossPairWeight || 0));
+    const wSeg = Math.max(0, Number(MERIT_CFG.crossSegWeight || 0));
+    return (wPair * pairs * pairs) + (wSeg * segs * segs);
+  }
 
   function traceBundleAtField(surfaces, fieldDeg, rayCount, wavePreset, sensorX, sensorHalfMm = null){
     const rays = buildRays(surfaces, fieldDeg, rayCount);
@@ -2598,6 +2718,9 @@
     targetT = null,
     physPenalty = 0,
     hardInvalid = false,
+    internalCrossPairs = 0,
+    internalCrossSegments = 0,
+    internalCrossPenalty = 0,
     distortionStats = null,
     distortionPenalty = 0,
     distortionWeight = 0,
@@ -2678,6 +2801,7 @@
     }
 
     if (Number.isFinite(physPenalty) && physPenalty > 0) merit += physPenalty;
+    if (Number.isFinite(internalCrossPenalty) && internalCrossPenalty > 0) merit += internalCrossPenalty;
     if (hardInvalid) merit += MERIT_CFG.hardInvalidPenalty;
     if (Number.isFinite(distortionPenalty) && distortionPenalty > 0) merit += distortionPenalty;
 
@@ -2690,6 +2814,9 @@
       vigMidPct: Math.round(vigMid * 100),
       physPenalty: Number.isFinite(physPenalty) ? physPenalty : 0,
       hardInvalid: !!hardInvalid,
+      internalCrossPairs: Math.max(0, Number(internalCrossPairs || 0)),
+      internalCrossSegments: Math.max(0, Number(internalCrossSegments || 0)),
+      internalCrossPenalty: Number.isFinite(internalCrossPenalty) ? Number(internalCrossPenalty) : 0,
       distRmsPct: Number.isFinite(distortionStats?.rmsPct) ? Number(distortionStats.rmsPct) : null,
       distMaxPct: Number.isFinite(distortionStats?.maxPct) ? Number(distortionStats.maxPct) : null,
       distEdgePct: Number.isFinite(distortionStats?.edgePct) ? Number(distortionStats.edgePct) : null,
@@ -3183,6 +3310,8 @@
 
     const rays = buildRays(lens.surfaces, fieldAngle, rayCount);
     const traces = rays.map((r) => traceRayForward(clone(r), lens.surfaces, wavePreset));
+    const rayCross = detectInternalRayCrossings(traces, lens.surfaces, wavePreset);
+    const crossPenalty = internalCrossPenaltyFromStats(rayCross);
 
     const vCount = traces.filter((t) => t.vignetted).length;
     const tirCount = traces.filter((t) => t.tir).length;
@@ -3212,6 +3341,7 @@
     const rearVx = lastPhysicalVertexX(lens.surfaces);
     const intrusion = rearVx - plX;
     const phys = evaluatePhysicalConstraints(lens.surfaces);
+    const physPenaltyBase = Number(phys.penalty || 0);
     const targetEflUi = num(ui.optTargetFL?.value, NaN);
     const targetTUi = num(ui.optTargetT?.value, NaN);
     const targetICUi = Math.max(0, num(ui.optTargetIC?.value, 0));
@@ -3232,10 +3362,12 @@
         T,
         softIcMm: softIcValid ? icDiameterMm : 0,
         intrusion,
-        hardInvalid: !!phys.hardFail,
-        physPenalty: Number(phys.penalty || 0),
+        hardInvalid: !!phys.hardFail || !!rayCross.invalid,
+        physPenalty: physPenaltyBase,
         worstOverlap: Number(phys.worstOverlap || 0),
         worstPinch: Number(phys.worstPinch || 0),
+        internalCrossPairs: Number(rayCross.crossPairs || 0),
+        internalCrossSegments: Number(rayCross.crossSegments || 0),
       },
       {
         targetEfl: targetEflUi,
@@ -3258,8 +3390,11 @@
       efl, T, bfl,
       targetEfl: targetEflUi,
       targetT: targetTUi,
-      physPenalty: phys.penalty,
-      hardInvalid: phys.hardFail,
+      physPenalty: physPenaltyBase,
+      hardInvalid: !!phys.hardFail || !!rayCross.invalid,
+      internalCrossPairs: Number(rayCross.crossPairs || 0),
+      internalCrossSegments: Number(rayCross.crossSegments || 0),
+      internalCrossPenalty: crossPenalty,
       distortionStats: distStats,
       distortionPenalty: distPenaltyRes.penalty,
       distortionWeight: distPenaltyRes.weight,
@@ -3275,6 +3410,7 @@
       `${Number.isFinite(bd.vigMidPct) ? ` • Vmid ${bd.vigMidPct}%` : ""}` +
       `${Number.isFinite(bd.distRmsPct) ? ` • DistRMS ${bd.distRmsPct.toFixed(2)}%` : ""}` +
       `${Number.isFinite(bd.distMaxPct) ? ` • DistMAX ${bd.distMaxPct.toFixed(2)}%` : ""}` +
+      `${Number(bd.internalCrossPairs || 0) > 0 ? ` • XOVER ${Number(bd.internalCrossPairs || 0)}` : ""}` +
       `${bd.intrusion != null && bd.intrusion > 0 ? ` • INTR +${bd.intrusion.toFixed(2)}mm` : ""}` +
       `${bd.physPenalty > 0 ? ` • PHYS +${bd.physPenalty.toFixed(1)}` : ""}` +
       `${bd.hardInvalid ? " • INVALID ❌" : ""})`;
@@ -3313,6 +3449,9 @@
     if (phys.hardFail && ui.footerWarn) {
       ui.footerWarn.textContent =
         `INVALID geometry: overlap/clearance issue (overlap ${phys.worstOverlap.toFixed(2)}mm, pinch ${phys.worstPinch.toFixed(2)}mm).`;
+    } else if (rayCross.invalid && ui.footerWarn) {
+      ui.footerWarn.textContent =
+        `INVALID optics: ${rayCross.crossPairs} ray crossings inside glass across ${rayCross.crossSegments} segment(s).`;
     } else if (phys.airGapCount < PHYS_CFG.minAirGapsPreferred && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Few air gaps (${phys.airGapCount}); aim for >= ${PHYS_CFG.minAirGapsPreferred} for practical designs.`;
@@ -3325,7 +3464,7 @@
 
     if (ui.status) {
       ui.status.textContent =
-        `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${softIcTxt} • ${meritTxt}`;
+        `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • xover ${rayCross.crossPairs} • ${softIcTxt} • ${meritTxt}`;
     }
     if (ui.metaInfo) {
       ui.metaInfo.textContent =
@@ -3354,6 +3493,9 @@
     const focusTxt = (focusMode === "cam")
       ? `CamFocus ${sensorX.toFixed(2)}mm`
       : `LensFocus ${lensShift.toFixed(2)}mm`;
+    const crossTxt = rayCross.crossPairs > 0
+      ? `XOVER ${rayCross.crossPairs} ❌`
+      : "XOVER 0";
 
     drawTitleOverlay([
       lens?.name || "Lens",
@@ -3363,6 +3505,7 @@
       tGeomTxt,
       tpTxt,
       softIcTxt,
+      crossTxt,
       distBadgeTopText,
       fovTxt,
       rearTxt,
@@ -5750,6 +5893,8 @@
         distFlavor: "unknown",
         distPenalty: 0,
         distWeight: 0,
+        internalCrossPairs: 0,
+        internalCrossSegments: 0,
         afOk,
         breakdown: {
           rmsCenter: null,
@@ -5759,6 +5904,9 @@
           fields: [0, 0, 0],
           physPenalty: Number(phys.penalty || 0),
           hardInvalid: true,
+          internalCrossPairs: 0,
+          internalCrossSegments: 0,
+          internalCrossPenalty: 0,
           distRmsPct: null,
           distMaxPct: null,
           distEdgePct: null,
@@ -5774,12 +5922,70 @@
     const trace0 = performance.now();
     const rays = buildRays(surfaces, fieldAngle, evalRayCount);
     const traces = rays.map(r => traceRayForward(clone(r), surfaces, wavePreset));
+    const rayCross = detectInternalRayCrossings(traces, surfaces, wavePreset);
+    const crossPenalty = internalCrossPenaltyFromStats(rayCross);
+    const physPenaltyTotal = Number(phys.penalty || 0) + crossPenalty;
+    const hardInvalidCombined = !!phys.hardFail || !!rayCross.invalid;
 
     const vCount = traces.filter(t=>t.vignetted).length;
     const vigFrac = traces.length ? (vCount / traces.length) : 1;
 
     const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
     const Tgeom = estimateTStopApprox(efl, surfaces);
+    if (rayCross.invalid) {
+      const score = MERIT_CFG.hardInvalidPenalty + Math.max(0, physPenaltyTotal);
+      const icShortfallMm = Number.isFinite(targetIC) && targetIC > 0 ? targetIC : 0;
+      tTraceMs += Math.max(0, performance.now() - trace0);
+      return finishEval({
+        score,
+        efl,
+        T: Number.isFinite(Tgeom) ? Tgeom : null,
+        softIcMm: 0,
+        icShortfallMm,
+        bfl,
+        intrusion,
+        vigFrac,
+        hardInvalid: true,
+        physPenalty: physPenaltyTotal,
+        worstOverlap: Number(phys.worstOverlap || 0),
+        worstPinch: Number(phys.worstPinch || 0),
+        goodFrac0: 0,
+        lensShift,
+        afOk,
+        rms0: null,
+        rmsE: null,
+        distRmsPct: null,
+        distMaxPct: null,
+        distEdgePct: null,
+        distFlavor: "unknown",
+        distPenalty: 0,
+        distWeight: 0,
+        internalCrossPairs: Number(rayCross.crossPairs || 0),
+        internalCrossSegments: Number(rayCross.crossSegments || 0),
+        breakdown: {
+          rmsCenter: null,
+          rmsEdge: null,
+          vigPct: Math.round(vigFrac * 100),
+          intrusion: Number.isFinite(intrusion) ? intrusion : null,
+          fields: [0, 0, 0],
+          vigCenterPct: Math.round(vigFrac * 100),
+          vigMidPct: Math.round(vigFrac * 100),
+          physPenalty: physPenaltyTotal,
+          hardInvalid: true,
+          internalCrossPairs: Number(rayCross.crossPairs || 0),
+          internalCrossSegments: Number(rayCross.crossSegments || 0),
+          internalCrossPenalty: crossPenalty,
+          distRmsPct: null,
+          distMaxPct: null,
+          distEdgePct: null,
+          distFlavor: "unknown",
+          distPenalty: 0,
+          distWeight: 0,
+          distSampleCount: 0,
+          distValidSamples: 0,
+        },
+      });
+    }
     const centerTp = measureCenterThroughput(
       surfaces,
       wavePreset,
@@ -5834,10 +6040,12 @@
         T,
         softIcMm: Number.isFinite(softIcMm) ? Number(softIcMm) : 0,
         intrusion,
-        hardInvalid: !!phys.hardFail,
-        physPenalty: Number(phys.penalty || 0),
+        hardInvalid: hardInvalidCombined,
+        physPenalty: physPenaltyTotal,
         worstOverlap: Number(phys.worstOverlap || 0),
         worstPinch: Number(phys.worstPinch || 0),
+        internalCrossPairs: Number(rayCross.crossPairs || 0),
+        internalCrossSegments: Number(rayCross.crossSegments || 0),
       },
       { targetEfl, targetIC, targetT }
     );
@@ -5887,8 +6095,11 @@
       bfl,
       targetEfl,
       targetT,
-      physPenalty: phys.penalty,
-      hardInvalid: phys.hardFail,
+      physPenalty: physPenaltyTotal,
+      hardInvalid: hardInvalidCombined,
+      internalCrossPairs: Number(rayCross.crossPairs || 0),
+      internalCrossSegments: Number(rayCross.crossSegments || 0),
+      internalCrossPenalty: crossPenalty,
       distortionStats,
       distortionPenalty: distPenaltyRes.penalty,
       distortionWeight: distPenaltyRes.weight,
@@ -5907,8 +6118,8 @@
       bfl,
       intrusion,
       vigFrac,
-      hardInvalid: !!phys.hardFail,
-      physPenalty: Number(phys.penalty || 0),
+      hardInvalid: hardInvalidCombined,
+      physPenalty: physPenaltyTotal,
       worstOverlap: Number(phys.worstOverlap || 0),
       worstPinch: Number(phys.worstPinch || 0),
       goodFrac0: centerTp.goodFrac,
@@ -5922,6 +6133,8 @@
       distFlavor: meritRes.breakdown.distFlavor,
       distPenalty: meritRes.breakdown.distPenalty,
       distWeight: meritRes.breakdown.distWeight,
+      internalCrossPairs: Number(rayCross.crossPairs || 0),
+      internalCrossSegments: Number(rayCross.crossSegments || 0),
       breakdown: meritRes.breakdown,
     });
   }
@@ -5939,20 +6152,24 @@
     const T = Number(evalRes?.T);
     const bfl = Number(evalRes?.bfl);
     const score = Number.isFinite(evalRes?.score) ? Number(evalRes.score) : 1e9;
-    const hardInvalid = !!evalRes?.hardInvalid;
+    const crossPairs = Math.max(0, Number(evalRes?.internalCrossPairs || 0));
+    const crossSegments = Math.max(0, Number(evalRes?.internalCrossSegments || 0));
+    const hardInvalid = !!evalRes?.hardInvalid || crossPairs > 0;
     const intrusionMm = Math.max(0, Number(evalRes?.intrusion || 0));
     const overlapMm = Math.max(0, Number(evalRes?.worstOverlap || 0));
     const pinchMm = Math.max(0, Number(evalRes?.worstPinch || 0));
     const physPenalty = Math.max(0, Number(evalRes?.physPenalty || 0));
     const bflShortMm = Number.isFinite(bfl) ? Math.max(0, MERIT_CFG.bflMin - bfl) : MERIT_CFG.bflMin;
     const bflBad = bflShortMm > 0.5;
-    const feasible = !hardInvalid && intrusionMm <= 1e-3 && overlapMm <= 1e-3;
+    const feasible = !hardInvalid && intrusionMm <= 1e-3 && overlapMm <= 1e-3 && crossPairs <= 0;
     const feasibilityDebt =
       (hardInvalid ? 5000 : 0) +
       intrusionMm * 1200 +
       overlapMm * 2000 +
       bflShortMm * 260 +
       Math.max(0, pinchMm - 0.35) * 160 +
+      crossPairs * 1800 +
+      crossSegments * 500 +
       physPenalty * 0.02;
 
     const eflErrRel = Number.isFinite(efl) && targetEfl > 1e-9
@@ -6030,6 +6247,8 @@
       tFastAbs,
       tGood,
       sharpness,
+      internalCrossPairs: crossPairs,
+      internalCrossSegments: crossSegments,
       distRmsPct: Number.isFinite(distRmsPctRaw) ? distRmsPctRaw : null,
       distMaxPct: Number.isFinite(distMaxPctRaw) ? distMaxPctRaw : null,
       distEdgePct: Number.isFinite(distEdgePct) ? distEdgePct : null,
@@ -6164,7 +6383,8 @@
     const intrTxt = Number.isFinite(p.intrusionMm) ? p.intrusionMm.toFixed(2) : "—";
     const ovTxt = Number.isFinite(p.overlapMm) ? p.overlapMm.toFixed(2) : "—";
     const bflTxt = Number.isFinite(p.bflShortMm) ? p.bflShortMm.toFixed(2) : "—";
-    return `PHYS INVALID ❌ (intr ${intrTxt}mm • overlap ${ovTxt}mm • BFL short ${bflTxt}mm)`;
+    const xoverTxt = Math.max(0, Number(p.internalCrossPairs || 0)).toFixed(0);
+    return `PHYS INVALID ❌ (intr ${intrTxt}mm • overlap ${ovTxt}mm • BFL short ${bflTxt}mm • xover ${xoverTxt})`;
   }
 
   function fmtStageStep(stage) {
