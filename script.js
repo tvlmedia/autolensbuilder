@@ -1,6 +1,6 @@
 /* Meridional Raytracer (2D) — TVL Lens Builder (RAYS ONLY)
    - Rays canvas + surface editor + merit score + simple optimizer.
-   - No preview/LUT/DOF/CA pipeline.
+   - No pixel preview/DOF/CA pipeline (keeps LUT-only analysis helpers).
 */
 
 (() => {
@@ -34,6 +34,7 @@
     vig: $("#badgeVig"),
     softIC: $("#badgeSoftIC"),
     dist: $("#badgeDist"),
+    sharp: $("#badgeSharp"),
     od: $("#badgeOD"),
     realism: $("#badgeRealism"),
     fov: $("#badgeFov"),
@@ -48,6 +49,7 @@
     softICTop: $("#badgeSoftICTop"),
     fovTop: $("#badgeFovTop"),
     distTop: $("#badgeDistTop"),
+    sharpTop: $("#badgeSharpTop"),
     odTop: $("#badgeODTop"),
     realismTop: $("#badgeRealismTop"),
     meritTop: $("#badgeMeritTop"),
@@ -93,6 +95,8 @@
     optLog: $("#optLog"),
 
     btnOptStart: $("#btnOptStart"),
+    btnOptDist: $("#btnOptDist"),
+    btnOptSharp: $("#btnOptSharp"),
     btnOptStop: $("#btnOptStop"),
     btnOptApply: $("#btnOptApply"),
     btnOptBench: $("#btnOptBench"),
@@ -1512,6 +1516,101 @@
     accurateAfFineStep: 0.08,
   };
 
+  const DIST_OPT_CFG = {
+    objDistMm: 20000.0,
+    sampleFracs: [0.3, 0.5, 0.7, 0.9],
+    lutNBadge: 220,
+    lutNOptFast: 320,
+    lutNOptFinal: 700,
+    lutPupilSqrtBadge: 1,
+    lutPupilSqrtOpt: 1,
+    maxFieldScanDeg: 65,
+    maxFieldStepDeg: 1.0,
+    maxCoverageDropDeg: 0.35,
+    maxCoverageDropRejectDeg: 0.85,
+    maxEflDriftRel: 0.018,
+    maxEflDriftRelReject: 0.040,
+    maxTDriftAbs: 0.20,
+    maxTDriftAbsReject: 0.45,
+    maxBflShortMm: 1.0,
+    iterationsMin: 800,
+    iterationsMax: 12000,
+    progressBatch: 80,
+    annealTempStart: 6.0,
+    annealTempEnd: 0.4,
+    mutation: {
+      stopMoveChance: 0.26,
+      bendChance: 0.50,
+      airChance: 0.20,
+      stopApChance: 0.04,
+      bendPctMin: 0.005,
+      bendPctMax: 0.020,
+      airDeltaMm: 0.60,
+      stopApPct: 0.005,
+    },
+    weights: {
+      dist: 120.0,
+      efl: 80.0,
+      t: 60.0,
+      cov: 200.0,
+      feas: 500.0,
+    },
+  };
+
+  const SHARP_OPT_CFG = {
+    angleFractions: [0.0, 0.35, 0.70, 0.95],
+    angleWeights: [1.0, 1.2, 1.6, 2.2],
+    rayCountMin: 11,
+    rayCountMax: 41,
+    minValidFrac: 0.48,
+    lowValidPenaltyMm: 0.75,
+    noDataPenaltyMm: 3.2,
+    maxFieldScanDeg: 65,
+    maxFieldStepDeg: 1.25,
+    maxCoverageDropDeg: 0.35,
+    maxCoverageDropRejectDeg: 0.80,
+    maxEflDriftRel: 0.012,
+    maxEflDriftRelReject: 0.030,
+    maxTDriftAbs: 0.18,
+    maxTDriftAbsReject: 0.42,
+    maxBflShortMm: 1.0,
+    maxDist70WorsenPct: 0.30,
+    maxDist70WorsenRejectPct: 0.90,
+    iterationsMin: 1200,
+    iterationsMax: 12000,
+    progressBatch: 60,
+    annealTempStart: 0.90,
+    annealTempEnd: 0.10,
+    autofocus: {
+      rangeMm: 0.60,
+      coarseStepMm: 0.10,
+      fineHalfMm: 0.16,
+      fineStepMm: 0.04,
+      rayCount: 15,
+      fieldMode: "center", // "center" | "weighted"
+    },
+    mutation: {
+      airChance: 0.52,
+      bendChance: 0.48,
+      airDeltaMinMm: 0.05,
+      airDeltaMaxMm: 0.40,
+      bendPctMin: 0.002,
+      bendPctMax: 0.010,
+      pairBendChance: 0.42,
+    },
+    distGuardLutN: 180,
+    distGuardPupilSqrt: 1,
+    distGuardObjDistMm: 20000,
+    weights: {
+      sharp: 120.0,
+      efl: 80.0,
+      t: 60.0,
+      cov: 200.0,
+      dist: 60.0,
+      feas: 500.0,
+    },
+  };
+
   const SCRATCH_CFG = {
     autoFamilyWideMaxMm: 35,
     autoFamilyNormalMaxMm: 85,
@@ -1550,8 +1649,14 @@
   let _softIcCacheVal = null;
   let _distCacheKey = "";
   let _distCacheVal = null;
+  let _lutOnlyCacheKey = "";
+  let _lutOnlyCacheVal = null;
+  let _lutDistMetricCacheKey = "";
+  let _lutDistMetricCacheVal = null;
   let _realismCacheKey = "";
   let _realismCacheVal = null;
+  let _sharpCacheKey = "";
+  let _sharpCacheVal = null;
 
   function chiefRadiusAtFieldDeg(workSurfaces, fieldDeg, wavePreset, sensorX) {
     const chief = buildChiefRay(workSurfaces, fieldDeg);
@@ -1831,6 +1936,258 @@
       focusFailed: false,
       drasticDropRadiusMm: null,
     };
+  }
+
+  function buildLUTOnly({
+    surfaces,
+    wavePreset = "d",
+    sensorX = 0,
+    lensShift = 0,
+    objDist = null,
+    lutN = 480,
+    lutPupilSqrt = 1,
+    doCA = false,
+    sensorW = null,
+    sensorH = null,
+  } = {}) {
+    if (!Array.isArray(surfaces) || surfaces.length < 3) return null;
+
+    const sensor = getSensorWH();
+    const wMm = Number.isFinite(sensorW) ? Number(sensorW) : Number(sensor.w || 36.7);
+    const hMm = Number.isFinite(sensorH) ? Number(sensorH) : Number(sensor.h || 25.54);
+    const halfDiag = 0.5 * Math.hypot(wMm, hMm);
+    const work = clone(surfaces);
+
+    computeVertices(work, Number(lensShift || 0), Number(sensorX || 0));
+    const stopIdx = findStopSurfaceIndex(work);
+    if (stopIdx < 0) return null;
+    const stopSurf = work[stopIdx];
+    const stopAp = Math.max(1e-6, Number(stopSurf?.ap || 0));
+    const xStop = Number(stopSurf?.vx);
+    if (!(stopAp > 0) || !Number.isFinite(xStop)) return null;
+
+    const startX = Number(sensorX || 0) + Number(SOFT_IC_CFG.bgStartEpsMm || 0.05);
+    const objDistMm = Math.max(300, Number(objDist || DIST_OPT_CFG.objDistMm || SOFT_IC_CFG.bgObjDistMm || 20000));
+    const xObjPlane = (work[0]?.vx ?? 0) - objDistMm;
+
+    const n = Math.max(24, Math.min(1600, Number(lutN || 480) | 0));
+    const pupilSqrt = Math.max(1, Math.min(20, Number(lutPupilSqrt || 1) | 0));
+    const rMaxSensor = Math.max(0.2, halfDiag);
+
+    const rSensorLUT = new Float32Array(n);
+    const naturalLUT = new Float32Array(n);
+    const transLUT = new Float32Array(n);
+    const rObjLUT = [
+      new Float32Array(n),
+      new Float32Array(n),
+      new Float32Array(n),
+    ];
+    for (let ch = 0; ch < 3; ch++) {
+      for (let k = 0; k < n; k++) rObjLUT[ch][k] = NaN;
+    }
+
+    const waveByCh = doCA
+      ? ["c", "d", "g"]
+      : [wavePreset, wavePreset, wavePreset];
+
+    for (let k = 0; k < n; k++) {
+      const a = n > 1 ? (k / (n - 1)) : 0;
+      const rS = a * rMaxSensor;
+      rSensorLUT[k] = rS;
+      naturalLUT[k] = naturalCos4AtSensorRadius(work, sensorX, rS);
+
+      const pS = { x: startX, y: rS, z: 0 };
+      const chiefTarget = { x: xStop, y: 0, z: 0 };
+      const chiefDir = normalize3({ x: chiefTarget.x - pS.x, y: chiefTarget.y - pS.y, z: chiefTarget.z - pS.z });
+
+      for (let ch = 0; ch < 3; ch++) {
+        const trChief = traceRayReverse3D({ p: pS, d: chiefDir }, work, waveByCh[ch]);
+        if (trChief?.vignetted || trChief?.tir || !trChief?.endRay) continue;
+        const hitObj = intersectPlaneX3D(trChief.endRay, xObjPlane);
+        if (!hitObj) continue;
+        rObjLUT[ch][k] = Math.hypot(Number(hitObj.y || 0), Number(hitObj.z || 0));
+      }
+
+      if (pupilSqrt <= 1) {
+        const trChief = traceRayReverse3D({ p: pS, d: chiefDir }, work, wavePreset);
+        transLUT[k] = (trChief && !trChief.vignetted && !trChief.tir && trChief.endRay) ? 1 : 0;
+      } else {
+        let ok = 0;
+        let total = 0;
+        for (let iy = 0; iy < pupilSqrt; iy++) {
+          for (let ix = 0; ix < pupilSqrt; ix++) {
+            const uu = (ix + 0.5) / pupilSqrt;
+            const vv = (iy + 0.5) / pupilSqrt;
+            const pp = samplePupilDisk(stopAp, uu, vv);
+            const target = { x: xStop, y: pp.y, z: pp.z };
+            const dir = normalize3({ x: target.x - pS.x, y: target.y - pS.y, z: target.z - pS.z });
+            const tr = traceRayReverse3D({ p: pS, d: dir }, work, wavePreset);
+            total++;
+            if (!tr || tr.vignetted || tr.tir || !tr.endRay) continue;
+            const hitObj = intersectPlaneX3D(tr.endRay, xObjPlane);
+            if (!hitObj) continue;
+            ok++;
+          }
+        }
+        transLUT[k] = total > 0 ? (ok / total) : 0;
+      }
+    }
+
+    return {
+      rMaxSensor,
+      rSensorLUT,
+      rObjLUT,
+      transLUT,
+      naturalLUT,
+      objDist: objDistMm,
+      xObjPlane,
+      sensorW: wMm,
+      sensorH: hMm,
+      lutN: n,
+      doCA: !!doCA,
+      wavePreset: String(wavePreset || "d"),
+    };
+  }
+
+  function sampleLutLinear(arr, rS, rMaxSensor) {
+    if (!arr || !arr.length || !(rMaxSensor > 1e-9)) return NaN;
+    const n = arr.length;
+    const x = clamp(Number(rS || 0), 0, rMaxSensor);
+    const t = x / rMaxSensor;
+    const p = t * (n - 1);
+    const i0 = clamp(Math.floor(p), 0, n - 1);
+    const i1 = clamp(i0 + 1, 0, n - 1);
+    const f = p - i0;
+    const v0 = Number(arr[i0]);
+    const v1 = Number(arr[i1]);
+    if (!Number.isFinite(v0) || !Number.isFinite(v1)) return NaN;
+    return v0 + (v1 - v0) * f;
+  }
+
+  function computeDistortionFromLUT(lutPack, {
+    efl = null,
+    objDist = null,
+    sampleFracs = null,
+  } = {}) {
+    if (!lutPack) return null;
+    const rMaxSensor = Number(lutPack?.rMaxSensor || 0);
+    const eflMm = Number(efl || 0);
+    const objDistMm = Math.max(1, Number(objDist || lutPack?.objDist || DIST_OPT_CFG.objDistMm || 20000));
+    if (!(rMaxSensor > 1e-9) || !(eflMm > 1e-9)) return null;
+
+    const green = lutPack?.rObjLUT?.[1] || lutPack?.rObjLUT?.[0];
+    if (!green || !green.length) return null;
+
+    const fracs = Array.isArray(sampleFracs) && sampleFracs.length
+      ? sampleFracs.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0)
+      : [0.3, 0.5, 0.7, 0.9];
+    if (!fracs.length) return null;
+
+    const samples = [];
+    let sumSq = 0;
+    let maxAbs = 0;
+    let valid = 0;
+    for (const fracRaw of fracs) {
+      const frac = clamp(fracRaw, 1e-4, 1.2);
+      const rS = frac * rMaxSensor;
+      const rObj = sampleLutLinear(green, rS, rMaxSensor);
+      const rIdeal = (objDistMm / eflMm) * rS;
+      if (!(Number.isFinite(rObj) && Number.isFinite(rIdeal) && rIdeal > 1e-12)) {
+        samples.push({ frac, rS, rObj: null, rIdeal: null, distPct: null });
+        continue;
+      }
+      const distPct = 100 * (rObj - rIdeal) / rIdeal;
+      sumSq += distPct * distPct;
+      maxAbs = Math.max(maxAbs, Math.abs(distPct));
+      valid++;
+      samples.push({ frac, rS, rObj, rIdeal, distPct });
+    }
+    if (valid <= 0) return null;
+
+    const at70 = samples.find((s) => Math.abs(Number(s.frac || 0) - 0.7) < 1e-3);
+    const edge = [...samples].reverse().find((s) => Number.isFinite(s?.distPct));
+    const edgeDistPct = Number.isFinite(edge?.distPct) ? Number(edge.distPct) : null;
+    const flavor = !Number.isFinite(edgeDistPct)
+      ? "unknown"
+      : edgeDistPct <= -0.05 ? "barrel"
+      : edgeDistPct >= 0.05 ? "pincushion"
+      : "neutral";
+
+    return {
+      distPctAt70: Number.isFinite(at70?.distPct) ? Number(at70.distPct) : null,
+      rmsDistPct: Math.sqrt(sumSq / valid),
+      maxAbsDistPct: maxAbs,
+      edgeDistPct,
+      flavor,
+      sampleCount: fracs.length,
+      validSamples: valid,
+      samples,
+      objDistMm,
+      rMaxSensor,
+    };
+  }
+
+  function getLutOnlyCached(params = {}) {
+    const surfaces = params?.surfaces || [];
+    const keyObj = {
+      wavePreset: String(params?.wavePreset || "d"),
+      sensorX: Number(params?.sensorX || 0).toFixed(6),
+      lensShift: Number(params?.lensShift || 0).toFixed(6),
+      objDist: Number(params?.objDist || 0).toFixed(3),
+      lutN: Number(params?.lutN || 0) | 0,
+      lutPupilSqrt: Number(params?.lutPupilSqrt || 0) | 0,
+      doCA: !!params?.doCA,
+      sensorW: Number(params?.sensorW || 0).toFixed(4),
+      sensorH: Number(params?.sensorH || 0).toFixed(4),
+      surfaces: surfaces.map((s) => ({
+        type: String(s?.type || ""),
+        R: Number(s?.R || 0).toFixed(6),
+        t: Number(s?.t || 0).toFixed(6),
+        ap: Number(s?.ap || 0).toFixed(6),
+        vx: Number(s?.vx || 0).toFixed(6),
+        glass: String(s?.glass || "AIR"),
+        stop: !!s?.stop,
+      })),
+    };
+    const key = JSON.stringify(keyObj);
+    if (key === _lutOnlyCacheKey && _lutOnlyCacheVal) return _lutOnlyCacheVal;
+    const val = buildLUTOnly(params);
+    _lutOnlyCacheKey = key;
+    _lutOnlyCacheVal = val;
+    return val;
+  }
+
+  function getLutDistortionMetricsCached(params = {}) {
+    const lutPack = getLutOnlyCached(params);
+    const keyObj = {
+      lutKey: _lutOnlyCacheKey,
+      efl: Number(params?.efl || 0).toFixed(6),
+      objDist: Number(params?.objDist || 0).toFixed(3),
+      fracs: (params?.sampleFracs || []).map((x) => Number(x).toFixed(4)),
+    };
+    const key = JSON.stringify(keyObj);
+    if (key === _lutDistMetricCacheKey && _lutDistMetricCacheVal) return _lutDistMetricCacheVal;
+    const val = computeDistortionFromLUT(lutPack, {
+      efl: params?.efl,
+      objDist: params?.objDist,
+      sampleFracs: params?.sampleFracs,
+    });
+    _lutDistMetricCacheKey = key;
+    _lutDistMetricCacheVal = val;
+    return val;
+  }
+
+  function formatLutDistortionBadgeText(distMetrics, compact = false) {
+    if (!distMetrics || !Number.isFinite(distMetrics.distPctAt70)) {
+      return compact ? "DIST@0.7D — • RMS —" : "DIST @0.7D: — • RMS: —";
+    }
+    const d70 = Number(distMetrics.distPctAt70).toFixed(2);
+    const rms = Number.isFinite(distMetrics.rmsDistPct) ? Number(distMetrics.rmsDistPct).toFixed(2) : "—";
+    const flavor = String(distMetrics?.flavor || "neutral");
+    const tail = (flavor === "barrel" || flavor === "pincushion") ? ` • ${flavor}` : "";
+    return compact
+      ? `DIST@0.7D ${d70}% • RMS ${rms}%${tail}`
+      : `DIST @0.7D: ${d70}% • RMS: ${rms}%${tail}`;
   }
 
   function traceBundleAtFieldForSoftIc(surfaces, fieldDeg, wavePreset, sensorX, raysPerBundle) {
@@ -4019,8 +4376,34 @@
     );
     const distWeight = distortionWeightForPriority(previewPri);
     const distPenaltyRes = distortionPenaltyFromStats(distStats, distWeight);
-    const distBadgeText = formatDistortionBadgeText(distStats, false);
-    const distBadgeTopText = formatDistortionBadgeText(distStats, true);
+    const chiefDistBadgeTopText = formatDistortionBadgeText(distStats, true);
+    const lutDistMetrics = getLutDistortionMetricsCached({
+      surfaces: lens.surfaces,
+      wavePreset,
+      sensorX,
+      lensShift,
+      objDist: DIST_OPT_CFG.objDistMm,
+      lutN: DIST_OPT_CFG.lutNBadge,
+      lutPupilSqrt: DIST_OPT_CFG.lutPupilSqrtBadge,
+      doCA: false,
+      sensorW,
+      sensorH,
+      efl,
+      sampleFracs: DIST_OPT_CFG.sampleFracs,
+    });
+    const distBadgeText = formatLutDistortionBadgeText(lutDistMetrics, false);
+    const distBadgeTopText = formatLutDistortionBadgeText(lutDistMetrics, true);
+    const sharpBadgeEval = getSharpnessBadgeCached({
+      surfaces: lens.surfaces,
+      wavePreset,
+      sensorX,
+      lensShift,
+      rayCount: clamp(rayCount | 0, 15, 31),
+      sensorW,
+      sensorH,
+    });
+    const sharpBadgeText = formatSharpnessBadgeText(sharpBadgeEval, false);
+    const sharpBadgeTopText = formatSharpnessBadgeText(sharpBadgeEval, true);
     const realismWeight = realismWeightForPriority(
       previewPri,
       {
@@ -4071,6 +4454,10 @@
       `${Number.isFinite(bd.vigMidPct) ? ` • Vmid ${bd.vigMidPct}%` : ""}` +
       `${Number.isFinite(bd.distRmsPct) ? ` • DistRMS ${bd.distRmsPct.toFixed(2)}%` : ""}` +
       `${Number.isFinite(bd.distMaxPct) ? ` • DistMAX ${bd.distMaxPct.toFixed(2)}%` : ""}` +
+      `${Number.isFinite(lutDistMetrics?.distPctAt70) ? ` • LUT@0.7D ${Number(lutDistMetrics.distPctAt70).toFixed(2)}%` : ""}` +
+      `${Number.isFinite(lutDistMetrics?.rmsDistPct) ? ` • LUT RMS ${Number(lutDistMetrics.rmsDistPct).toFixed(2)}%` : ""}` +
+      `${Number.isFinite(sharpBadgeEval?.centerRmsMm) ? ` • SharpC ${Number(sharpBadgeEval.centerRmsMm).toFixed(3)}mm` : ""}` +
+      `${Number.isFinite(sharpBadgeEval?.edgeRmsMm) ? ` • SharpE ${Number(sharpBadgeEval.edgeRmsMm).toFixed(3)}mm` : ""}` +
       `${Number.isFinite(bd.frontOD) ? ` • FrontOD ${bd.frontOD.toFixed(1)}mm` : ""}` +
       `${Number.isFinite(bd.maxOD) ? ` • MaxOD ${bd.maxOD.toFixed(1)}mm` : ""}` +
       `${Number.isFinite(bd.realismPenalty) ? ` • Realism ${bd.realismPenalty.toFixed(1)}` : ""}` +
@@ -4101,6 +4488,7 @@
     if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
     if (ui.softIC) ui.softIC.textContent = softIcDetailTxt;
     if (ui.dist) ui.dist.textContent = distBadgeText;
+    if (ui.sharp) ui.sharp.textContent = sharpBadgeText;
     if (ui.od) ui.od.textContent = odBadgeText;
     if (ui.realism) ui.realism.textContent = realismBadgeText;
     if (ui.fov) ui.fov.textContent = fovTxt;
@@ -4111,6 +4499,7 @@
     if (ui.softICTop) ui.softICTop.textContent = softIcTxt;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.distTop) ui.distTop.textContent = distBadgeTopText;
+    if (ui.sharpTop) ui.sharpTop.textContent = sharpBadgeTopText;
     if (ui.odTop) ui.odTop.textContent = odBadgeTopText;
     if (ui.realismTop) ui.realismTop.textContent = realismBadgeTopText;
 
@@ -4180,6 +4569,8 @@
       softIcTxt,
       crossTxt,
       distBadgeTopText,
+      sharpBadgeTopText,
+      chiefDistBadgeTopText,
       odBadgeTopText,
       realismBadgeTopText,
       fovTxt,
@@ -5267,8 +5658,8 @@
     stopWhenAcceptable = true,
   } = {}) {
     if (scratchBuildRunning) return;
-    if (optRunning) {
-      toast("Stop optimizer first before Build From Scratch.");
+    if (optRunning || distOptRunning || sharpOptRunning) {
+      toast("Stop optimizer/distortion/sharpness run first before Build From Scratch.");
       return;
     }
 
@@ -5770,6 +6161,10 @@
   // OPTIMIZER
   // ===========================
   let optRunning = false;
+  let distOptRunning = false;
+  let distOptStopRequested = false;
+  let sharpOptRunning = false;
+  let sharpOptStopRequested = false;
   let optBest = null; // {lens, score, meta}
   let scratchBuildRunning = false;
   let scratchStopRequested = false;
@@ -7300,13 +7695,1484 @@
     return `${Math.min(4, (stage | 0) + 1)}/4`;
   }
 
+  function evaluateSharpness(surfaces, wavePreset, sensorX, rayCount, opts = {}) {
+    if (!Array.isArray(surfaces) || surfaces.length < 3) {
+      return {
+        ok: false,
+        score: Infinity,
+        weightedRmsMm: Infinity,
+        penaltyMm: Number(SHARP_OPT_CFG.noDataPenaltyMm || 3.2),
+        rmsByAngle: [],
+        validCounts: [],
+        validFracs: [],
+        anglesDeg: [],
+        maxFieldDeg: 0,
+        centerRmsMm: null,
+        edgeRmsMm: null,
+      };
+    }
+
+    const sensor = getSensorWH();
+    const sensorW = Number.isFinite(opts?.sensorW) ? Number(opts.sensorW) : Number(sensor.w || 36.7);
+    const sensorH = Number.isFinite(opts?.sensorH) ? Number(opts.sensorH) : Number(sensor.h || 25.54);
+    const lensShift = Number.isFinite(opts?.lensShift) ? Number(opts.lensShift) : 0;
+    const stepDeg = Number.isFinite(opts?.maxFieldStepDeg)
+      ? Number(opts.maxFieldStepDeg)
+      : Number(SHARP_OPT_CFG.maxFieldStepDeg || 1.25);
+    const scanDeg = Number.isFinite(opts?.maxFieldScanDeg)
+      ? Number(opts.maxFieldScanDeg)
+      : Number(SHARP_OPT_CFG.maxFieldScanDeg || 65);
+    const angleFractions = Array.isArray(opts?.angleFractions) && opts.angleFractions.length
+      ? opts.angleFractions.map((v) => clamp(Number(v || 0), 0, 1))
+      : Array.from(SHARP_OPT_CFG.angleFractions || [0, 0.35, 0.7, 0.95]);
+    const angleWeights = Array.isArray(opts?.angleWeights) && opts.angleWeights.length === angleFractions.length
+      ? opts.angleWeights.map((v) => Math.max(0.05, Number(v || 0.05)))
+      : angleFractions.map((_, i) => Number(SHARP_OPT_CFG.angleWeights?.[i] ?? 1));
+    const evalRayCount = clamp(
+      Number(rayCount || 21) | 0,
+      Number(SHARP_OPT_CFG.rayCountMin || 11),
+      Number(SHARP_OPT_CFG.rayCountMax || 41)
+    );
+    const minValidFrac = clamp(
+      Number(opts?.minValidFrac ?? SHARP_OPT_CFG.minValidFrac ?? 0.48),
+      0.05,
+      1.0
+    );
+    const lowValidPenaltyMm = Math.max(0, Number(opts?.lowValidPenaltyMm ?? SHARP_OPT_CFG.lowValidPenaltyMm ?? 0.75));
+    const noDataPenaltyMm = Math.max(0.1, Number(opts?.noDataPenaltyMm ?? SHARP_OPT_CFG.noDataPenaltyMm ?? 3.2));
+
+    computeVertices(surfaces, lensShift, Number(sensorX || 0));
+    const maxFieldDeg = Number.isFinite(opts?.maxFieldDeg)
+      ? Math.max(0, Number(opts.maxFieldDeg))
+      : coverageTestMaxFieldDeg(surfaces, wavePreset, Number(sensorX || 0), {
+          sensorW,
+          sensorH,
+          stepDeg,
+          maxDeg: scanDeg,
+        });
+
+    const anglesDeg = angleFractions.map((f) => clamp(f, 0, 1) * maxFieldDeg);
+    const rmsByAngle = [];
+    const validCounts = [];
+    const validFracs = [];
+    const sampleDetails = [];
+    let weightedRmsMm = 0;
+    let weightSum = 0;
+    let penaltyMm = 0;
+    let validFields = 0;
+
+    for (let i = 0; i < anglesDeg.length; i++) {
+      const fieldDeg = Math.max(0, Number(anglesDeg[i] || 0));
+      const w = Math.max(0.05, Number(angleWeights[i] || 1));
+      const rays = buildRays(surfaces, fieldDeg, evalRayCount);
+      const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
+      const spot = spotRmsAtSensorX(traces, Number(sensorX || 0));
+      const nValid = Math.max(0, Number(spot?.n || 0));
+      const total = Math.max(1, traces.length);
+      const validFrac = nValid / total;
+      const rms = Number(spot?.rms);
+      const rmsSafe = Number.isFinite(rms) ? rms : 999;
+
+      rmsByAngle.push(Number.isFinite(rms) ? rms : null);
+      validCounts.push(nValid);
+      validFracs.push(validFrac);
+      sampleDetails.push({
+        idx: i,
+        fieldDeg,
+        weight: w,
+        rmsMm: Number.isFinite(rms) ? rms : null,
+        valid: nValid,
+        total,
+        validFrac,
+      });
+
+      if (Number.isFinite(rms) && nValid > 0) {
+        weightedRmsMm += w * rmsSafe;
+        weightSum += w;
+        validFields++;
+      } else {
+        penaltyMm += noDataPenaltyMm * w;
+      }
+
+      if (validFrac < minValidFrac) {
+        const d = (minValidFrac - validFrac);
+        penaltyMm += lowValidPenaltyMm * w * d * d * 8.0;
+      }
+    }
+
+    const weighted = weightSum > 1e-9 ? (weightedRmsMm / weightSum) : Infinity;
+    const score = (Number.isFinite(weighted) ? weighted : noDataPenaltyMm * 2) + penaltyMm;
+    const centerRmsMm = rmsByAngle.length ? rmsByAngle[0] : null;
+    const edgeRmsMm = rmsByAngle.length ? rmsByAngle[rmsByAngle.length - 1] : null;
+
+    return {
+      ok: Number.isFinite(score),
+      score,
+      weightedRmsMm: weighted,
+      penaltyMm,
+      rmsByAngle,
+      validCounts,
+      validFracs,
+      anglesDeg,
+      maxFieldDeg,
+      centerRmsMm,
+      edgeRmsMm,
+      validFields,
+      rayCount: evalRayCount,
+      samples: sampleDetails,
+      minValidFrac,
+    };
+  }
+
+  function findBestFocusShift(surfaces, focusMode, sensorX, lensShift, wavePreset, opts = {}) {
+    if (!Array.isArray(surfaces) || surfaces.length < 3) {
+      return {
+        ok: false,
+        mode: String(focusMode || "lens"),
+        shift: Number(focusMode === "cam" ? sensorX : lensShift) || 0,
+        sensorX: Number(sensorX || 0),
+        lensShift: Number(lensShift || 0),
+        score: Infinity,
+        rmsCenter: null,
+      };
+    }
+    const mode = String(focusMode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
+    const sensor = getSensorWH();
+    const sensorW = Number.isFinite(opts?.sensorW) ? Number(opts.sensorW) : Number(sensor.w || 36.7);
+    const sensorH = Number.isFinite(opts?.sensorH) ? Number(opts.sensorH) : Number(sensor.h || 25.54);
+    const center = mode === "cam" ? Number(sensorX || 0) : Number(lensShift || 0);
+    const range = Math.max(0.1, Number(opts?.rangeMm ?? SHARP_OPT_CFG.autofocus.rangeMm ?? 0.6));
+    const coarseStep = Math.max(0.02, Number(opts?.coarseStepMm ?? SHARP_OPT_CFG.autofocus.coarseStepMm ?? 0.10));
+    const fineHalf = Math.max(0.04, Number(opts?.fineHalfMm ?? SHARP_OPT_CFG.autofocus.fineHalfMm ?? 0.16));
+    const fineStep = Math.max(0.01, Number(opts?.fineStepMm ?? SHARP_OPT_CFG.autofocus.fineStepMm ?? 0.04));
+    const afRayCount = clamp(
+      Number(opts?.rayCount ?? SHARP_OPT_CFG.autofocus.rayCount ?? 15) | 0,
+      9,
+      31
+    );
+    const fieldMode = String(opts?.fieldMode || SHARP_OPT_CFG.autofocus.fieldMode || "center").toLowerCase();
+
+    let best = {
+      shift: center,
+      sensorX: mode === "cam" ? center : Number(sensorX || 0),
+      lensShift: mode === "lens" ? center : Number(lensShift || 0),
+      score: Infinity,
+      rmsCenter: null,
+      nCenter: 0,
+    };
+
+    const evalAt = (shiftVal) => {
+      const sx = mode === "cam" ? shiftVal : Number(sensorX || 0);
+      const ls = mode === "lens" ? shiftVal : Number(lensShift || 0);
+      computeVertices(surfaces, ls, sx);
+
+      if (fieldMode === "weighted") {
+        const sh = evaluateSharpness(surfaces, wavePreset, sx, afRayCount, {
+          sensorW,
+          sensorH,
+          lensShift: ls,
+          maxFieldStepDeg: Math.max(1.2, Number(SHARP_OPT_CFG.maxFieldStepDeg || 1.25)),
+          maxFieldScanDeg: Math.max(18, Number(SHARP_OPT_CFG.maxFieldScanDeg || 65)),
+          noDataPenaltyMm: Number(SHARP_OPT_CFG.noDataPenaltyMm || 3.2),
+        });
+        const centerRms = Number(sh?.centerRmsMm);
+        return {
+          score: Number(sh?.score),
+          rmsCenter: Number.isFinite(centerRms) ? centerRms : null,
+          nCenter: Number(sh?.validCounts?.[0] || 0),
+          sensorX: sx,
+          lensShift: ls,
+        };
+      }
+
+      const rays = buildRays(surfaces, 0, afRayCount);
+      const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
+      const st = spotRmsAtSensorX(traces, sx);
+      const n = Math.max(0, Number(st?.n || 0));
+      const vf = n / Math.max(1, traces.length);
+      const rms = Number(st?.rms);
+      if (!Number.isFinite(rms)) {
+        return { score: Infinity, rmsCenter: null, nCenter: n, sensorX: sx, lensShift: ls };
+      }
+      const validPenalty = vf < 0.45 ? (0.7 * Math.pow(0.45 - vf, 2) * 8.0) : 0;
+      return {
+        score: rms + validPenalty,
+        rmsCenter: rms,
+        nCenter: n,
+        sensorX: sx,
+        lensShift: ls,
+      };
+    };
+
+    const scan = (centerShift, half, step) => {
+      const start = centerShift - half;
+      const end = centerShift + half;
+      for (let sh = start; sh <= end + 1e-9; sh += step) {
+        const ev = evalAt(sh);
+        if (!Number.isFinite(ev.score)) continue;
+        if (ev.score + 1e-12 < best.score) {
+          best = {
+            shift: sh,
+            sensorX: ev.sensorX,
+            lensShift: ev.lensShift,
+            score: ev.score,
+            rmsCenter: ev.rmsCenter,
+            nCenter: ev.nCenter,
+          };
+        }
+      }
+    };
+
+    scan(center, range, coarseStep);
+    if (Number.isFinite(best.score)) scan(best.shift, fineHalf, fineStep);
+
+    return {
+      ok: Number.isFinite(best.score),
+      mode,
+      shift: Number(best.shift || 0),
+      sensorX: Number(best.sensorX || 0),
+      lensShift: Number(best.lensShift || 0),
+      score: Number.isFinite(best.score) ? best.score : Infinity,
+      rmsCenter: Number.isFinite(best.rmsCenter) ? best.rmsCenter : null,
+      nCenter: Number(best.nCenter || 0),
+    };
+  }
+
+  function formatSharpnessBadgeText(sharp, compact = false) {
+    const c = Number(sharp?.centerRmsMm);
+    const e = Number(sharp?.edgeRmsMm);
+    if (!Number.isFinite(c) && !Number.isFinite(e)) {
+      return compact ? "RMS C/E — / —" : "RMS C/E: — / — mm";
+    }
+    const cTxt = Number.isFinite(c) ? c.toFixed(3) : "—";
+    const eTxt = Number.isFinite(e) ? e.toFixed(3) : "—";
+    if (compact) return `RMS C/E ${cTxt} / ${eTxt}`;
+    return `RMS C/E: ${cTxt} / ${eTxt} mm`;
+  }
+
+  function getSharpnessBadgeCached({
+    surfaces,
+    wavePreset,
+    sensorX,
+    lensShift = 0,
+    rayCount = 21,
+    sensorW,
+    sensorH,
+  }) {
+    const key = JSON.stringify({
+      wavePreset: String(wavePreset || "d"),
+      sensorX: Number(sensorX || 0).toFixed(4),
+      lensShift: Number(lensShift || 0).toFixed(4),
+      rayCount: Number(rayCount || 21) | 0,
+      sensorW: Number(sensorW || 0).toFixed(3),
+      sensorH: Number(sensorH || 0).toFixed(3),
+      fracs: Array.from(SHARP_OPT_CFG.angleFractions || []),
+      weights: Array.from(SHARP_OPT_CFG.angleWeights || []),
+      surfaces: (surfaces || []).map((s) => ({
+        type: String(s?.type || ""),
+        R: Number(s?.R || 0).toFixed(6),
+        t: Number(s?.t || 0).toFixed(6),
+        ap: Number(s?.ap || 0).toFixed(6),
+        glass: String(s?.glass || "AIR"),
+        stop: !!s?.stop,
+      })),
+    });
+    if (key === _sharpCacheKey && _sharpCacheVal) return _sharpCacheVal;
+    const val = evaluateSharpness(surfaces, wavePreset, sensorX, rayCount, {
+      sensorW,
+      sensorH,
+      lensShift,
+      angleFractions: SHARP_OPT_CFG.angleFractions,
+      angleWeights: SHARP_OPT_CFG.angleWeights,
+      maxFieldStepDeg: SHARP_OPT_CFG.maxFieldStepDeg,
+      maxFieldScanDeg: SHARP_OPT_CFG.maxFieldScanDeg,
+      minValidFrac: SHARP_OPT_CFG.minValidFrac,
+      lowValidPenaltyMm: SHARP_OPT_CFG.lowValidPenaltyMm,
+      noDataPenaltyMm: SHARP_OPT_CFG.noDataPenaltyMm,
+    });
+    _sharpCacheKey = key;
+    _sharpCacheVal = val;
+    return val;
+  }
+
   function fmtIntrusion(evalRes) {
     const v = Number(evalRes?.intrusion);
     return Number.isFinite(v) ? `${v.toFixed(2)}mm` : "—";
   }
 
+  function coverageTestMaxFieldDeg(
+    surfaces,
+    wavePreset,
+    sensorX,
+    {
+      sensorW = null,
+      sensorH = null,
+      stepDeg = DIST_OPT_CFG.maxFieldStepDeg,
+      maxDeg = DIST_OPT_CFG.maxFieldScanDeg,
+      diagTolMm = 0.35,
+      breakMissRun = 4,
+    } = {}
+  ) {
+    const sensor = getSensorWH();
+    const wMm = Number.isFinite(sensorW) ? Number(sensorW) : Number(sensor.w || 36.7);
+    const hMm = Number.isFinite(sensorH) ? Number(sensorH) : Number(sensor.h || 25.54);
+    const halfDiag = 0.5 * Math.hypot(wMm, hMm);
+    const step = Math.max(0.25, Number(stepDeg || 1.0));
+    const limit = Math.max(step, Number(maxDeg || 60));
+
+    let best = 0;
+    let missRun = 0;
+    for (let th = 0; th <= limit + 1e-9; th += step) {
+      const chief = buildChiefRay(surfaces, th);
+      const tr = traceRayForward(clone(chief), surfaces, wavePreset);
+      if (!tr || tr.vignetted || tr.tir || !tr.endRay || tr.clippedByMount) {
+        missRun++;
+        if (th > 8 && missRun >= breakMissRun) break;
+        continue;
+      }
+      const y = rayHitYAtX(tr.endRay, sensorX);
+      if (!Number.isFinite(y)) {
+        missRun++;
+        if (th > 8 && missRun >= breakMissRun) break;
+        continue;
+      }
+      const ok = Math.abs(y) <= (halfDiag + Math.max(0.05, Number(diagTolMm || 0.35)));
+      if (ok) {
+        best = th;
+        missRun = 0;
+      } else {
+        missRun++;
+        if (th > 8 && missRun >= breakMissRun) break;
+      }
+    }
+    return Math.max(0, Number(best || 0));
+  }
+
+  function distortionScoreFromSampleSet(samples = []) {
+    let score = 0;
+    let valid = 0;
+    for (const s of samples || []) {
+      const frac = Number(s?.frac || 0);
+      const d = Number(s?.distPct);
+      if (!Number.isFinite(d)) continue;
+      let w = 1.0;
+      if (frac >= 0.89) w = 1.80;
+      else if (frac >= 0.69) w = 1.55;
+      score += w * Math.pow(d / 2.0, 2);
+      valid++;
+    }
+    if (valid <= 0) return Infinity;
+    return score;
+  }
+
+  function measureDistortionState(
+    lensObj,
+    {
+      wavePreset = "d",
+      sensorX = 0,
+      lensShift = 0,
+      objDist = DIST_OPT_CFG.objDistMm,
+      sampleFracs = DIST_OPT_CFG.sampleFracs,
+      sensorW = null,
+      sensorH = null,
+      lutN = DIST_OPT_CFG.lutNOptFast,
+      lutPupilSqrt = DIST_OPT_CFG.lutPupilSqrtOpt,
+      maxFieldStepDeg = DIST_OPT_CFG.maxFieldStepDeg,
+      maxFieldScanDeg = DIST_OPT_CFG.maxFieldScanDeg,
+      maxBflShortMm = DIST_OPT_CFG.maxBflShortMm,
+    } = {}
+  ) {
+    if (!lensObj?.surfaces || !Array.isArray(lensObj.surfaces)) {
+      return { ok: false, reason: "lens" };
+    }
+
+    const surfaces = lensObj.surfaces;
+    ensureStopExists(surfaces);
+    enforceSingleStopSurface(surfaces);
+    ensureStopInAirBothSides(surfaces);
+    quickSanity(surfaces);
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 0) return { ok: false, reason: "stop" };
+
+    const sx = Number(sensorX || 0);
+    const ls = Number(lensShift || 0);
+    computeVertices(surfaces, 0, sx);
+    const rearVxNeutral = lastPhysicalVertexX(surfaces);
+    const intrusionNeutral = Number.isFinite(rearVxNeutral) ? (rearVxNeutral - (-PL_FFD)) : Infinity;
+
+    computeVertices(surfaces, ls, sx);
+    const phys = evaluatePhysicalConstraints(surfaces);
+    if (phys.hardFail) return { ok: false, reason: "phys", phys };
+
+    const rearVxFocused = lastPhysicalVertexX(surfaces);
+    const intrusionFocused = Number.isFinite(rearVxFocused) ? (rearVxFocused - (-PL_FFD)) : Infinity;
+    const intrusion = Math.max(intrusionNeutral, intrusionFocused);
+    if (!(intrusion <= 1e-3)) return { ok: false, reason: "pl", intrusion, phys };
+
+    const rays = buildRays(surfaces, 0, 13);
+    const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
+    const cross = detectInternalRayCrossings(traces, surfaces, wavePreset);
+    if (cross.invalid) return { ok: false, reason: "xover", cross, phys };
+
+    const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
+    if (!(Number.isFinite(efl) && efl > 1e-6)) return { ok: false, reason: "efl", phys };
+    const bflShortMm = Number.isFinite(bfl) ? Math.max(0, MERIT_CFG.bflMin - bfl) : Infinity;
+    if (!(bflShortMm <= Number(maxBflShortMm || DIST_OPT_CFG.maxBflShortMm))) {
+      return { ok: false, reason: "bfl", bflShortMm, bfl, phys };
+    }
+
+    const T = estimateTStopApprox(efl, surfaces);
+    if (!(Number.isFinite(T) && T > 0)) return { ok: false, reason: "t", efl, phys };
+
+    const maxFieldDeg = coverageTestMaxFieldDeg(surfaces, wavePreset, sx, {
+      sensorW,
+      sensorH,
+      stepDeg: maxFieldStepDeg,
+      maxDeg: maxFieldScanDeg,
+    });
+    if (!(Number.isFinite(maxFieldDeg) && maxFieldDeg >= 0)) {
+      return { ok: false, reason: "cov", efl, T, phys };
+    }
+
+    const lut = buildLUTOnly({
+      surfaces,
+      wavePreset,
+      sensorX: sx,
+      lensShift: ls,
+      objDist,
+      lutN,
+      lutPupilSqrt,
+      doCA: false,
+      sensorW,
+      sensorH,
+    });
+    if (!lut) return { ok: false, reason: "lut", efl, T, maxFieldDeg, phys };
+    const dist = computeDistortionFromLUT(lut, {
+      efl,
+      objDist,
+      sampleFracs,
+    });
+    if (!dist || !(Number.isFinite(dist.rmsDistPct) && Number.isFinite(dist.maxAbsDistPct))) {
+      return { ok: false, reason: "dist", efl, T, maxFieldDeg, phys };
+    }
+
+    return {
+      ok: true,
+      efl,
+      T,
+      bfl,
+      bflShortMm,
+      intrusion,
+      maxFieldDeg,
+      stopIdx,
+      phys,
+      cross,
+      lut,
+      dist,
+      distScore: distortionScoreFromSampleSet(dist.samples),
+    };
+  }
+
+  function scoreDistortionState(state, baseline, cfg = DIST_OPT_CFG) {
+    const ws = cfg?.weights || DIST_OPT_CFG.weights;
+    const eflDiff = Number(state?.efl || 0) - Number(baseline?.efl || 0);
+    const eflRel = Math.abs(eflDiff) / Math.max(1e-6, Math.abs(Number(baseline?.efl || 1)));
+    const tDiff = Number(state?.T || 0) - Number(baseline?.T || 0);
+    const tAbs = Math.abs(tDiff);
+    const covDropDeg = Math.max(0, Number(baseline?.maxFieldDeg || 0) - Number(state?.maxFieldDeg || 0));
+    const covPenaltyDeg = Math.max(0, covDropDeg - Number(cfg.maxCoverageDropDeg || DIST_OPT_CFG.maxCoverageDropDeg));
+    const distScore = Number.isFinite(state?.distScore) ? Number(state.distScore) : Infinity;
+
+    let hardReject = false;
+    let hardReason = "";
+    if (!(Number.isFinite(distScore) && distScore < Infinity)) {
+      hardReject = true;
+      hardReason = "dist";
+    } else if (eflRel > Number(cfg.maxEflDriftRelReject || DIST_OPT_CFG.maxEflDriftRelReject)) {
+      hardReject = true;
+      hardReason = "efl_guard";
+    } else if (tAbs > Number(cfg.maxTDriftAbsReject || DIST_OPT_CFG.maxTDriftAbsReject)) {
+      hardReject = true;
+      hardReason = "t_guard";
+    } else if (covDropDeg > Number(cfg.maxCoverageDropRejectDeg || DIST_OPT_CFG.maxCoverageDropRejectDeg)) {
+      hardReject = true;
+      hardReason = "cov_guard";
+    }
+
+    let merit =
+      Number(ws.dist || 120) * distScore +
+      Number(ws.efl || 80) * (eflDiff * eflDiff) +
+      Number(ws.t || 60) * (tDiff * tDiff) +
+      Number(ws.cov || 200) * (covPenaltyDeg * covPenaltyDeg);
+
+    if (eflRel > Number(cfg.maxEflDriftRel || DIST_OPT_CFG.maxEflDriftRel)) {
+      const d = eflRel - Number(cfg.maxEflDriftRel || DIST_OPT_CFG.maxEflDriftRel);
+      merit += 3000.0 * d * d;
+    }
+    if (tAbs > Number(cfg.maxTDriftAbs || DIST_OPT_CFG.maxTDriftAbs)) {
+      const d = tAbs - Number(cfg.maxTDriftAbs || DIST_OPT_CFG.maxTDriftAbs);
+      merit += 1800.0 * d * d;
+    }
+
+    return {
+      merit,
+      hardReject,
+      hardReason,
+      distScore,
+      eflDiff,
+      eflRel,
+      tDiff,
+      tAbs,
+      covDropDeg,
+      covPenaltyDeg,
+    };
+  }
+
+  function randRange(a, b) {
+    return Number(a) + Math.random() * (Number(b) - Number(a));
+  }
+
+  function moveStopSurfaceByOne(surfaces, dir) {
+    if (!Array.isArray(surfaces) || !surfaces.length) return false;
+    const snapshot = clone(surfaces);
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 1 || stopIdx >= surfaces.length - 1) return false;
+    const d = dir < 0 ? -1 : 1;
+    let targetIdx = stopIdx + d;
+    if (targetIdx <= 0 || targetIdx >= surfaces.length - 1) return false;
+    const tTarget = String(surfaces[targetIdx]?.type || "").toUpperCase();
+    if (tTarget === "OBJ" || tTarget === "IMS") return false;
+
+    const moved = surfaces.splice(stopIdx, 1)[0];
+    if (!moved) return false;
+    if (targetIdx > stopIdx) targetIdx--;
+    surfaces.splice(targetIdx, 0, moved);
+    enforceSingleStopSurface(surfaces);
+
+    const newStopIdx = findStopSurfaceIndex(surfaces);
+    const prevMedium = newStopIdx > 0
+      ? String(resolveGlassName(surfaces[newStopIdx - 1]?.glass || "AIR")).toUpperCase()
+      : "AIR";
+    const nextMedium = String(resolveGlassName(surfaces[newStopIdx]?.glass || "AIR")).toUpperCase();
+    if (prevMedium !== "AIR" || nextMedium !== "AIR") {
+      surfaces.splice(0, surfaces.length, ...snapshot);
+      return false;
+    }
+
+    ensureStopInAirBothSides(surfaces);
+    quickSanity(surfaces);
+    return true;
+  }
+
+  function collectDistortionMutationIndices(surfaces, stopIdx) {
+    const bend = [];
+    const gaps = [];
+    const addIf = (arr, idx) => {
+      if (!Number.isFinite(idx) || idx < 1 || idx >= surfaces.length - 1) return;
+      if (!arr.includes(idx)) arr.push(idx);
+    };
+
+    for (let d = -3; d <= 3; d++) addIf(bend, stopIdx + d);
+    for (let d = 4; d <= 6; d++) addIf(bend, stopIdx + d);
+    for (let d = -3; d <= 6; d++) addIf(gaps, stopIdx + d);
+
+    const bendFiltered = bend.filter((idx) => {
+      if (idx === stopIdx) return false;
+      const s = surfaces[idx];
+      if (!s || surfaceIsLocked(s)) return false;
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "STOP") return false;
+      const absR = Math.abs(Number(s?.R || 0));
+      return absR > 1e-9;
+    });
+
+    const gapFiltered = gaps.filter((idx) => {
+      const s = surfaces[idx];
+      if (!s || surfaceIsLocked(s)) return false;
+      const mediumAfter = String(resolveGlassName(s?.glass || "AIR")).toUpperCase();
+      return mediumAfter === "AIR";
+    });
+
+    return { bend: bendFiltered, gaps: gapFiltered };
+  }
+
+  function applyOneDistortionMutation(surfaces, cfg = DIST_OPT_CFG) {
+    if (!Array.isArray(surfaces) || surfaces.length < 4) return { ok: false, reason: "lens" };
+    ensureStopExists(surfaces);
+    enforceSingleStopSurface(surfaces);
+    ensureStopInAirBothSides(surfaces);
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 0) return { ok: false, reason: "stop" };
+
+    const mut = cfg?.mutation || DIST_OPT_CFG.mutation;
+    const totalChance = Math.max(
+      1e-6,
+      Number(mut.stopMoveChance || 0) +
+      Number(mut.bendChance || 0) +
+      Number(mut.airChance || 0) +
+      Number(mut.stopApChance || 0)
+    );
+    const r = Math.random() * totalChance;
+    const cutStop = Number(mut.stopMoveChance || 0);
+    const cutBend = cutStop + Number(mut.bendChance || 0);
+    const cutAir = cutBend + Number(mut.airChance || 0);
+
+    const ids = collectDistortionMutationIndices(surfaces, stopIdx);
+    let kind = "bend";
+    let mutated = false;
+
+    if (r < cutStop) {
+      kind = "stop_shift";
+      mutated = moveStopSurfaceByOne(surfaces, Math.random() < 0.5 ? -1 : 1);
+    } else if (r < cutBend) {
+      kind = "bend";
+      if (ids.bend.length) {
+        const idx = pick(ids.bend);
+        const s = surfaces[idx];
+        const R0 = Number(s?.R || 0);
+        const absR = Math.max(PHYS_CFG.minRadius, Math.abs(R0));
+        const sign = Math.sign(R0 || 1) || 1;
+        const frac = randRange(
+          Math.max(0.0005, Number(mut.bendPctMin || 0.005)),
+          Math.max(0.001, Number(mut.bendPctMax || 0.020))
+        );
+        const delta = Math.random() < 0.5 ? -frac : frac;
+        const absNew = clamp(absR * (1 + delta), PHYS_CFG.minRadius, 650);
+        s.R = sign * absNew;
+        enforceApertureRadiusCoupling(s, 1.08);
+        mutated = true;
+      }
+    } else if (r < cutAir) {
+      kind = "air_gap";
+      if (ids.gaps.length) {
+        const idx = pick(ids.gaps);
+        const s = surfaces[idx];
+        const d = randRange(-Math.abs(Number(mut.airDeltaMm || 0.6)), Math.abs(Number(mut.airDeltaMm || 0.6)));
+        s.t = clamp(
+          Number(s?.t || 0) + d,
+          PHYS_CFG.minAirGap,
+          Math.min(28, PHYS_CFG.maxThickness)
+        );
+        mutated = true;
+      }
+    } else {
+      kind = "stop_ap";
+      const idx = findStopSurfaceIndex(surfaces);
+      if (idx >= 0) {
+        const stop = surfaces[idx];
+        const pct = Math.abs(Number(mut.stopApPct || 0.005));
+        const f = 1 + randRange(-pct, pct);
+        stop.ap = clamp(Number(stop.ap || 0) * f, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        mutated = true;
+      }
+    }
+
+    if (!mutated) return { ok: false, reason: kind };
+    enforceSingleStopSurface(surfaces);
+    ensureStopInAirBothSides(surfaces);
+    quickSanity(surfaces);
+    return { ok: true, kind };
+  }
+
+  function collectSharpnessMutationIndices(surfaces, stopIdx) {
+    const bend = [];
+    const gaps = [];
+    const add = (arr, idx) => {
+      if (!Number.isFinite(idx) || idx < 1 || idx >= surfaces.length - 1) return;
+      if (!arr.includes(idx)) arr.push(idx);
+    };
+
+    for (let d = -3; d <= 3; d++) add(bend, stopIdx + d);
+    for (let d = 4; d <= 6; d++) add(bend, stopIdx + d);
+    for (let d = -3; d <= 8; d++) add(gaps, stopIdx + d);
+
+    const bendFiltered = bend.filter((idx) => {
+      const s = surfaces[idx];
+      if (!s || surfaceIsLocked(s)) return false;
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "STOP" || t === "OBJ" || t === "IMS") return false;
+      const absR = Math.abs(Number(s?.R || 0));
+      return absR > 1e-9;
+    });
+    const gapFiltered = gaps.filter((idx) => {
+      const s = surfaces[idx];
+      if (!s || surfaceIsLocked(s)) return false;
+      const mediumAfter = String(resolveGlassName(s?.glass || "AIR")).toUpperCase();
+      return mediumAfter === "AIR";
+    });
+    return { bend: bendFiltered, gaps: gapFiltered };
+  }
+
+  function applyOneSharpnessMutation(surfaces, cfg = SHARP_OPT_CFG) {
+    if (!Array.isArray(surfaces) || surfaces.length < 4) return { ok: false, reason: "lens" };
+    ensureStopExists(surfaces);
+    enforceSingleStopSurface(surfaces);
+    ensureStopInAirBothSides(surfaces);
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 0) return { ok: false, reason: "stop" };
+
+    const mut = cfg?.mutation || SHARP_OPT_CFG.mutation;
+    const pAir = Math.max(0.01, Number(mut.airChance || 0.52));
+    const pBend = Math.max(0.01, Number(mut.bendChance || 0.48));
+    const r = Math.random() * (pAir + pBend);
+    const ids = collectSharpnessMutationIndices(surfaces, stopIdx);
+
+    let kind = "air_gap";
+    let mutated = false;
+
+    if (r < pAir) {
+      kind = "air_gap";
+      if (ids.gaps.length) {
+        const idx = pick(ids.gaps);
+        const s = surfaces[idx];
+        const dAbs = randRange(
+          Math.max(0.01, Number(mut.airDeltaMinMm || 0.05)),
+          Math.max(0.02, Number(mut.airDeltaMaxMm || 0.40))
+        );
+        const d = Math.random() < 0.5 ? -dAbs : dAbs;
+        s.t = clamp(
+          Number(s?.t || 0) + d,
+          Math.max(0.05, Number(PHYS_CFG.minAirGap || 0.12)),
+          Math.min(22, Number(PHYS_CFG.maxThickness || 55))
+        );
+        mutated = true;
+      }
+    } else {
+      kind = "bend";
+      if (ids.bend.length) {
+        const idx = pick(ids.bend);
+        const s = surfaces[idx];
+        const R0 = Number(s?.R || 0);
+        const absR = Math.max(Number(PHYS_CFG.minRadius || 8), Math.abs(R0));
+        const sign = Math.sign(R0 || 1) || 1;
+        const frac = randRange(
+          Math.max(0.0005, Number(mut.bendPctMin || 0.002)),
+          Math.max(0.0015, Number(mut.bendPctMax || 0.010))
+        );
+        const delta = Math.random() < 0.5 ? -frac : frac;
+        s.R = sign * clamp(absR * (1 + delta), Number(PHYS_CFG.minRadius || 8), 650);
+        enforceApertureRadiusCoupling(s, 1.08);
+        mutated = true;
+
+        if (Math.random() < Math.max(0, Number(mut.pairBendChance || 0.42))) {
+          const pairIdx = stopIdx - (idx - stopIdx);
+          if (Number.isFinite(pairIdx) && pairIdx >= 1 && pairIdx < surfaces.length - 1 && pairIdx !== idx) {
+            const sp = surfaces[pairIdx];
+            const tp = String(sp?.type || "").toUpperCase();
+            const Rp0 = Number(sp?.R || 0);
+            if (sp && !surfaceIsLocked(sp) && tp !== "STOP" && Math.abs(Rp0) > 1e-9) {
+              const pairScale = randRange(0.60, 1.00);
+              const pairDelta = -delta * pairScale;
+              const pairAbsR = Math.max(Number(PHYS_CFG.minRadius || 8), Math.abs(Rp0));
+              const pairSign = Math.sign(Rp0 || 1) || 1;
+              sp.R = pairSign * clamp(pairAbsR * (1 + pairDelta), Number(PHYS_CFG.minRadius || 8), 650);
+              enforceApertureRadiusCoupling(sp, 1.08);
+            }
+          }
+        }
+      }
+    }
+
+    if (!mutated) return { ok: false, reason: kind };
+    enforceSingleStopSurface(surfaces);
+    ensureStopInAirBothSides(surfaces);
+    quickSanity(surfaces);
+    return { ok: true, kind };
+  }
+
+  function measureSharpnessState(
+    lensObj,
+    {
+      wavePreset = "d",
+      focusMode = "lens",
+      sensorX = 0,
+      lensShift = 0,
+      rayCount = 25,
+      sensorW = null,
+      sensorH = null,
+      maxFieldStepDeg = SHARP_OPT_CFG.maxFieldStepDeg,
+      maxFieldScanDeg = SHARP_OPT_CFG.maxFieldScanDeg,
+      maxBflShortMm = SHARP_OPT_CFG.maxBflShortMm,
+      afOptions = null,
+      withDistGuard = true,
+    } = {}
+  ) {
+    if (!lensObj?.surfaces || !Array.isArray(lensObj.surfaces)) return { ok: false, reason: "lens" };
+    const surfaces = lensObj.surfaces;
+    ensureStopExists(surfaces);
+    enforceSingleStopSurface(surfaces);
+    ensureStopInAirBothSides(surfaces);
+    quickSanity(surfaces);
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 0) return { ok: false, reason: "stop" };
+
+    const sensor = getSensorWH();
+    const wMm = Number.isFinite(sensorW) ? Number(sensorW) : Number(sensor.w || 36.7);
+    const hMm = Number.isFinite(sensorH) ? Number(sensorH) : Number(sensor.h || 25.54);
+    const focus = findBestFocusShift(
+      surfaces,
+      focusMode,
+      Number(sensorX || 0),
+      Number(lensShift || 0),
+      wavePreset,
+      {
+        sensorW: wMm,
+        sensorH: hMm,
+        ...(afOptions || {}),
+      }
+    );
+    if (!focus.ok) return { ok: false, reason: "af" };
+
+    computeVertices(surfaces, 0, focus.sensorX);
+    const rearVxNeutral = lastPhysicalVertexX(surfaces);
+    const intrusionNeutral = Number.isFinite(rearVxNeutral) ? (rearVxNeutral - (-PL_FFD)) : Infinity;
+    computeVertices(surfaces, focus.lensShift, focus.sensorX);
+    const phys = evaluatePhysicalConstraints(surfaces);
+    if (phys.hardFail) return { ok: false, reason: "phys", phys, focus };
+    const rearVxFocused = lastPhysicalVertexX(surfaces);
+    const intrusionFocused = Number.isFinite(rearVxFocused) ? (rearVxFocused - (-PL_FFD)) : Infinity;
+    const intrusion = Math.max(intrusionNeutral, intrusionFocused);
+    if (!(intrusion <= 1e-3)) return { ok: false, reason: "pl", intrusion, phys, focus };
+
+    const rays = buildRays(surfaces, 0, 13);
+    const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
+    const cross = detectInternalRayCrossings(traces, surfaces, wavePreset);
+    if (cross.invalid) return { ok: false, reason: "xover", cross, phys, focus };
+
+    const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
+    if (!(Number.isFinite(efl) && efl > 1e-6)) return { ok: false, reason: "efl", focus, phys };
+    const bflShortMm = Number.isFinite(bfl) ? Math.max(0, Number(MERIT_CFG.bflMin || 52) - bfl) : Infinity;
+    if (!(bflShortMm <= Number(maxBflShortMm || SHARP_OPT_CFG.maxBflShortMm))) {
+      return { ok: false, reason: "bfl", bfl, bflShortMm, focus, phys };
+    }
+    const T = estimateTStopApprox(efl, surfaces);
+    if (!(Number.isFinite(T) && T > 0)) return { ok: false, reason: "t", efl, bfl, focus, phys };
+
+    const sharp = evaluateSharpness(
+      surfaces,
+      wavePreset,
+      focus.sensorX,
+      rayCount,
+      {
+        sensorW: wMm,
+        sensorH: hMm,
+        lensShift: focus.lensShift,
+        angleFractions: SHARP_OPT_CFG.angleFractions,
+        angleWeights: SHARP_OPT_CFG.angleWeights,
+        maxFieldStepDeg,
+        maxFieldScanDeg,
+        minValidFrac: SHARP_OPT_CFG.minValidFrac,
+        lowValidPenaltyMm: SHARP_OPT_CFG.lowValidPenaltyMm,
+        noDataPenaltyMm: SHARP_OPT_CFG.noDataPenaltyMm,
+      }
+    );
+    if (!(sharp?.ok && Number.isFinite(sharp?.score))) {
+      return { ok: false, reason: "sharp", efl, T, bfl, focus, sharp, phys };
+    }
+
+    let dist70Pct = null;
+    if (withDistGuard) {
+      const dist = getLutDistortionMetricsCached({
+        surfaces,
+        wavePreset,
+        sensorX: focus.sensorX,
+        lensShift: focus.lensShift,
+        objDist: Number(SHARP_OPT_CFG.distGuardObjDistMm || DIST_OPT_CFG.objDistMm || 20000),
+        lutN: Number(SHARP_OPT_CFG.distGuardLutN || 180),
+        lutPupilSqrt: Number(SHARP_OPT_CFG.distGuardPupilSqrt || 1),
+        doCA: false,
+        sensorW: wMm,
+        sensorH: hMm,
+        efl,
+        sampleFracs: DIST_OPT_CFG.sampleFracs,
+      });
+      const d70 = Number(dist?.distPctAt70);
+      if (!Number.isFinite(d70)) {
+        return { ok: false, reason: "dist_guard", efl, T, bfl, focus, sharp, phys };
+      }
+      dist70Pct = d70;
+    }
+
+    return {
+      ok: true,
+      stopIdx,
+      efl,
+      T,
+      bfl,
+      bflShortMm,
+      intrusion,
+      phys,
+      cross,
+      sharp,
+      focus,
+      maxFieldDeg: Number(sharp?.maxFieldDeg || 0),
+      dist70Pct,
+      dist70AbsPct: Number.isFinite(dist70Pct) ? Math.abs(dist70Pct) : null,
+    };
+  }
+
+  function scoreSharpnessState(state, baseline, cfg = SHARP_OPT_CFG) {
+    const ws = cfg?.weights || SHARP_OPT_CFG.weights;
+    const sharpScore = Number.isFinite(state?.sharp?.score) ? Number(state.sharp.score) : Infinity;
+    const eflDiff = Number(state?.efl || 0) - Number(baseline?.efl || 0);
+    const eflRel = Math.abs(eflDiff) / Math.max(1e-6, Math.abs(Number(baseline?.efl || 1)));
+    const tDiff = Number(state?.T || 0) - Number(baseline?.T || 0);
+    const tAbs = Math.abs(tDiff);
+    const covDropDeg = Math.max(0, Number(baseline?.maxFieldDeg || 0) - Number(state?.maxFieldDeg || 0));
+    const covPenaltyDeg = Math.max(0, covDropDeg - Number(cfg.maxCoverageDropDeg || SHARP_OPT_CFG.maxCoverageDropDeg));
+    const baseDistAbs = Math.abs(Number(baseline?.dist70AbsPct || 0));
+    const curDistAbs = Math.abs(Number(state?.dist70AbsPct || 0));
+    const distWorse = Number.isFinite(curDistAbs)
+      ? Math.max(0, curDistAbs - (baseDistAbs + Number(cfg.maxDist70WorsenPct || SHARP_OPT_CFG.maxDist70WorsenPct)))
+      : 0;
+
+    let hardReject = false;
+    let hardReason = "";
+    if (!(Number.isFinite(sharpScore) && sharpScore < Infinity)) {
+      hardReject = true;
+      hardReason = "sharp";
+    } else if (eflRel > Number(cfg.maxEflDriftRelReject || SHARP_OPT_CFG.maxEflDriftRelReject)) {
+      hardReject = true;
+      hardReason = "efl_guard";
+    } else if (tAbs > Number(cfg.maxTDriftAbsReject || SHARP_OPT_CFG.maxTDriftAbsReject)) {
+      hardReject = true;
+      hardReason = "t_guard";
+    } else if (covDropDeg > Number(cfg.maxCoverageDropRejectDeg || SHARP_OPT_CFG.maxCoverageDropRejectDeg)) {
+      hardReject = true;
+      hardReason = "cov_guard";
+    } else if (
+      Number.isFinite(curDistAbs) &&
+      curDistAbs > baseDistAbs + Number(cfg.maxDist70WorsenRejectPct || SHARP_OPT_CFG.maxDist70WorsenRejectPct)
+    ) {
+      hardReject = true;
+      hardReason = "dist_guard";
+    }
+
+    let merit =
+      Number(ws.sharp || 120) * sharpScore +
+      Number(ws.efl || 80) * (eflDiff * eflDiff) +
+      Number(ws.t || 60) * (tDiff * tDiff) +
+      Number(ws.cov || 200) * (covPenaltyDeg * covPenaltyDeg) +
+      Number(ws.dist || 60) * (distWorse * distWorse);
+
+    if (eflRel > Number(cfg.maxEflDriftRel || SHARP_OPT_CFG.maxEflDriftRel)) {
+      const d = eflRel - Number(cfg.maxEflDriftRel || SHARP_OPT_CFG.maxEflDriftRel);
+      merit += 2500.0 * d * d;
+    }
+    if (tAbs > Number(cfg.maxTDriftAbs || SHARP_OPT_CFG.maxTDriftAbs)) {
+      const d = tAbs - Number(cfg.maxTDriftAbs || SHARP_OPT_CFG.maxTDriftAbs);
+      merit += 1400.0 * d * d;
+    }
+
+    return {
+      merit,
+      hardReject,
+      hardReason,
+      sharpScore,
+      eflDiff,
+      eflRel,
+      tDiff,
+      tAbs,
+      covDropDeg,
+      covPenaltyDeg,
+      distWorse,
+      distAbsPct: Number.isFinite(curDistAbs) ? curDistAbs : null,
+    };
+  }
+
+  async function runSharpnessOptimizer() {
+    if (sharpOptRunning) return;
+    if (optRunning || scratchBuildRunning || distOptRunning) {
+      toast("Stop optimizer/build/distortion first before Optimize Sharpness.");
+      return;
+    }
+
+    sharpOptRunning = true;
+    sharpOptStopRequested = false;
+    if (ui.btnOptSharp) ui.btnOptSharp.disabled = true;
+    if (ui.btnOptDist) ui.btnOptDist.disabled = true;
+
+    const runNo = ++optimizerRunSerial;
+    const prevRunCtx = optRunContext;
+    setOptRunContext({
+      mode: "Sharpness Optimizer",
+      label: "multi-field RMS",
+    });
+
+    try {
+      const sensor = getSensorWH();
+      const wavePreset = ui.wavePreset?.value || "d";
+      const focusMode = String(ui.focusMode?.value || "lens").toLowerCase() === "cam" ? "cam" : "lens";
+      const sensorX0 = focusMode === "cam" ? num(ui.sensorOffset?.value, 0) : 0;
+      const lensShift0 = focusMode === "lens" ? num(ui.lensFocus?.value, 0) : 0;
+      const popMode = String(ui.optPop?.value || "safe").toLowerCase();
+      const rayCount = clamp(
+        num(ui.rayCount?.value, 31) | 0,
+        Number(SHARP_OPT_CFG.rayCountMin || 11),
+        Number(SHARP_OPT_CFG.rayCountMax || 41)
+      );
+      const baseIters = clamp(
+        num(ui.optIters?.value, 3000),
+        SHARP_OPT_CFG.iterationsMin,
+        SHARP_OPT_CFG.iterationsMax
+      );
+      const modeScale = popMode === "wild" ? 1.45 : 1.0;
+      const iters = clamp(
+        Math.round(baseIters * modeScale),
+        SHARP_OPT_CFG.iterationsMin,
+        SHARP_OPT_CFG.iterationsMax
+      );
+      const runHeader = formatOptimizerRunHeader(runNo);
+
+      const ctxBase = {
+        wavePreset,
+        focusMode,
+        sensorX: sensorX0,
+        lensShift: lensShift0,
+        rayCount,
+        sensorW: sensor.w,
+        sensorH: sensor.h,
+        maxFieldStepDeg: SHARP_OPT_CFG.maxFieldStepDeg,
+        maxFieldScanDeg: SHARP_OPT_CFG.maxFieldScanDeg,
+        maxBflShortMm: SHARP_OPT_CFG.maxBflShortMm,
+        afOptions: SHARP_OPT_CFG.autofocus,
+        withDistGuard: true,
+      };
+
+      const startLens = sanitizeLens(clone(lens));
+      const baseState = measureSharpnessState(startLens, ctxBase);
+      if (!baseState.ok) {
+        setOptLog(
+          `${runHeader}\n` +
+          `failed: baseline invalid (${baseState.reason})\n` +
+          `No changes applied.`
+        );
+        toast(`Sharpness optimizer aborted: baseline ${baseState.reason}`);
+        return;
+      }
+      const baseScore = scoreSharpnessState(baseState, baseState, SHARP_OPT_CFG);
+
+      let bestLens = clone(startLens);
+      let bestState = baseState;
+      let bestMerit = Number(baseScore?.merit || Infinity);
+      let bestIter = 0;
+
+      let curLens = clone(startLens);
+      let curState = baseState;
+      let curMerit = Number(baseScore?.merit || Infinity);
+
+      const rejects = {
+        mutation: 0,
+        af: 0,
+        sharp: 0,
+        phys: 0,
+        pl: 0,
+        xover: 0,
+        bfl: 0,
+        efl_guard: 0,
+        t_guard: 0,
+        cov_guard: 0,
+        dist_guard: 0,
+        other: 0,
+      };
+      const countReject = (reason) => {
+        const k = String(reason || "other");
+        if (Object.prototype.hasOwnProperty.call(rejects, k)) rejects[k]++;
+        else rejects.other++;
+      };
+
+      const batch = Math.max(20, Number(SHARP_OPT_CFG.progressBatch || 60) | 0);
+      const t0 = performance.now();
+      setOptLog(
+        `${runHeader}\n` +
+        `running… 0/${iters}\n` +
+        `baseline RMS C/E ${Number(baseState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(baseState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm\n` +
+        `baseline score ${Number(baseState?.sharp?.score || 0).toFixed(4)} • EFL ${baseState.efl.toFixed(2)}mm • T ${baseState.T.toFixed(2)} • field ${baseState.maxFieldDeg.toFixed(2)}°`
+      );
+
+      let itersRan = 0;
+      for (let i = 1; i <= iters; i++) {
+        if (!sharpOptRunning || sharpOptStopRequested) break;
+        itersRan = i;
+        const alpha = i / iters;
+        const temp = SHARP_OPT_CFG.annealTempStart * (1 - alpha) + SHARP_OPT_CFG.annealTempEnd * alpha;
+        const parent = Math.random() < 0.66 ? curLens : bestLens;
+        const cand = clone(parent);
+        const mut = applyOneSharpnessMutation(cand.surfaces, SHARP_OPT_CFG);
+        if (!mut.ok) {
+          countReject("mutation");
+          continue;
+        }
+
+        const candState = measureSharpnessState(cand, ctxBase);
+        if (!candState.ok) {
+          countReject(candState.reason);
+          continue;
+        }
+        const candScore = scoreSharpnessState(candState, baseState, SHARP_OPT_CFG);
+        if (candScore.hardReject) {
+          countReject(candScore.hardReason || "other");
+          continue;
+        }
+
+        let accept = false;
+        if (candScore.merit < curMerit) {
+          accept = true;
+        } else {
+          const uphill = candScore.merit - curMerit;
+          const pAcc = Math.exp(-uphill / Math.max(1e-6, temp));
+          accept = Math.random() < pAcc;
+        }
+        if (accept) {
+          curLens = cand;
+          curState = candState;
+          curMerit = candScore.merit;
+        }
+
+        if (candScore.merit + 1e-9 < bestMerit) {
+          const checkState = measureSharpnessState(cand, {
+            ...ctxBase,
+            rayCount: Math.min(41, Math.max(rayCount, 29)),
+            maxFieldStepDeg: Math.max(0.8, Number(SHARP_OPT_CFG.maxFieldStepDeg || 1.25) * 0.85),
+          });
+          if (checkState.ok) {
+            const checkScore = scoreSharpnessState(checkState, baseState, SHARP_OPT_CFG);
+            if (!checkScore.hardReject && checkScore.merit + 1e-9 < bestMerit) {
+              bestLens = clone(cand);
+              bestState = checkState;
+              bestMerit = checkScore.merit;
+              bestIter = i;
+            }
+          }
+        }
+
+        if (i % batch === 0) {
+          const dt = Math.max(1e-6, (performance.now() - t0) / 1000);
+          const ips = i / dt;
+          const curC = Number(curState?.sharp?.centerRmsMm);
+          const curE = Number(curState?.sharp?.edgeRmsMm);
+          const bestC = Number(bestState?.sharp?.centerRmsMm);
+          const bestE = Number(bestState?.sharp?.edgeRmsMm);
+          const eflDrift = Number(bestState?.efl || 0) - Number(baseState?.efl || 0);
+          const tDrift = Number(bestState?.T || 0) - Number(baseState?.T || 0);
+          const fieldDrop = Math.max(0, Number(baseState?.maxFieldDeg || 0) - Number(bestState?.maxFieldDeg || 0));
+          const distNow = Number(bestState?.dist70Pct);
+          setOptLog(
+            `${runHeader}\n` +
+            `running… ${i}/${iters} (${ips.toFixed(1)} it/s)\n` +
+            `current merit ${curMerit.toFixed(2)} • best merit ${bestMerit.toFixed(2)} @${bestIter}\n` +
+            `base RMS C/E ${Number(baseState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(baseState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm\n` +
+            `cur  RMS C/E ${Number.isFinite(curC) ? curC.toFixed(3) : "—"} / ${Number.isFinite(curE) ? curE.toFixed(3) : "—"} mm\n` +
+            `best RMS C/E ${Number.isFinite(bestC) ? bestC.toFixed(3) : "—"} / ${Number.isFinite(bestE) ? bestE.toFixed(3) : "—"} mm\n` +
+            `best drift EFL ${eflDrift.toFixed(3)}mm • T ${tDrift.toFixed(3)} • field drop ${fieldDrop.toFixed(2)}° • dist70 ${Number.isFinite(distNow) ? distNow.toFixed(2) : "—"}%\n` +
+            `focus ${focusMode === "cam" ? `sensor ${Number(bestState?.focus?.sensorX || 0).toFixed(3)}mm` : `lens ${Number(bestState?.focus?.lensShift || 0).toFixed(3)}mm`}\n` +
+            `rejects phys ${rejects.phys} • pl ${rejects.pl} • xover ${rejects.xover} • bfl ${rejects.bfl} • af ${rejects.af} • sharp ${rejects.sharp} • efl ${rejects.efl_guard} • t ${rejects.t_guard} • cov ${rejects.cov_guard} • dist ${rejects.dist_guard} • mut ${rejects.mutation}`
+          );
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+
+      const bestScore = scoreSharpnessState(bestState, baseState, SHARP_OPT_CFG);
+      const improved =
+        Number.isFinite(bestScore?.merit) &&
+        Number.isFinite(baseScore?.merit) &&
+        bestScore.merit + 1e-6 < baseScore.merit;
+
+      if (improved) {
+        loadLens(bestLens);
+        if (ui.focusMode) ui.focusMode.value = focusMode;
+        if (focusMode === "cam") {
+          if (ui.sensorOffset) ui.sensorOffset.value = Number(bestState?.focus?.sensorX || 0).toFixed(3);
+        } else {
+          if (ui.sensorOffset) ui.sensorOffset.value = Number(sensorX0 || 0).toFixed(3);
+        }
+        if (focusMode === "lens") {
+          if (ui.lensFocus) ui.lensFocus.value = Number(bestState?.focus?.lensShift || 0).toFixed(3);
+        } else {
+          if (ui.lensFocus) ui.lensFocus.value = Number(lensShift0 || 0).toFixed(3);
+        }
+        renderAll();
+        scheduleRenderPreviewIfAvailable();
+        scheduleAutosave();
+      } else {
+        renderAll();
+      }
+
+      const eflDrift = Number(bestState?.efl || 0) - Number(baseState?.efl || 0);
+      const tDrift = Number(bestState?.T || 0) - Number(baseState?.T || 0);
+      const fieldDrop = Math.max(0, Number(baseState?.maxFieldDeg || 0) - Number(bestState?.maxFieldDeg || 0));
+      setOptLog(
+        `${runHeader}\n` +
+        `${sharpOptStopRequested ? "stopped" : "done"} ${itersRan}/${iters}\n` +
+        `${improved ? "APPLIED ✅" : "no better candidate (kept original)"}\n` +
+        `sharp before RMS C/E ${Number(baseState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(baseState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm • score ${Number(baseState?.sharp?.score || 0).toFixed(4)}\n` +
+        `sharp after  RMS C/E ${Number(bestState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(bestState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm • score ${Number(bestState?.sharp?.score || 0).toFixed(4)}\n` +
+        `focus ${focusMode === "cam" ? `sensorOffset ${Number(bestState?.focus?.sensorX || 0).toFixed(3)}mm` : `lensFocus ${Number(bestState?.focus?.lensShift || 0).toFixed(3)}mm`}\n` +
+        `drift EFL ${eflDrift.toFixed(3)}mm • T ${tDrift.toFixed(3)} • field drop ${fieldDrop.toFixed(2)}° • dist70 ${Number.isFinite(bestState?.dist70Pct) ? Number(bestState.dist70Pct).toFixed(2) : "—"}%\n` +
+        `rejects phys ${rejects.phys} • pl ${rejects.pl} • xover ${rejects.xover} • bfl ${rejects.bfl} • af ${rejects.af} • sharp ${rejects.sharp} • efl ${rejects.efl_guard} • t ${rejects.t_guard} • cov ${rejects.cov_guard} • dist ${rejects.dist_guard} • mut ${rejects.mutation}`
+      );
+      toast(
+        improved
+          ? `Sharpness optimized: C/E ${Number(bestState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(bestState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm`
+          : "Sharpness optimizer: no better lens within guards"
+      );
+    } finally {
+      sharpOptStopRequested = false;
+      sharpOptRunning = false;
+      if (ui.btnOptSharp) ui.btnOptSharp.disabled = false;
+      if (ui.btnOptDist && !distOptRunning) ui.btnOptDist.disabled = false;
+      setOptRunContext(prevRunCtx);
+    }
+  }
+
+  function scheduleRenderPreviewIfAvailable() {
+    if (typeof scheduleRenderPreview === "function") {
+      try { scheduleRenderPreview(); } catch (_) {}
+    }
+  }
+
+  async function runDistortionOptimizer() {
+    if (distOptRunning) return;
+    if (optRunning || scratchBuildRunning || sharpOptRunning) {
+      toast("Stop optimizer/build/sharpness first before Optimize Distortion.");
+      return;
+    }
+
+    distOptRunning = true;
+    distOptStopRequested = false;
+    if (ui.btnOptDist) ui.btnOptDist.disabled = true;
+    if (ui.btnOptSharp) ui.btnOptSharp.disabled = true;
+
+    const runNo = ++optimizerRunSerial;
+    const prevRunCtx = optRunContext;
+    setOptRunContext({
+      mode: "Distortion Optimizer",
+      label: "LUT dedistort",
+    });
+
+    try {
+      const sensor = getSensorWH();
+      const wavePreset = ui.wavePreset?.value || "d";
+      const focusMode = String(ui.focusMode?.value || "lens").toLowerCase();
+      const sensorX = focusMode === "cam" ? num(ui.sensorOffset?.value, 0) : 0;
+      const lensShift = focusMode === "lens" ? num(ui.lensFocus?.value, 0) : 0;
+      const popMode = String(ui.optPop?.value || "safe").toLowerCase();
+      const baseIters = clamp(
+        num(ui.optIters?.value, 3200),
+        DIST_OPT_CFG.iterationsMin,
+        DIST_OPT_CFG.iterationsMax
+      );
+      const modeScale = popMode === "wild" ? 1.7 : 1.0;
+      const iters = clamp(
+        Math.round(baseIters * modeScale),
+        DIST_OPT_CFG.iterationsMin,
+        DIST_OPT_CFG.iterationsMax
+      );
+      const runHeader = formatOptimizerRunHeader(runNo);
+
+      const ctxBase = {
+        wavePreset,
+        sensorX,
+        lensShift,
+        objDist: DIST_OPT_CFG.objDistMm,
+        sampleFracs: DIST_OPT_CFG.sampleFracs,
+        sensorW: sensor.w,
+        sensorH: sensor.h,
+        lutN: DIST_OPT_CFG.lutNOptFinal,
+        lutPupilSqrt: DIST_OPT_CFG.lutPupilSqrtOpt,
+        maxFieldStepDeg: DIST_OPT_CFG.maxFieldStepDeg,
+        maxFieldScanDeg: DIST_OPT_CFG.maxFieldScanDeg,
+        maxBflShortMm: DIST_OPT_CFG.maxBflShortMm,
+      };
+
+      const startLens = sanitizeLens(clone(lens));
+      const baseState = measureDistortionState(startLens, ctxBase);
+      if (!baseState.ok) {
+        setOptLog(
+          `${runHeader}\n` +
+          `failed: baseline invalid (${baseState.reason})\n` +
+          `No changes applied.`
+        );
+        toast(`Distortion optimizer aborted: baseline ${baseState.reason}`);
+        return;
+      }
+      const baseScore = scoreDistortionState(baseState, baseState, DIST_OPT_CFG);
+      const baseDist70 = Number(baseState?.dist?.distPctAt70);
+      const baseRms = Number(baseState?.dist?.rmsDistPct);
+
+      let bestLens = clone(startLens);
+      let bestState = baseState;
+      let bestMerit = baseScore.merit;
+      let bestIter = 0;
+
+      let curLens = clone(startLens);
+      let curState = baseState;
+      let curMerit = baseScore.merit;
+
+      const rejects = {
+        mutation: 0,
+        phys: 0,
+        pl: 0,
+        xover: 0,
+        bfl: 0,
+        cov: 0,
+        dist: 0,
+        efl_guard: 0,
+        t_guard: 0,
+        cov_guard: 0,
+        other: 0,
+      };
+      const countReject = (reason) => {
+        const k = String(reason || "other");
+        if (Object.prototype.hasOwnProperty.call(rejects, k)) rejects[k]++;
+        else rejects.other++;
+      };
+
+      const batch = Math.max(20, Number(DIST_OPT_CFG.progressBatch || 80) | 0);
+      const t0 = performance.now();
+      setOptLog(
+        `${runHeader}\n` +
+        `running… 0/${iters}\n` +
+        `baseline DIST@0.7D ${Number.isFinite(baseDist70) ? baseDist70.toFixed(2) : "—"}% • RMS ${Number.isFinite(baseRms) ? baseRms.toFixed(2) : "—"}%\n` +
+        `baseline EFL ${baseState.efl.toFixed(2)}mm • T ${baseState.T.toFixed(2)} • field ${baseState.maxFieldDeg.toFixed(2)}° • stop #${baseState.stopIdx}`
+      );
+
+      let itersRan = 0;
+      for (let i = 1; i <= iters; i++) {
+        if (!distOptRunning || distOptStopRequested) break;
+        itersRan = i;
+
+        const alpha = i / iters;
+        const temp = DIST_OPT_CFG.annealTempStart * (1 - alpha) + DIST_OPT_CFG.annealTempEnd * alpha;
+        const parent = Math.random() < 0.64 ? curLens : bestLens;
+        const cand = clone(parent);
+        const mut = applyOneDistortionMutation(cand.surfaces, DIST_OPT_CFG);
+        if (!mut.ok) {
+          countReject("mutation");
+          continue;
+        }
+
+        const candState = measureDistortionState(cand, {
+          ...ctxBase,
+          lutN: DIST_OPT_CFG.lutNOptFast,
+        });
+        if (!candState.ok) {
+          countReject(candState.reason);
+          continue;
+        }
+        const candScore = scoreDistortionState(candState, baseState, DIST_OPT_CFG);
+        if (candScore.hardReject) {
+          countReject(candScore.hardReason || "other");
+          continue;
+        }
+
+        let accept = false;
+        if (candScore.merit < curMerit) {
+          accept = true;
+        } else {
+          const uphill = candScore.merit - curMerit;
+          const pAcc = Math.exp(-uphill / Math.max(1e-6, temp));
+          accept = Math.random() < pAcc;
+        }
+        if (accept) {
+          curLens = cand;
+          curState = candState;
+          curMerit = candScore.merit;
+        }
+
+        if (candScore.merit + 1e-9 < bestMerit) {
+          const checkState = measureDistortionState(cand, {
+            ...ctxBase,
+            lutN: DIST_OPT_CFG.lutNOptFinal,
+          });
+          if (checkState.ok) {
+            const checkScore = scoreDistortionState(checkState, baseState, DIST_OPT_CFG);
+            if (!checkScore.hardReject && checkScore.merit + 1e-9 < bestMerit) {
+              bestLens = clone(cand);
+              bestState = checkState;
+              bestMerit = checkScore.merit;
+              bestIter = i;
+            }
+          }
+        }
+
+        if (i % batch === 0) {
+          const dt = Math.max(1e-6, (performance.now() - t0) / 1000);
+          const ips = i / dt;
+          const cur70 = Number(curState?.dist?.distPctAt70);
+          const best70 = Number(bestState?.dist?.distPctAt70);
+          const curRms = Number(curState?.dist?.rmsDistPct);
+          const bestRms = Number(bestState?.dist?.rmsDistPct);
+          const eflDrift = Number(bestState?.efl || 0) - Number(baseState?.efl || 0);
+          const tDrift = Number(bestState?.T || 0) - Number(baseState?.T || 0);
+          const fieldDrop = Math.max(0, Number(baseState?.maxFieldDeg || 0) - Number(bestState?.maxFieldDeg || 0));
+          setOptLog(
+            `${runHeader}\n` +
+            `running… ${i}/${iters} (${ips.toFixed(1)} it/s)\n` +
+            `current merit ${curMerit.toFixed(2)} • best merit ${bestMerit.toFixed(2)} @${bestIter}\n` +
+            `base DIST@0.7D ${Number.isFinite(baseDist70) ? baseDist70.toFixed(2) : "—"}% • RMS ${Number.isFinite(baseRms) ? baseRms.toFixed(2) : "—"}%\n` +
+            `cur  DIST@0.7D ${Number.isFinite(cur70) ? cur70.toFixed(2) : "—"}% • RMS ${Number.isFinite(curRms) ? curRms.toFixed(2) : "—"}%\n` +
+            `best DIST@0.7D ${Number.isFinite(best70) ? best70.toFixed(2) : "—"}% • RMS ${Number.isFinite(bestRms) ? bestRms.toFixed(2) : "—"}%\n` +
+            `best drift EFL ${eflDrift.toFixed(3)}mm • T ${tDrift.toFixed(3)} • field drop ${fieldDrop.toFixed(2)}° • stop #${bestState.stopIdx}\n` +
+            `rejects phys ${rejects.phys} • pl ${rejects.pl} • xover ${rejects.xover} • bfl ${rejects.bfl} • dist ${rejects.dist} • efl ${rejects.efl_guard} • t ${rejects.t_guard} • cov ${rejects.cov_guard} • mut ${rejects.mutation}`
+          );
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+
+      const bestScore = scoreDistortionState(bestState, baseState, DIST_OPT_CFG);
+      const improved =
+        Number.isFinite(bestScore?.merit) &&
+        Number.isFinite(baseScore?.merit) &&
+        bestScore.merit + 1e-6 < baseScore.merit;
+
+      if (improved) {
+        loadLens(bestLens);
+        if (ui.focusMode) ui.focusMode.value = focusMode === "cam" ? "cam" : "lens";
+        if (ui.sensorOffset) ui.sensorOffset.value = Number(sensorX).toFixed(2);
+        if (ui.lensFocus) ui.lensFocus.value = Number(lensShift).toFixed(2);
+        renderAll();
+        scheduleRenderPreviewIfAvailable();
+        scheduleAutosave();
+      } else {
+        renderAll();
+      }
+
+      const after70 = Number(bestState?.dist?.distPctAt70);
+      const afterRms = Number(bestState?.dist?.rmsDistPct);
+      const eflDrift = Number(bestState?.efl || 0) - Number(baseState?.efl || 0);
+      const tDrift = Number(bestState?.T || 0) - Number(baseState?.T || 0);
+      const fieldDrop = Math.max(0, Number(baseState?.maxFieldDeg || 0) - Number(bestState?.maxFieldDeg || 0));
+      setOptLog(
+        `${runHeader}\n` +
+        `${distOptStopRequested ? "stopped" : "done"} ${itersRan}/${iters}\n` +
+        `${improved ? "APPLIED ✅" : "no better candidate (kept original)"}\n` +
+        `dist before DIST@0.7D ${Number.isFinite(baseDist70) ? baseDist70.toFixed(2) : "—"}% • RMS ${Number.isFinite(baseRms) ? baseRms.toFixed(2) : "—"}%\n` +
+        `dist after  DIST@0.7D ${Number.isFinite(after70) ? after70.toFixed(2) : "—"}% • RMS ${Number.isFinite(afterRms) ? afterRms.toFixed(2) : "—"}%\n` +
+        `drift EFL ${eflDrift.toFixed(3)}mm • T ${tDrift.toFixed(3)} • field drop ${fieldDrop.toFixed(2)}°\n` +
+        `stop idx ${bestState.stopIdx}\n` +
+        `rejects phys ${rejects.phys} • pl ${rejects.pl} • xover ${rejects.xover} • bfl ${rejects.bfl} • dist ${rejects.dist} • efl ${rejects.efl_guard} • t ${rejects.t_guard} • cov ${rejects.cov_guard} • mut ${rejects.mutation}`
+      );
+      toast(
+        improved
+          ? `Distortion optimized: @0.7D ${Number.isFinite(after70) ? after70.toFixed(2) : "—"}% (was ${Number.isFinite(baseDist70) ? baseDist70.toFixed(2) : "—"}%)`
+          : "Distortion optimizer: no better lens within guards"
+      );
+    } finally {
+      distOptStopRequested = false;
+      distOptRunning = false;
+      if (ui.btnOptDist) ui.btnOptDist.disabled = false;
+      if (ui.btnOptSharp && !sharpOptRunning) ui.btnOptSharp.disabled = false;
+      setOptRunContext(prevRunCtx);
+    }
+  }
+
   async function runOptimizer(){
     if (optRunning) return;
+    if (distOptRunning || sharpOptRunning) {
+      toast("Stop distortion/sharpness optimizer first.");
+      return;
+    }
     optRunning = true;
     const runNo = ++optimizerRunSerial;
     const runHeader = formatOptimizerRunHeader(runNo);
@@ -7899,11 +9765,27 @@
   function stopOptimizer(){
     const stoppingScratch = !!scratchBuildRunning;
     const stoppingOpt = !!optRunning;
-    if (!stoppingScratch && !stoppingOpt) return;
+    const stoppingDist = !!distOptRunning;
+    const stoppingSharp = !!sharpOptRunning;
+    if (!stoppingScratch && !stoppingOpt && !stoppingDist && !stoppingSharp) return;
     if (stoppingScratch) scratchStopRequested = true;
     if (stoppingOpt) optRunning = false;
-    if (stoppingScratch && stoppingOpt) toast("Stopping build + optimizer…");
+    if (stoppingDist) distOptStopRequested = true;
+    if (stoppingSharp) sharpOptStopRequested = true;
+    if (stoppingScratch && stoppingOpt && stoppingDist && stoppingSharp) toast("Stopping build + optimizer + distortion + sharpness run…");
+    else if (stoppingScratch && stoppingOpt && stoppingDist) toast("Stopping build + optimizer + distortion run…");
+    else if (stoppingScratch && stoppingOpt && stoppingSharp) toast("Stopping build + optimizer + sharpness run…");
+    else if (stoppingScratch && stoppingDist && stoppingSharp) toast("Stopping build + distortion + sharpness run…");
+    else if (stoppingOpt && stoppingDist && stoppingSharp) toast("Stopping optimizer + distortion + sharpness run…");
+    else if (stoppingScratch && stoppingOpt) toast("Stopping build + optimizer…");
+    else if (stoppingScratch && stoppingDist) toast("Stopping build + distortion run…");
+    else if (stoppingScratch && stoppingSharp) toast("Stopping build + sharpness run…");
+    else if (stoppingOpt && stoppingDist) toast("Stopping optimizer + distortion run…");
+    else if (stoppingOpt && stoppingSharp) toast("Stopping optimizer + sharpness run…");
+    else if (stoppingDist && stoppingSharp) toast("Stopping distortion + sharpness run…");
     else if (stoppingScratch) toast("Stopping build from scratch…");
+    else if (stoppingDist) toast("Stopping distortion run…");
+    else if (stoppingSharp) toast("Stopping sharpness run…");
     else toast("Stopping…");
   }
 
@@ -8016,6 +9898,8 @@
     // optimizer
     ui.btnBuildScratch?.addEventListener("click", openBuildScratchModal);
     ui.btnOptStart?.addEventListener("click", runOptimizer);
+    ui.btnOptDist?.addEventListener("click", runDistortionOptimizer);
+    ui.btnOptSharp?.addEventListener("click", runSharpnessOptimizer);
     ui.btnOptStop?.addEventListener("click", stopOptimizer);
     ui.btnOptApply?.addEventListener("click", applyBest);
     ui.btnOptBench?.addEventListener("click", benchOptimizer);
