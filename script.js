@@ -7099,6 +7099,7 @@
     nested = false,
     runContext = null,
     silent = false,
+    allowedBaselineHardReasons = [],
   } = {}) {
     if (!nested) {
       if (cockpitOptRunning || cockpitMacroRunning) return null;
@@ -7163,7 +7164,10 @@
       });
       if (!nested) recordCockpitSnapshot(`${label} • start`, baseMetrics);
       const hardBase = failsHardConstraints(baseLens.surfaces, baseMetrics, { strictness: settings.strictness });
-      if (hardBase.fail) {
+      const relaxedBaseReasons = normalizeHardReasonList(allowedBaselineHardReasons);
+      const baselineRelaxAllowed = hardBase.fail
+        && hardBase.reasons.every((r) => relaxedBaseReasons.includes(String(r || "").toLowerCase()));
+      if (hardBase.fail && !baselineRelaxAllowed) {
         setOptLog(
           `${runHeader}\n` +
           `failed: baseline violates hard constraints (${hardBase.reasons.join(", ")})\n` +
@@ -7198,6 +7202,7 @@
         `${runHeader}\n` +
         `running… 0/${iters}\n` +
         `objective ${label}\n` +
+        `${baselineRelaxAllowed ? `baseline relax mode: ${hardBase.reasons.join(", ")} (must not worsen)\n` : ""}` +
         `baseline EFL ${Number(baseMetrics?.efl).toFixed(2)}mm • T ${Number(baseMetrics?.T).toFixed(2)} • field ${Number(baseMetrics?.maxFieldDeg).toFixed(2)}° • IC ${Number(baseMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm\n` +
         `baseline Dist@0.7 ${Number.isFinite(baseMetrics?.distortion?.dist70Pct) ? Number(baseMetrics.distortion.dist70Pct).toFixed(2) : "—"}% • RMS ${Number.isFinite(baseMetrics?.distortion?.rmsPct) ? Number(baseMetrics.distortion.rmsPct).toFixed(2) : "—"}%`
       );
@@ -7267,8 +7272,19 @@
 
         const hard = failsHardConstraints(candLens.surfaces, candMetrics, { strictness: settings.strictness });
         if (hard.fail) {
-          rejects.hard++;
-          continue;
+          const relax = baselineRelaxAllowed
+            ? canRelaxHardFailureForBaseline(
+                hard,
+                hardBase,
+                candMetrics,
+                baseMetrics,
+                relaxedBaseReasons
+              )
+            : { ok: false };
+          if (!relax.ok) {
+            rejects.hard++;
+            continue;
+          }
         }
         const g = (typeof guardFn === "function")
           ? (guardFn(candMetrics, baseMetrics, { targets, settings, iter: i }) || {})
@@ -7404,6 +7420,7 @@
       includeSharpness: false,
       autofocusCandidates: false,
       anneal: opts?.anneal,
+      allowedBaselineHardReasons: ["pl"],
       nested: !!opts?.nested,
       runContext: opts?.runContext || null,
       silent: !!opts?.silent,
@@ -7439,6 +7456,7 @@
       includeSharpness: false,
       autofocusCandidates: false,
       anneal: opts?.anneal,
+      allowedBaselineHardReasons: ["pl"],
       nested: !!opts?.nested,
       runContext: opts?.runContext || null,
       silent: !!opts?.silent,
@@ -7485,6 +7503,7 @@
       includeSharpness: false,
       autofocusCandidates: false,
       anneal: opts?.anneal,
+      allowedBaselineHardReasons: ["pl"],
       nested: !!opts?.nested,
       runContext: opts?.runContext || null,
       silent: !!opts?.silent,
@@ -9990,6 +10009,43 @@
       fail: reasons.length > 0,
       reasons,
     };
+  }
+
+  function normalizeHardReasonList(list) {
+    if (!Array.isArray(list)) return [];
+    const out = [];
+    for (const it of list) {
+      const r = String(it || "").trim().toLowerCase();
+      if (!r) continue;
+      if (!out.includes(r)) out.push(r);
+    }
+    return out;
+  }
+
+  function canRelaxHardFailureForBaseline(hardEval, baseHardEval, candMetrics, baseMetrics, allowedReasons = []) {
+    if (!hardEval?.fail) return { ok: true, reason: "none" };
+    if (!baseHardEval?.fail) return { ok: false, reason: "no-base-hard" };
+
+    const allow = new Set(normalizeHardReasonList(allowedReasons));
+    if (!allow.size) return { ok: false, reason: "no-allow-list" };
+
+    const baseReasons = normalizeHardReasonList(baseHardEval?.reasons || []);
+    const nowReasons = normalizeHardReasonList(hardEval?.reasons || []);
+    const baseSet = new Set(baseReasons);
+
+    for (const r of nowReasons) {
+      if (!allow.has(r) || !baseSet.has(r)) return { ok: false, reason: `new-hard-${r}` };
+    }
+
+    // Relax mode still requires monotonic improvement (or equal) for allowed reasons.
+    if (nowReasons.includes("pl")) {
+      const baseIntr = Number(baseMetrics?.feasible?.plIntrusionMm);
+      const candIntr = Number(candMetrics?.feasible?.plIntrusionMm);
+      if (!Number.isFinite(baseIntr) || !Number.isFinite(candIntr)) return { ok: false, reason: "pl-nan" };
+      if (candIntr > (baseIntr + 0.05)) return { ok: false, reason: "pl-worse" };
+    }
+
+    return { ok: true, reason: "relaxed" };
   }
 
   function fmtIntrusion(evalRes) {
