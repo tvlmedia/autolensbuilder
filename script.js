@@ -1709,6 +1709,11 @@
     strictDistMaxPct: 2.00,
     acceptableDistRmsPct: 2.20,
     acceptableDistMaxPct: 4.20,
+    // Focusability/sharpness sanity to avoid accepting "technically feasible but useless" designs.
+    strictRmsCenterMm: 0.45,
+    strictRmsEdgeMm: 1.20,
+    acceptableRmsCenterMm: 0.75,
+    acceptableRmsEdgeMm: 2.20,
     minElements: 3,
     maxElementsHardCap: 14,
   };
@@ -5772,6 +5777,7 @@
 
   function scratchTargetsReached(priority, targets) {
     if (!priority?.feasible) return false;
+    if (priority.afOk === false) return false;
     if (Number(priority.bflShortMm || 0) > 0.8) return false;
     if (!(Number(priority.eflErrRel) <= (OPT_STAGE_CFG.flStageRel + 1e-4))) return false;
     if (Number(targets?.targetT || 0) > 0) {
@@ -5784,11 +5790,14 @@
     const strictDistMax = Number(SCRATCH_CFG.strictDistMaxPct || 2.0);
     if (!(Number.isFinite(priority.distRmsScore) && priority.distRmsScore <= strictDistRms)) return false;
     if (!(Number.isFinite(priority.distMaxScore) && priority.distMaxScore <= strictDistMax)) return false;
+    if (!(Number.isFinite(priority.rms0) && priority.rms0 <= Number(SCRATCH_CFG.strictRmsCenterMm || 0.45))) return false;
+    if (!(Number.isFinite(priority.rmsE) && priority.rmsE <= Number(SCRATCH_CFG.strictRmsEdgeMm || 1.2))) return false;
     return true;
   }
 
   function scratchAcceptableReached(priority, targets) {
     if (!priority?.feasible) return false;
+    if (priority.afOk === false) return false;
     if (Number(priority.bflShortMm || 0) > 1.0) return false;
     if (!(Number(priority.eflErrRel) <= Number(SCRATCH_CFG.acceptableFlRel || 0.02))) return false;
     if (Number(targets?.targetT || 0) > 0) {
@@ -5801,6 +5810,8 @@
     const okDistMax = Number(SCRATCH_CFG.acceptableDistMaxPct || 4.2);
     if (!(Number.isFinite(priority.distRmsScore) && priority.distRmsScore <= okDistRms)) return false;
     if (!(Number.isFinite(priority.distMaxScore) && priority.distMaxScore <= okDistMax)) return false;
+    if (!(Number.isFinite(priority.rms0) && priority.rms0 <= Number(SCRATCH_CFG.acceptableRmsCenterMm || 0.75))) return false;
+    if (!(Number.isFinite(priority.rmsE) && priority.rmsE <= Number(SCRATCH_CFG.acceptableRmsEdgeMm || 2.2))) return false;
     return true;
   }
 
@@ -5884,6 +5895,7 @@
     if (ui.btnBuildScratch) ui.btnBuildScratch.disabled = true;
     const prevOptIters = ui.optIters?.value;
     const prevOptPop = ui.optPop?.value;
+    const prevFieldAngle = ui.fieldAngle?.value;
     const preBuildLens = sanitizeLens(clone(lens));
     const preBuildFocusMode = String(ui.focusMode?.value || "lens");
     const preBuildSensorOffset = Number(ui.sensorOffset?.value || 0);
@@ -5907,6 +5919,7 @@
       if (ui.optTargetFL) ui.optTargetFL.value = targets.targetEfl.toFixed(2);
       if (ui.optTargetT) ui.optTargetT.value = targets.targetT.toFixed(2);
       if (ui.optTargetIC) ui.optTargetIC.value = targets.targetIC.toFixed(2);
+      if (ui.fieldAngle) ui.fieldAngle.value = "0";
 
       const baseLens = generateBaseLens(
         familyResolved,
@@ -6137,6 +6150,49 @@
         finalSnap = evaluateCurrentLensPriorityForTargets(targets);
         if (!earlyStopReason) earlyStopReason = "no feasible scratch result; restored previous lens";
       }
+      if (finalSnap.pri?.feasible) {
+        // Final guard: ensure the resulting design can actually autofocus at center.
+        const afFinal = findBestFocusShift(
+          lens.surfaces,
+          "lens",
+          0,
+          Number(ui.lensFocus?.value || 0),
+          wavePreset,
+          {
+            rangeMm: 1.8,
+            coarseStepMm: 0.15,
+            fineHalfMm: 0.45,
+            fineStepMm: 0.04,
+            rayCount: Math.max(11, Math.min(31, Number(ui.rayCount?.value || 21) | 0)),
+            fieldMode: "center",
+          }
+        );
+        if (afFinal?.ok) {
+          if (ui.focusMode) ui.focusMode.value = "lens";
+          if (ui.sensorOffset) ui.sensorOffset.value = "0";
+          if (ui.lensFocus) ui.lensFocus.value = Number(afFinal.shift || 0).toFixed(2);
+          renderAll();
+          finalSnap = evaluateCurrentLensPriorityForTargets(targets);
+        } else if (bestFeasibleSnapshot?.lens) {
+          loadLens(bestFeasibleSnapshot.lens);
+          if (ui.focusMode) ui.focusMode.value = "lens";
+          if (ui.sensorOffset) ui.sensorOffset.value = "0";
+          if (ui.lensFocus && Number.isFinite(bestFeasibleSnapshot?.eval?.lensShift)) {
+            ui.lensFocus.value = Number(bestFeasibleSnapshot.eval.lensShift).toFixed(2);
+          }
+          renderAll();
+          finalSnap = evaluateCurrentLensPriorityForTargets(targets);
+          if (!earlyStopReason) earlyStopReason = "final autofocus failed; restored best feasible";
+        } else if (preBuildLens?.surfaces?.length) {
+          loadLens(preBuildLens);
+          if (ui.focusMode) ui.focusMode.value = preBuildFocusMode;
+          if (ui.sensorOffset) ui.sensorOffset.value = Number.isFinite(preBuildSensorOffset) ? String(preBuildSensorOffset) : "0";
+          if (ui.lensFocus) ui.lensFocus.value = Number.isFinite(preBuildLensFocus) ? preBuildLensFocus.toFixed(2) : "0.00";
+          renderAll();
+          finalSnap = evaluateCurrentLensPriorityForTargets(targets);
+          if (!earlyStopReason) earlyStopReason = "final autofocus failed; restored previous lens";
+        }
+      }
       const p = finalSnap.pri;
       const doneStrict = scratchTargetsReached(p, targets);
       const acceptable = scratchAcceptableReached(p, targets);
@@ -6174,6 +6230,7 @@
     } finally {
       if (ui.optIters && prevOptIters != null) ui.optIters.value = String(prevOptIters);
       if (ui.optPop && prevOptPop != null) ui.optPop.value = String(prevOptPop);
+      if (ui.fieldAngle && prevFieldAngle != null) ui.fieldAngle.value = String(prevFieldAngle);
       scratchStopRequested = false;
       scratchBuildRunning = false;
       if (ui.btnBuildScratch) ui.btnBuildScratch.disabled = false;
@@ -6833,16 +6890,10 @@
     }
     recordCockpitSnapshot("Dist pre-apply");
     loadLens(distOptBest.lens);
-    const m = distOptBest.meta || {};
-    const fm = String(m.focusMode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
-    if (ui.focusMode) ui.focusMode.value = fm;
-    if (ui.sensorOffset) ui.sensorOffset.value = Number.isFinite(Number(m.sensorX))
-      ? Number(m.sensorX).toFixed(3)
-      : "0";
-    if (ui.lensFocus) ui.lensFocus.value = Number.isFinite(Number(m.lensShift))
-      ? Number(m.lensShift).toFixed(3)
-      : "0";
-    renderAll();
+    if (ui.focusMode) ui.focusMode.value = "lens";
+    if (ui.sensorOffset) ui.sensorOffset.value = "0";
+    if (ui.lensFocus) ui.lensFocus.value = "0";
+    autoFocus();
     scheduleRenderPreviewIfAvailable();
     scheduleAutosave();
     recordCockpitSnapshot("Dist applied");
@@ -9109,7 +9160,8 @@
     );
     const realismProfileLabel = String(evalRes?.realismProfileLabel ?? evalRes?.breakdown?.realismProfileLabel ?? "");
     const realismLargeSensor = !!(evalRes?.realismLargeSensor ?? evalRes?.breakdown?.realismLargeSensor);
-    const hardInvalid = !!evalRes?.hardInvalid || crossPairs > 0 || realismHardInvalid;
+    const afOk = evalRes?.afOk !== false;
+    const hardInvalid = !!evalRes?.hardInvalid || crossPairs > 0 || realismHardInvalid || !afOk;
     const intrusionMm = Math.max(0, Number(evalRes?.intrusion || 0));
     const overlapMm = Math.max(0, Number(evalRes?.worstOverlap || 0));
     const pinchMm = Math.max(0, Number(evalRes?.worstPinch || 0));
@@ -9121,6 +9173,7 @@
     const feasible = !hardInvalid && !bflHardFail && intrusionMm <= 1e-3 && overlapMm <= 1e-3 && crossPairs <= 0;
     const feasibilityDebt =
       (hardInvalid ? 5000 : 0) +
+      (!afOk ? 2800 : 0) +
       (bflHardFail ? 2400 : 0) +
       intrusionMm * 1200 +
       overlapMm * 2000 +
@@ -9208,7 +9261,10 @@
       tErrAbs,
       tFastAbs,
       tGood,
+      afOk,
       sharpness,
+      rms0: Number.isFinite(rms0) ? rms0 : null,
+      rmsE: Number.isFinite(rmsE) ? rmsE : null,
       internalCrossPairs: crossPairs,
       internalCrossSegments: crossSegments,
       distRmsPct: Number.isFinite(distRmsPctRaw) ? distRmsPctRaw : null,
@@ -9390,7 +9446,8 @@
     const odTxt = p.realismHardInvalid
       ? ` • OD hard +${Math.max(0, Number(p.realismHardOverMm || 0)).toFixed(2)}mm`
       : "";
-    return `PHYS INVALID ❌ (intr ${intrTxt}mm • overlap ${ovTxt}mm • BFL short ${bflTxt}mm • xover ${xoverTxt}${odTxt})`;
+    const afTxt = p.afOk === false ? " • AF fail" : "";
+    return `PHYS INVALID ❌ (intr ${intrTxt}mm • overlap ${ovTxt}mm • BFL short ${bflTxt}mm • xover ${xoverTxt}${odTxt}${afTxt})`;
   }
 
   function fmtStageStep(stage) {
