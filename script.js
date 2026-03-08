@@ -1714,6 +1714,15 @@
     strictRmsEdgeMm: 1.20,
     acceptableRmsCenterMm: 0.75,
     acceptableRmsEdgeMm: 2.20,
+    // Hard floor for "usable best effort" output.
+    minUsableFlRel: 0.06,
+    minUsableTSlowAbs: 1.60,
+    minUsableIcNeedMmAbs: 3.0,
+    minUsableIcNeedMmFrac: 0.16,
+    minUsableRmsCenterMm: 1.20,
+    minUsableRmsEdgeMm: 4.50,
+    maxUsableVigFrac: 0.50,
+    minUsableCenterThroughput: 0.18,
     minElements: 3,
     maxElementsHardCap: 14,
   };
@@ -5815,6 +5824,36 @@
     return true;
   }
 
+  function scratchMinimumUsableReached(snap, targets) {
+    const p = snap?.pri;
+    const ev = snap?.evalRes || {};
+    if (!p?.feasible) return false;
+    if (p.afOk === false) return false;
+    if (!(Number(p.eflErrRel) <= Number(SCRATCH_CFG.minUsableFlRel || 0.06))) return false;
+
+    if (Number(targets?.targetT || 0) > 0) {
+      if (!(Number(p.tErrAbs) <= Number(SCRATCH_CFG.minUsableTSlowAbs || 1.6))) return false;
+    }
+    if (Number(targets?.targetIC || 0) > 0) {
+      const icTol = Math.max(
+        Number(SCRATCH_CFG.minUsableIcNeedMmAbs || 3.0),
+        Number(targets.targetIC || 0) * Number(SCRATCH_CFG.minUsableIcNeedMmFrac || 0.16)
+      );
+      if (!(Number(p.icNeedMm) <= icTol)) return false;
+    }
+
+    if (!(Number.isFinite(p.rms0) && p.rms0 <= Number(SCRATCH_CFG.minUsableRmsCenterMm || 1.2))) return false;
+    if (!(Number.isFinite(p.rmsE) && p.rmsE <= Number(SCRATCH_CFG.minUsableRmsEdgeMm || 4.5))) return false;
+
+    const vigFrac = Number(ev?.vigFrac);
+    if (Number.isFinite(vigFrac) && vigFrac > Number(SCRATCH_CFG.maxUsableVigFrac || 0.5)) return false;
+
+    const goodFrac0 = Number(ev?.goodFrac0);
+    if (Number.isFinite(goodFrac0) && goodFrac0 < Number(SCRATCH_CFG.minUsableCenterThroughput || 0.18)) return false;
+
+    return true;
+  }
+
   async function runScratchOptimizerPass(pass, targets, aggr, meta = {}) {
     if (scratchStopRequested) return evaluateCurrentLensPriorityForTargets(targets);
     if (!pass) return evaluateCurrentLensPriorityForTargets(targets);
@@ -5956,6 +5995,7 @@
 
       let snap = null;
       let bestFeasibleSnapshot = null;
+      let bestUsableSnapshot = null;
       let earlyStopReason = "";
       let abortedByUser = false;
       const markStoppedByUser = () => {
@@ -5976,8 +6016,23 @@
           };
         }
       };
+      const storeBestUsable = (label, resObj) => {
+        if (!scratchMinimumUsableReached(resObj, targets)) return;
+        const pri = resObj?.pri;
+        const metric = scratchProgressMetric(pri, targets);
+        if (!bestUsableSnapshot || metric < bestUsableSnapshot.metric) {
+          bestUsableSnapshot = {
+            metric,
+            label: String(label || "snapshot"),
+            lens: sanitizeLens(clone(lens)),
+            pri,
+            eval: resObj?.evalRes,
+          };
+        }
+      };
       const startSnap = evaluateCurrentLensPriorityForTargets(targets);
       storeBestFeasible("prepared", startSnap);
+      storeBestUsable("prepared", startSnap);
       for (let i = 0; i < firstPasses.length; i++) {
         if (scratchStopRequested) {
           markStoppedByUser();
@@ -5995,6 +6050,7 @@
           break;
         }
         storeBestFeasible(`pass_${firstPasses[i]?.id || i}`, snap);
+        storeBestUsable(`pass_${firstPasses[i]?.id || i}`, snap);
         if (stopOnAccept && scratchAcceptableReached(snap?.pri, targets)) {
           earlyStopReason = `accepted in initial pass ${firstPasses[i]?.id || (i + 1)}`;
           break;
@@ -6075,6 +6131,7 @@
             break;
           }
           storeBestFeasible(`grow_${cycle + 1}_${growPasses[i]?.id || i}`, snap);
+          storeBestUsable(`grow_${cycle + 1}_${growPasses[i]?.id || i}`, snap);
           if (stopOnAccept && scratchAcceptableReached(snap?.pri, targets)) {
             earlyStopReason = `accepted in grow ${cycle + 1} pass ${growPasses[i]?.id || (i + 1)}`;
             break;
@@ -6084,6 +6141,7 @@
 
         const after = evaluateCurrentLensPriorityForTargets(targets);
         storeBestFeasible(`grow_${cycle + 1}`, after);
+        storeBestUsable(`grow_${cycle + 1}`, after);
         const metric = scratchProgressMetric(after.pri, targets);
         const relImprove = (bestMetric - metric) / Math.max(1e-6, Math.abs(bestMetric));
         if (metric < bestMetric) {
@@ -6131,6 +6189,7 @@
 
       const final = evaluateCurrentLensPriorityForTargets(targets);
       let finalSnap = final;
+      storeBestUsable("final_precheck", finalSnap);
       if (!finalSnap.pri?.feasible && bestFeasibleSnapshot?.lens) {
         loadLens(bestFeasibleSnapshot.lens);
         if (ui.focusMode) ui.focusMode.value = "lens";
@@ -6140,6 +6199,7 @@
         }
         renderAll();
         finalSnap = evaluateCurrentLensPriorityForTargets(targets);
+        storeBestUsable("fallback_feasible", finalSnap);
       }
       if (!finalSnap.pri?.feasible && !bestFeasibleSnapshot?.lens && preBuildLens?.surfaces?.length) {
         loadLens(preBuildLens);
@@ -6148,6 +6208,7 @@
         if (ui.lensFocus) ui.lensFocus.value = Number.isFinite(preBuildLensFocus) ? preBuildLensFocus.toFixed(2) : "0.00";
         renderAll();
         finalSnap = evaluateCurrentLensPriorityForTargets(targets);
+        storeBestUsable("fallback_previous", finalSnap);
         if (!earlyStopReason) earlyStopReason = "no feasible scratch result; restored previous lens";
       }
       if (finalSnap.pri?.feasible) {
@@ -6173,6 +6234,7 @@
           if (ui.lensFocus) ui.lensFocus.value = Number(afFinal.shift || 0).toFixed(2);
           renderAll();
           finalSnap = evaluateCurrentLensPriorityForTargets(targets);
+          storeBestUsable("final_af", finalSnap);
         } else if (bestFeasibleSnapshot?.lens) {
           loadLens(bestFeasibleSnapshot.lens);
           if (ui.focusMode) ui.focusMode.value = "lens";
@@ -6182,6 +6244,7 @@
           }
           renderAll();
           finalSnap = evaluateCurrentLensPriorityForTargets(targets);
+          storeBestUsable("fallback_af_feasible", finalSnap);
           if (!earlyStopReason) earlyStopReason = "final autofocus failed; restored best feasible";
         } else if (preBuildLens?.surfaces?.length) {
           loadLens(preBuildLens);
@@ -6190,35 +6253,64 @@
           if (ui.lensFocus) ui.lensFocus.value = Number.isFinite(preBuildLensFocus) ? preBuildLensFocus.toFixed(2) : "0.00";
           renderAll();
           finalSnap = evaluateCurrentLensPriorityForTargets(targets);
+          storeBestUsable("fallback_af_previous", finalSnap);
           if (!earlyStopReason) earlyStopReason = "final autofocus failed; restored previous lens";
         }
+      }
+
+      let usable = scratchMinimumUsableReached(finalSnap, targets);
+      if (!usable && bestUsableSnapshot?.lens) {
+        loadLens(bestUsableSnapshot.lens);
+        if (ui.focusMode) ui.focusMode.value = "lens";
+        if (ui.sensorOffset) ui.sensorOffset.value = "0";
+        if (ui.lensFocus && Number.isFinite(bestUsableSnapshot?.eval?.lensShift)) {
+          ui.lensFocus.value = Number(bestUsableSnapshot.eval.lensShift).toFixed(2);
+        } else if (ui.lensFocus) {
+          ui.lensFocus.value = "0.00";
+          autoFocus();
+        }
+        renderAll();
+        finalSnap = evaluateCurrentLensPriorityForTargets(targets);
+        usable = scratchMinimumUsableReached(finalSnap, targets);
+        if (!earlyStopReason) earlyStopReason = `result below usable floor; restored ${bestUsableSnapshot.label}`;
+      }
+      if (!usable && preBuildLens?.surfaces?.length) {
+        loadLens(preBuildLens);
+        if (ui.focusMode) ui.focusMode.value = preBuildFocusMode;
+        if (ui.sensorOffset) ui.sensorOffset.value = Number.isFinite(preBuildSensorOffset) ? String(preBuildSensorOffset) : "0";
+        if (ui.lensFocus) ui.lensFocus.value = Number.isFinite(preBuildLensFocus) ? preBuildLensFocus.toFixed(2) : "0.00";
+        renderAll();
+        finalSnap = evaluateCurrentLensPriorityForTargets(targets);
+        usable = scratchMinimumUsableReached(finalSnap, targets);
+        if (!earlyStopReason) earlyStopReason = "no usable scratch result; restored previous lens";
       }
       const p = finalSnap.pri;
       const doneStrict = scratchTargetsReached(p, targets);
       const acceptable = scratchAcceptableReached(p, targets);
-      const done = !abortedByUser && (doneStrict || (stopOnAccept && acceptable));
+      const done = !abortedByUser && usable && (doneStrict || (stopOnAccept && acceptable));
       const finalElems = countLensElements(lens.surfaces);
       const headline = abortedByUser
         ? "STOPPED ⏹"
-        : (!p.feasible ? "FAILED ❌" : (done ? "DONE ✅" : "DONE (best effort)"));
+        : ((!p.feasible || !usable) ? "FAILED ❌" : (done ? "DONE ✅" : "DONE (usable best effort)"));
       setOptLog(
         `Build From Scratch ${headline}\n` +
         `family ${scratchFamilyLabel(familyResolved)} • aggr ${aggr} • effort x${effortScale.toFixed(2)}\n` +
         `${earlyStopReason ? `stop ${earlyStopReason}\n` : ""}` +
         `${bestFeasibleSnapshot ? `fallback ${bestFeasibleSnapshot.label}\n` : ""}` +
+        `${bestUsableSnapshot ? `usable fallback ${bestUsableSnapshot.label}\n` : ""}` +
         `optimizer runs ${runStep}/${runTotalEstimate}\n` +
         `elements ${finalElems}/${maxElems}\n` +
         `FL err ${(Number(p.eflErrRel || 0) * 100).toFixed(2)}%\n` +
         `T slow ${Number.isFinite(p.tErrAbs) ? p.tErrAbs.toFixed(2) : "—"}\n` +
         `IC short ${Number.isFinite(p.icNeedMm) ? p.icNeedMm.toFixed(2) : "—"}mm\n` +
-        `acceptable ${acceptable ? "YES" : "NO"} • strict ${doneStrict ? "YES" : "NO"}\n` +
+        `acceptable ${acceptable ? "YES" : "NO"} • strict ${doneStrict ? "YES" : "NO"} • usable ${usable ? "YES" : "NO"}\n` +
         `Dist RMS ${Number.isFinite(p.distRmsPct) ? Math.abs(p.distRmsPct).toFixed(2) : "—"}% • MAX ${Number.isFinite(p.distMaxPct) ? Math.abs(p.distMaxPct).toFixed(2) : "—"}%\n` +
         `${fmtPhysOpt(finalSnap.evalRes, targets)}\n` +
         `stage ${p.stageName}`
       );
 
       toast(
-        `Build from scratch ${abortedByUser ? "stopped" : (!p.feasible ? "failed" : (done ? "done" : "ready (best effort)"))} • ${scratchFamilyLabel(familyResolved)} • FL ${Number.isFinite(p.efl) ? p.efl.toFixed(1) : "—"}mm`
+        `Build from scratch ${abortedByUser ? "stopped" : ((!p.feasible || !usable) ? "failed" : (done ? "done" : "ready (usable best effort)"))} • ${scratchFamilyLabel(familyResolved)} • FL ${Number.isFinite(p.efl) ? p.efl.toFixed(1) : "—"}mm`
       );
       scheduleAutosave();
     } catch (err) {
@@ -12030,6 +12122,10 @@
     const p = buildOptPriority(optBest.eval, targets);
     if (!p.feasible) {
       return toast("Best is fysiek ongeldig (intrusion/overlap/BFL). Eerst verder optimaliseren.");
+    }
+    const usable = scratchMinimumUsableReached({ pri: p, evalRes: optBest.eval }, targets);
+    if (!usable) {
+      return toast("Best is nog niet bruikbaar (focus/scherpte/T/vignette). Eerst verder optimaliseren.");
     }
     recordCockpitSnapshot("Main pre-apply");
     loadLens(optBest.lens);
