@@ -96,6 +96,15 @@ body{
 
   max-width:calc(100vw - 70px);
 }
+
+/* Keep clear/reset action always visible when toolbar is horizontally scrolled. */
+.toolbar #btnNew{
+  position:sticky;
+  left:0;
+  z-index:4;
+  background:linear-gradient(180deg, rgba(11,15,22,.96), rgba(11,15,22,.92));
+  box-shadow:10px 0 14px rgba(11,15,22,.72);
+}
 .toolbar::-webkit-scrollbar{ height:8px; }
 .toolbar::-webkit-scrollbar-thumb{
   background:rgba(255,255,255,.12);

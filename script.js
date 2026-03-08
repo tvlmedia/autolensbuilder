@@ -25,6 +25,7 @@
 
   // -------------------- UI --------------------
   const ui = {
+    toolbar: $(".toolbar"),
     tbody: $("#surfTbody"),
     status: $("#statusText"),
 
@@ -6437,6 +6438,12 @@
     }
   }
 
+  function ensureToolbarStartVisible() {
+    const tb = ui.toolbar || document.querySelector(".toolbar");
+    if (!tb) return;
+    try { tb.scrollLeft = 0; } catch(_) {}
+  }
+
   function setCockpitButtonsBusy(busy) {
     const on = !!busy;
     [
@@ -12158,6 +12165,8 @@
       window.scrollTo(0, 0);
       document.querySelector(".leftScroll")?.scrollTo(0, 0);
       setTimeout(() => document.querySelector(".leftScroll")?.scrollTo(0, 0), 0);
+      setTimeout(() => ensureToolbarStartVisible(), 0);
+      setTimeout(() => ensureToolbarStartVisible(), 80);
     } catch(_) {}
 
     const restored = restoreAutosave();
@@ -12174,7 +12183,7 @@
     }
     setCockpitProgress(0, "Idle");
 
-    window.addEventListener("resize", () => renderAll());
+    window.addEventListener("resize", () => { ensureToolbarStartVisible(); renderAll(); });
     document.addEventListener("fullscreenchange", () => renderAll());
   }
 
