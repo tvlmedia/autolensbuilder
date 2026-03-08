@@ -5824,34 +5824,39 @@
     return true;
   }
 
-  function scratchMinimumUsableReached(snap, targets) {
+  function scratchUsabilityReasons(snap, targets) {
     const p = snap?.pri;
     const ev = snap?.evalRes || {};
-    if (!p?.feasible) return false;
-    if (p.afOk === false) return false;
-    if (!(Number(p.eflErrRel) <= Number(SCRATCH_CFG.minUsableFlRel || 0.06))) return false;
+    const reasons = [];
+    if (!p?.feasible) reasons.push("phys");
+    if (p?.afOk === false) reasons.push("af");
+    if (!(Number(p?.eflErrRel) <= Number(SCRATCH_CFG.minUsableFlRel || 0.06))) reasons.push("fl");
 
     if (Number(targets?.targetT || 0) > 0) {
-      if (!(Number(p.tErrAbs) <= Number(SCRATCH_CFG.minUsableTSlowAbs || 1.6))) return false;
+      if (!(Number(p?.tErrAbs) <= Number(SCRATCH_CFG.minUsableTSlowAbs || 1.6))) reasons.push("t");
     }
     if (Number(targets?.targetIC || 0) > 0) {
       const icTol = Math.max(
         Number(SCRATCH_CFG.minUsableIcNeedMmAbs || 3.0),
         Number(targets.targetIC || 0) * Number(SCRATCH_CFG.minUsableIcNeedMmFrac || 0.16)
       );
-      if (!(Number(p.icNeedMm) <= icTol)) return false;
+      if (!(Number(p?.icNeedMm) <= icTol)) reasons.push("ic");
     }
 
-    if (!(Number.isFinite(p.rms0) && p.rms0 <= Number(SCRATCH_CFG.minUsableRmsCenterMm || 1.2))) return false;
-    if (!(Number.isFinite(p.rmsE) && p.rmsE <= Number(SCRATCH_CFG.minUsableRmsEdgeMm || 4.5))) return false;
+    if (!(Number.isFinite(p?.rms0) && p.rms0 <= Number(SCRATCH_CFG.minUsableRmsCenterMm || 1.2))) reasons.push("rmsC");
+    if (!(Number.isFinite(p?.rmsE) && p.rmsE <= Number(SCRATCH_CFG.minUsableRmsEdgeMm || 4.5))) reasons.push("rmsE");
 
     const vigFrac = Number(ev?.vigFrac);
-    if (Number.isFinite(vigFrac) && vigFrac > Number(SCRATCH_CFG.maxUsableVigFrac || 0.5)) return false;
+    if (Number.isFinite(vigFrac) && vigFrac > Number(SCRATCH_CFG.maxUsableVigFrac || 0.5)) reasons.push("vig");
 
     const goodFrac0 = Number(ev?.goodFrac0);
-    if (Number.isFinite(goodFrac0) && goodFrac0 < Number(SCRATCH_CFG.minUsableCenterThroughput || 0.18)) return false;
+    if (Number.isFinite(goodFrac0) && goodFrac0 < Number(SCRATCH_CFG.minUsableCenterThroughput || 0.18)) reasons.push("tp0");
 
-    return true;
+    return reasons;
+  }
+
+  function scratchMinimumUsableReached(snap, targets) {
+    return scratchUsabilityReasons(snap, targets).length === 0;
   }
 
   async function runScratchOptimizerPass(pass, targets, aggr, meta = {}) {
@@ -6274,7 +6279,22 @@
         usable = scratchMinimumUsableReached(finalSnap, targets);
         if (!earlyStopReason) earlyStopReason = `result below usable floor; restored ${bestUsableSnapshot.label}`;
       }
-      if (!usable && preBuildLens?.surfaces?.length) {
+      if (!usable && bestFeasibleSnapshot?.lens) {
+        loadLens(bestFeasibleSnapshot.lens);
+        if (ui.focusMode) ui.focusMode.value = "lens";
+        if (ui.sensorOffset) ui.sensorOffset.value = "0";
+        if (ui.lensFocus && Number.isFinite(bestFeasibleSnapshot?.eval?.lensShift)) {
+          ui.lensFocus.value = Number(bestFeasibleSnapshot.eval.lensShift).toFixed(2);
+        } else if (ui.lensFocus) {
+          ui.lensFocus.value = "0.00";
+          autoFocus();
+        }
+        renderAll();
+        finalSnap = evaluateCurrentLensPriorityForTargets(targets);
+        usable = scratchMinimumUsableReached(finalSnap, targets);
+        if (!earlyStopReason) earlyStopReason = `no usable scratch result; kept best feasible ${bestFeasibleSnapshot.label}`;
+      }
+      if (!usable && !bestFeasibleSnapshot?.lens && preBuildLens?.surfaces?.length) {
         loadLens(preBuildLens);
         if (ui.focusMode) ui.focusMode.value = preBuildFocusMode;
         if (ui.sensorOffset) ui.sensorOffset.value = Number.isFinite(preBuildSensorOffset) ? String(preBuildSensorOffset) : "0";
@@ -6289,9 +6309,12 @@
       const acceptable = scratchAcceptableReached(p, targets);
       const done = !abortedByUser && usable && (doneStrict || (stopOnAccept && acceptable));
       const finalElems = countLensElements(lens.surfaces);
+      const usableReasons = scratchUsabilityReasons(finalSnap, targets);
       const headline = abortedByUser
         ? "STOPPED ⏹"
-        : ((!p.feasible || !usable) ? "FAILED ❌" : (done ? "DONE ✅" : "DONE (usable best effort)"));
+        : (!p.feasible
+          ? "FAILED ❌"
+          : (usable ? (done ? "DONE ✅" : "DONE (usable best effort)") : "DONE (best feasible ⚠)"));
       setOptLog(
         `Build From Scratch ${headline}\n` +
         `family ${scratchFamilyLabel(familyResolved)} • aggr ${aggr} • effort x${effortScale.toFixed(2)}\n` +
@@ -6304,13 +6327,14 @@
         `T slow ${Number.isFinite(p.tErrAbs) ? p.tErrAbs.toFixed(2) : "—"}\n` +
         `IC short ${Number.isFinite(p.icNeedMm) ? p.icNeedMm.toFixed(2) : "—"}mm\n` +
         `acceptable ${acceptable ? "YES" : "NO"} • strict ${doneStrict ? "YES" : "NO"} • usable ${usable ? "YES" : "NO"}\n` +
+        `${!usable ? `usable fail: ${usableReasons.join(", ")}\n` : ""}` +
         `Dist RMS ${Number.isFinite(p.distRmsPct) ? Math.abs(p.distRmsPct).toFixed(2) : "—"}% • MAX ${Number.isFinite(p.distMaxPct) ? Math.abs(p.distMaxPct).toFixed(2) : "—"}%\n` +
         `${fmtPhysOpt(finalSnap.evalRes, targets)}\n` +
         `stage ${p.stageName}`
       );
 
       toast(
-        `Build from scratch ${abortedByUser ? "stopped" : ((!p.feasible || !usable) ? "failed" : (done ? "done" : "ready (usable best effort)"))} • ${scratchFamilyLabel(familyResolved)} • FL ${Number.isFinite(p.efl) ? p.efl.toFixed(1) : "—"}mm`
+        `Build from scratch ${abortedByUser ? "stopped" : (!p.feasible ? "failed" : (usable ? (done ? "done" : "ready (usable best effort)") : "ready (best feasible)"))} • ${scratchFamilyLabel(familyResolved)} • FL ${Number.isFinite(p.efl) ? p.efl.toFixed(1) : "—"}mm`
       );
       scheduleAutosave();
     } catch (err) {
