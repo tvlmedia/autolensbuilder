@@ -7104,6 +7104,9 @@
     const kk = Number(k);
     if (!Array.isArray(surfaces) || !(Number.isFinite(kk) && kk > 0)) return false;
     const keepAperture = opts?.keepAperture !== false;
+    const thicknessScale = keepAperture
+      ? (kk >= 1 ? kk : (1 - (1 - kk) * 0.45))
+      : kk;
     const rearIdx = findScratchRearSurfaceIndex(surfaces);
     const apScale = keepAperture
       ? (kk >= 1 ? Math.pow(kk, 0.20) : Math.max(0.995, Math.pow(Math.max(1e-6, kk), 0.08)))
@@ -7117,7 +7120,7 @@
         s.t = Math.max(PHYS_CFG.minAirGap, Number(s.t || 0));
         s.glass = "AIR";
       } else {
-        s.t = clamp(Number(s.t || 0) * kk, PHYS_CFG.minThickness, PHYS_CFG.maxThickness);
+        s.t = clamp(Number(s.t || 0) * thicknessScale, PHYS_CFG.minThickness, PHYS_CFG.maxThickness);
       }
       s.ap = clamp(Number(s.ap || 0) * apScale, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
       enforceApertureRadiusCoupling(s, keepAperture ? 1.03 : 1.08);
@@ -7125,6 +7128,119 @@
     enforceRearMountStart(surfaces);
     quickSanity(surfaces);
     return true;
+  }
+
+  function repairLensForPhysicsAfterEflScale(surfaces, opts = {}) {
+    if (!Array.isArray(surfaces) || surfaces.length < 3) return false;
+    const passes = Math.max(1, Math.min(3, Number(opts?.passes || 2) | 0));
+    let changedAny = false;
+
+    for (let pass = 0; pass < passes; pass++) {
+      quickSanity(surfaces);
+      computeVertices(surfaces, 0, 0);
+      let changed = false;
+
+      // Expand under-sized gaps/CT that get squeezed by FL-down scaling.
+      for (let i = 0; i < surfaces.length - 1; i++) {
+        const sA = surfaces[i];
+        const sB = surfaces[i + 1];
+        const tA = String(sA?.type || "").toUpperCase();
+        const tB = String(sB?.type || "").toUpperCase();
+        if (tA === "OBJ" || tA === "IMS" || tB === "OBJ" || tB === "IMS") continue;
+
+        const mediumAfterA = String(resolveGlassName(sA?.glass || "AIR")).toUpperCase();
+        const required = mediumAfterA === "AIR"
+          ? Number(PHYS_CFG.minAirGap || 0.12)
+          : Number(PHYS_CFG.minGlassCT || 0.35);
+        const margin = mediumAfterA === "AIR" ? 0.04 : 0.07;
+        const want = required + margin;
+
+        const apShared = Math.max(
+          0.1,
+          Math.min(
+            Number(sA?.ap || 0),
+            Number(sB?.ap || 0),
+            maxApForSurface(sA),
+            maxApForSurface(sB)
+          )
+        );
+        const minGap = minGapBetweenSurfaces(sA, sB, apShared, 11);
+        if (!Number.isFinite(minGap) || minGap >= want) continue;
+
+        const add = clamp(want - minGap, 0.01, 2.6);
+        sA.t = clamp(Number(sA.t || 0) + add, PHYS_CFG.minThickness, PHYS_CFG.maxThickness);
+        changed = true;
+      }
+
+      // Keep stop compatible with nearby clear apertures (avoids hard stop-oversize fails).
+      const stopIdx = findStopSurfaceIndex(surfaces);
+      if (stopIdx >= 0) {
+        const stop = surfaces[stopIdx];
+        const stopAp = Math.max(PHYS_CFG.minAperture, Number(stop?.ap || 0));
+        const neigh = [];
+        for (let d = 1; d <= 2; d++) {
+          for (const idx of [stopIdx - d, stopIdx + d]) {
+            if (idx < 0 || idx >= surfaces.length) continue;
+            const s = surfaces[idx];
+            const tt = String(s?.type || "").toUpperCase();
+            if (tt === "OBJ" || tt === "IMS") continue;
+            neigh.push(idx);
+          }
+        }
+        if (neigh.length) {
+          const minNeigh = Math.min(...neigh.map((idx) => Number(surfaces[idx]?.ap || 0)));
+          const allowedStop = 1.08 * minNeigh + 0.82;
+          if (stopAp > allowedStop) {
+            const floor = Math.max(PHYS_CFG.minAperture, (stopAp - 0.78) / 1.08);
+            for (const idx of neigh) {
+              const s = surfaces[idx];
+              if (!s || surfaceIsLocked(s)) continue;
+              if (Number(s.ap || 0) < floor) {
+                s.ap = clamp(floor, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+                enforceApertureRadiusCoupling(s, 1.07);
+                changed = true;
+              }
+            }
+          }
+        }
+      }
+
+      enforceRearMountStart(surfaces);
+      quickSanity(surfaces);
+      changedAny = changedAny || changed;
+      if (!changed) break;
+    }
+    return changedAny;
+  }
+
+  function progressiveEflScaleTowardTarget(surfaces, targetEfl, wavePreset, opts = {}) {
+    if (!Array.isArray(surfaces) || surfaces.length < 3) return false;
+    const tgt = Number(targetEfl || 0);
+    if (!(Number.isFinite(tgt) && tgt > 1e-6)) return false;
+    const maxSteps = Math.max(3, Math.min(24, Number(opts?.maxSteps || 12) | 0));
+    let moved = false;
+    for (let i = 0; i < maxSteps; i++) {
+      computeVertices(surfaces, 0, 0);
+      const p = estimateEflBflParaxial(surfaces, wavePreset);
+      const efl = Number(p?.efl);
+      if (!(Number.isFinite(efl) && efl > 1e-6)) break;
+      const errRel = Math.abs(efl - tgt) / Math.max(1e-9, tgt);
+      if (errRel <= 0.003) break;
+
+      const kGoal = tgt / efl;
+      const alpha = errRel > 0.25 ? 0.60 : (errRel > 0.12 ? 0.52 : 0.42);
+      let k = 1 + (kGoal - 1) * alpha;
+      const span = errRel > 0.25 ? 0.08 : (errRel > 0.12 ? 0.06 : 0.04);
+      k = clamp(k, 1 - span, 1 + span);
+      if (!(Number.isFinite(k) && k > 0 && Math.abs(k - 1) > 1e-6)) break;
+
+      cockpitScaleLensByFactor(surfaces, k, { keepAperture: true });
+      repairLensForPhysicsAfterEflScale(surfaces, { passes: 2 });
+      enforceRearMountStart(surfaces);
+      quickSanity(surfaces);
+      moved = true;
+    }
+    return moved;
   }
 
   function mutateEflCandidate(lensObj, ctx = {}) {
@@ -7172,6 +7288,7 @@
     if (!(Number.isFinite(k) && k > 0 && Math.abs(k - 1) > 1e-6)) return { ok: false, reason: "scale" };
 
     cockpitScaleLensByFactor(surfaces, k, { keepAperture: true });
+    repairLensForPhysicsAfterEflScale(surfaces, { passes: 2 });
 
     // Keep BFL viable while pulling EFL down by expanding image-space gap when needed.
     if (dir < 0) {
@@ -7195,6 +7312,7 @@
       }
     }
     enforceRearMountStart(surfaces);
+    repairLensForPhysicsAfterEflScale(surfaces, { passes: 1 });
     quickSanity(surfaces);
     return { ok: true, kind: "scale", scale: k };
   }
@@ -7319,6 +7437,203 @@
       `T ${Number.isFinite(bT) ? bT.toFixed(2) : "—"}→${Number.isFinite(aT) ? aT.toFixed(2) : "—"} | ` +
       `IC ${Number.isFinite(bIc) ? bIc.toFixed(1) : "—"}→${Number.isFinite(aIc) ? aIc.toFixed(1) : "—"}mm | ` +
       `SharpE ${Number.isFinite(bSe) ? bSe.toFixed(3) : "—"}→${Number.isFinite(aSe) ? aSe.toFixed(3) : "—"}mm`;
+  }
+
+  function setUiFocusStateSafe(focus) {
+    const f = focus || {};
+    const fm = String(f.focusMode || ui.focusMode?.value || "lens").toLowerCase() === "cam" ? "cam" : "lens";
+    if (ui.focusMode) ui.focusMode.value = fm;
+    if (ui.sensorOffset) ui.sensorOffset.value = Number(f.sensorX || 0).toFixed(3);
+    if (ui.lensFocus) ui.lensFocus.value = Number(f.lensShift || 0).toFixed(3);
+  }
+
+  function computeLocalDeterministicMetrics(kind, lensObj, focus, sensor, wavePreset) {
+    const k = String(kind || "").toLowerCase();
+    const includeUsableIC = k === "ic";
+    const includeDistortion = k === "ic";
+    return computeMetrics({
+      surfaces: lensObj?.surfaces || [],
+      wavePreset,
+      focusMode: focus?.focusMode || "lens",
+      sensorX: Number(focus?.sensorX || 0),
+      lensShift: Number(focus?.lensShift || 0),
+      sensorW: Number(sensor?.w || 36.7),
+      sensorH: Number(sensor?.h || 25.54),
+      objDist: COCKPIT_CFG.defaultObjDistMm,
+      rayCount: clamp(num(ui.rayCount?.value, 21) | 0, 11, 41),
+      lutN: k === "ic" ? 260 : 180,
+      includeUsableIC,
+      includeDistortion,
+      includeSharpness: false,
+      autofocus: false,
+      useCache: false,
+    });
+  }
+
+  function canAcceptDeterministicCandidate(baseLens, baseMetrics, candLens, candMetrics, settings, allowedReasons = ["pl", "bfl", "valid"]) {
+    const hardCand = failsHardConstraints(candLens?.surfaces || [], candMetrics, { strictness: settings?.strictness });
+    if (!hardCand.fail) return { ok: true, mode: "clean" };
+
+    const hardBase = failsHardConstraints(baseLens?.surfaces || [], baseMetrics, { strictness: settings?.strictness });
+    if (!hardBase.fail) return { ok: false, reason: `hard-${(hardCand.reasons || []).join(",")}` };
+
+    const relax = canRelaxHardFailureForBaseline(
+      hardCand,
+      hardBase,
+      candMetrics,
+      baseMetrics,
+      allowedReasons
+    );
+    return relax?.ok
+      ? { ok: true, mode: "relaxed", reason: relax.reason || "relaxed" }
+      : { ok: false, reason: relax?.reason || "hard" };
+  }
+
+  function applyDeterministicLocalCandidate(label, candLens, focus, candMetrics, { silent = false, recordSnapshots = true } = {}) {
+    if (recordSnapshots) recordCockpitSnapshot(`${label} • pre-align`);
+    loadLens(candLens);
+    setUiFocusStateSafe(focus);
+    renderAll();
+    scheduleRenderPreviewIfAvailable();
+    scheduleAutosave();
+    if (recordSnapshots) recordCockpitSnapshot(`${label} • aligned`, candMetrics);
+    if (!silent) toast(`${label}: deterministic align applied`);
+  }
+
+  function tryDeterministicEflAlign({ settings, targets, sensor, focus, wavePreset, silent = false, nested = false } = {}) {
+    const baseLens = sanitizeLens(clone(lens));
+    const candLens = sanitizeLens(clone(baseLens));
+    const okScale = progressiveEflScaleTowardTarget(
+      candLens.surfaces,
+      Number(targets?.targetEfl || 50),
+      wavePreset,
+      { maxSteps: 14 }
+    ) || scaleLensGeometryToTargetEfl(candLens.surfaces, Number(targets?.targetEfl || 50), wavePreset);
+    if (!okScale) return { applied: false, reason: "scale" };
+    repairLensForPhysicsAfterEflScale(candLens.surfaces, { passes: 2 });
+    enforceRearMountStart(candLens.surfaces);
+    ensureStopInAirBothSides(candLens.surfaces);
+    quickSanity(candLens.surfaces);
+
+    const before = computeLocalDeterministicMetrics("efl", baseLens, focus, sensor, wavePreset);
+    const after = computeLocalDeterministicMetrics("efl", candLens, focus, sensor, wavePreset);
+    const targetEfl = Number(targets?.targetEfl || 50);
+    const errBefore = Math.abs(Number(before?.efl || 0) - targetEfl);
+    const errAfter = Math.abs(Number(after?.efl || 0) - targetEfl);
+    if (!(errAfter + 0.02 < errBefore)) return { applied: false, reason: "no_gain", before, after };
+
+    const hard = canAcceptDeterministicCandidate(baseLens, before, candLens, after, settings, ["pl", "bfl", "valid"]);
+    if (!hard.ok) return { applied: false, reason: hard.reason || "hard", before, after };
+
+    applyDeterministicLocalCandidate("Optimize EFL", candLens, focus, after, {
+      silent,
+      recordSnapshots: !nested,
+    });
+    return { applied: true, before, after, hardMode: hard.mode };
+  }
+
+  function tryDeterministicTAlign({ settings, targets, sensor, focus, wavePreset, silent = false, nested = false } = {}) {
+    const baseLens = sanitizeLens(clone(lens));
+    const candLens = sanitizeLens(clone(baseLens));
+    const before = computeLocalDeterministicMetrics("t", baseLens, focus, sensor, wavePreset);
+    const targetT = Number(targets?.targetT || 2.0);
+    const slowBefore = Number.isFinite(before?.T) ? Math.max(0, Number(before.T) - targetT) : Infinity;
+    if (!(slowBefore > 1e-4)) return { applied: false, reason: "already_fast", before };
+
+    const eflRef = Number.isFinite(before?.efl) && Number(before.efl) > 1e-6
+      ? Number(before.efl)
+      : Number(targets?.targetEfl || 50);
+    const okSet = setStopForTargetTOnSurfaces(candLens.surfaces, eflRef, targetT);
+    if (!okSet) return { applied: false, reason: "stop" };
+    enforceRearMountStart(candLens.surfaces);
+    ensureStopInAirBothSides(candLens.surfaces);
+    quickSanity(candLens.surfaces);
+
+    const after = computeLocalDeterministicMetrics("t", candLens, focus, sensor, wavePreset);
+    const slowAfter = Number.isFinite(after?.T) ? Math.max(0, Number(after.T) - targetT) : Infinity;
+    if (!(slowAfter + 0.005 < slowBefore)) return { applied: false, reason: "no_gain", before, after };
+
+    const hard = canAcceptDeterministicCandidate(baseLens, before, candLens, after, settings, ["pl", "bfl", "valid"]);
+    if (!hard.ok) return { applied: false, reason: hard.reason || "hard", before, after };
+
+    applyDeterministicLocalCandidate("Optimize T", candLens, focus, after, {
+      silent,
+      recordSnapshots: !nested,
+    });
+    return { applied: true, before, after, hardMode: hard.mode };
+  }
+
+  function tryDeterministicIcAlign({ settings, targets, sensor, focus, wavePreset, silent = false, nested = false } = {}) {
+    const baseLens = sanitizeLens(clone(lens));
+    const candLens = sanitizeLens(clone(baseLens));
+    const before = computeLocalDeterministicMetrics("ic", baseLens, focus, sensor, wavePreset);
+    const icGoal = Math.max(Number(targets?.targetIC || 0), Math.hypot(Number(sensor?.w || 36.7), Number(sensor?.h || 25.54)));
+    if (!(Number.isFinite(icGoal) && icGoal > 0.1)) return { applied: false, reason: "goal" };
+
+    const beforeIc = Number(before?.usableIC?.diameterMm || 0);
+    const icNeed = Math.max(0, icGoal - beforeIc);
+    for (let p = 0; p < 3; p++) {
+      applyCoverageBoostMutation(candLens.surfaces, {
+        targetIC: icGoal,
+        targetEfl: Number(targets?.targetEfl || 50),
+        targetT: Number(targets?.targetT || 2.0),
+        icNeedMm: icNeed + (p * 0.6),
+        keepFl: true,
+      });
+    }
+    promoteElementDiameters(candLens.surfaces, {
+      targetEfl: Number(targets?.targetEfl || 50),
+      targetT: Number(targets?.targetT || 2.0),
+      targetIC: icGoal,
+      stage: 2,
+      strength: 0.95,
+      keepFl: true,
+    });
+    enforcePupilHealthFloors(candLens.surfaces, {
+      targetEfl: Number(targets?.targetEfl || 50),
+      targetT: Number(targets?.targetT || 2.0),
+      targetIC: icGoal,
+      stage: 2,
+      keepFl: true,
+    });
+    ensureStopInAirBothSides(candLens.surfaces);
+    enforceRearMountStart(candLens.surfaces);
+    quickSanity(candLens.surfaces);
+
+    const after = computeLocalDeterministicMetrics("ic", candLens, focus, sensor, wavePreset);
+    const afterIc = Number(after?.usableIC?.diameterMm || 0);
+    const fieldGain = Number(after?.maxFieldDeg || 0) - Number(before?.maxFieldDeg || 0);
+    if (!((afterIc > beforeIc + 0.12) || (fieldGain > 0.15))) {
+      return { applied: false, reason: "no_gain", before, after };
+    }
+
+    const eflTol = settings?.strictness === "strict"
+      ? COCKPIT_CFG.maxEflDriftStrictMm
+      : COCKPIT_CFG.maxEflDriftNormalMm;
+    const tTol = settings?.strictness === "strict"
+      ? COCKPIT_CFG.maxTDriftStrict
+      : COCKPIT_CFG.maxTDriftNormal;
+    const distTol = settings?.strictness === "strict"
+      ? COCKPIT_CFG.maxDistWorsenStrictPct
+      : COCKPIT_CFG.maxDistWorsenNormalPct;
+    const eflDrift = Math.abs(Number(after?.efl || 0) - Number(before?.efl || 0));
+    const tDrift = Math.abs(Number(after?.T || 0) - Number(before?.T || 0));
+    const distWorse = Math.max(
+      0,
+      Math.abs(Number(after?.distortion?.dist70Pct || 0)) - Math.abs(Number(before?.distortion?.dist70Pct || 0))
+    );
+    if (eflDrift > eflTol || tDrift > tTol || distWorse > distTol) {
+      return { applied: false, reason: "guards", before, after };
+    }
+
+    const hard = canAcceptDeterministicCandidate(baseLens, before, candLens, after, settings, ["pl", "bfl", "valid"]);
+    if (!hard.ok) return { applied: false, reason: hard.reason || "hard", before, after };
+
+    applyDeterministicLocalCandidate("Optimize Image Circle", candLens, focus, after, {
+      silent,
+      recordSnapshots: !nested,
+    });
+    return { applied: true, before, after, hardMode: hard.mode };
   }
 
   async function runCockpitOptimizerEngine({
@@ -7649,6 +7964,18 @@
   async function runOptimizeEflLocal(opts = {}) {
     const settings = getCockpitSettings();
     const targets = getCockpitTargets();
+    const focus = getFocusStateFromUi();
+    const sensor = getSensorWH();
+    const wavePreset = ui.wavePreset?.value || "d";
+    tryDeterministicEflAlign({
+      settings,
+      targets,
+      sensor,
+      focus,
+      wavePreset,
+      silent: !!opts?.silent,
+      nested: !!opts?.nested,
+    });
     const covTol = settings.strictness === "strict"
       ? COCKPIT_CFG.maxCoverageDropStrictDeg
       : COCKPIT_CFG.maxCoverageDropNormalDeg;
@@ -7680,6 +8007,18 @@
   async function runOptimizeTLocal(opts = {}) {
     const settings = getCockpitSettings();
     const targets = getCockpitTargets();
+    const focus = getFocusStateFromUi();
+    const sensor = getSensorWH();
+    const wavePreset = ui.wavePreset?.value || "d";
+    tryDeterministicTAlign({
+      settings,
+      targets,
+      sensor,
+      focus,
+      wavePreset,
+      silent: !!opts?.silent,
+      nested: !!opts?.nested,
+    });
     const eflTol = settings.strictness === "strict"
       ? COCKPIT_CFG.maxEflDriftStrictMm
       : COCKPIT_CFG.maxEflDriftNormalMm;
@@ -7717,6 +8056,17 @@
     const settings = getCockpitSettings();
     const targets = getCockpitTargets();
     const sensor = getSensorWH();
+    const focus = getFocusStateFromUi();
+    const wavePreset = ui.wavePreset?.value || "d";
+    tryDeterministicIcAlign({
+      settings,
+      targets,
+      sensor,
+      focus,
+      wavePreset,
+      silent: !!opts?.silent,
+      nested: !!opts?.nested,
+    });
     const icGoal = Math.max(Number(targets.targetIC || 0), Math.hypot(sensor.w, sensor.h));
     const eflTol = settings.strictness === "strict"
       ? COCKPIT_CFG.maxEflDriftStrictMm
