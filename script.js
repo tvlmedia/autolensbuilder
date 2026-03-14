@@ -1583,6 +1583,7 @@
     maxTDriftAbs: 0.20,
     maxTDriftAbsReject: 0.45,
     maxBflShortMm: 1.0,
+    plWorsenTolMm: 0.05,
     iterationsMin: 800,
     iterationsMax: 100000,
     progressBatch: 80,
@@ -1624,6 +1625,7 @@
     maxTDriftAbs: 0.18,
     maxTDriftAbsReject: 0.42,
     maxBflShortMm: 1.0,
+    plWorsenTolMm: 0.05,
     maxDist70WorsenPct: 0.30,
     maxDist70WorsenRejectPct: 0.90,
     iterationsMin: 1200,
@@ -10313,6 +10315,8 @@
       maxFieldStepDeg = DIST_OPT_CFG.maxFieldStepDeg,
       maxFieldScanDeg = DIST_OPT_CFG.maxFieldScanDeg,
       maxBflShortMm = DIST_OPT_CFG.maxBflShortMm,
+      plBaselineIntrusionMm = null,
+      plWorsenTolMm = DIST_OPT_CFG.plWorsenTolMm,
     } = {}
   ) {
     if (!lensObj?.surfaces || !Array.isArray(lensObj.surfaces)) {
@@ -10340,7 +10344,10 @@
     const rearVxFocused = lastPhysicalVertexX(surfaces);
     const intrusionFocused = Number.isFinite(rearVxFocused) ? (rearVxFocused - (-PL_FFD)) : Infinity;
     const intrusion = Math.max(intrusionNeutral, intrusionFocused);
-    if (!(intrusion <= 1e-3)) return { ok: false, reason: "pl", intrusion, phys };
+    const baseIntr = Number(plBaselineIntrusionMm);
+    const plTol = Math.max(0, Number(plWorsenTolMm ?? DIST_OPT_CFG.plWorsenTolMm ?? 0.05));
+    const allowRelaxedPl = Number.isFinite(baseIntr) && baseIntr > 1e-3 && intrusion <= (baseIntr + plTol);
+    if (!(intrusion <= 1e-3) && !allowRelaxedPl) return { ok: false, reason: "pl", intrusion, phys };
 
     const rays = buildRays(surfaces, 0, 13);
     const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
@@ -10396,6 +10403,8 @@
       bfl,
       bflShortMm,
       intrusion,
+      plRelaxed: allowRelaxedPl,
+      plBaselineIntrusionMm: Number.isFinite(baseIntr) ? baseIntr : null,
       maxFieldDeg,
       stopIdx,
       phys,
@@ -10755,6 +10764,8 @@
       maxBflShortMm = SHARP_OPT_CFG.maxBflShortMm,
       afOptions = null,
       withDistGuard = true,
+      plBaselineIntrusionMm = null,
+      plWorsenTolMm = SHARP_OPT_CFG.plWorsenTolMm,
     } = {}
   ) {
     if (!lensObj?.surfaces || !Array.isArray(lensObj.surfaces)) return { ok: false, reason: "lens" };
@@ -10792,7 +10803,10 @@
     const rearVxFocused = lastPhysicalVertexX(surfaces);
     const intrusionFocused = Number.isFinite(rearVxFocused) ? (rearVxFocused - (-PL_FFD)) : Infinity;
     const intrusion = Math.max(intrusionNeutral, intrusionFocused);
-    if (!(intrusion <= 1e-3)) return { ok: false, reason: "pl", intrusion, phys, focus };
+    const baseIntr = Number(plBaselineIntrusionMm);
+    const plTol = Math.max(0, Number(plWorsenTolMm ?? SHARP_OPT_CFG.plWorsenTolMm ?? 0.05));
+    const allowRelaxedPl = Number.isFinite(baseIntr) && baseIntr > 1e-3 && intrusion <= (baseIntr + plTol);
+    if (!(intrusion <= 1e-3) && !allowRelaxedPl) return { ok: false, reason: "pl", intrusion, phys, focus };
 
     const rays = buildRays(surfaces, 0, 13);
     const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
@@ -10861,6 +10875,8 @@
       bfl,
       bflShortMm,
       intrusion,
+      plRelaxed: allowRelaxedPl,
+      plBaselineIntrusionMm: Number.isFinite(baseIntr) ? baseIntr : null,
       phys,
       cross,
       sharp,
@@ -10993,9 +11009,21 @@
         afOptions: SHARP_OPT_CFG.autofocus,
         withDistGuard: true,
       };
+      let plBaselineIntrusionMm = null;
+      const plWorsenTolMm = Math.max(0, Number(SHARP_OPT_CFG.plWorsenTolMm || 0.05));
+      let plRelaxedMode = false;
 
       const startLens = sanitizeLens(clone(lens));
-      const baseState = measureSharpnessState(startLens, ctxBase);
+      let baseState = measureSharpnessState(startLens, ctxBase);
+      if (!baseState.ok && baseState.reason === "pl" && Number.isFinite(Number(baseState.intrusion))) {
+        plBaselineIntrusionMm = Number(baseState.intrusion);
+        plRelaxedMode = true;
+        baseState = measureSharpnessState(startLens, {
+          ...ctxBase,
+          plBaselineIntrusionMm,
+          plWorsenTolMm,
+        });
+      }
       if (!baseState.ok) {
         setOptLog(
           `${runHeader}\n` +
@@ -11045,6 +11073,7 @@
         `${runHeader}\n` +
         `running… 0/${iters}\n` +
         `apply mode: ${autoApply ? "auto" : "manual (Apply best)"}\n` +
+        `${plRelaxedMode ? `baseline relax mode: PL ${plBaselineIntrusionMm.toFixed(2)}mm (must not worsen > +${plWorsenTolMm.toFixed(2)}mm)\n` : ""}` +
         `baseline RMS C/E ${Number(baseState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(baseState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm\n` +
         `baseline score ${Number(baseState?.sharp?.score || 0).toFixed(4)} • EFL ${baseState.efl.toFixed(2)}mm • T ${baseState.T.toFixed(2)} • field ${baseState.maxFieldDeg.toFixed(2)}° • IC ${Number.isFinite(baseIcMm) ? baseIcMm.toFixed(2) : "—"}mm`
       );
@@ -11063,9 +11092,16 @@
           continue;
         }
 
-        const candState = measureSharpnessState(cand, ctxBase);
+        const candState = measureSharpnessState(cand, {
+          ...ctxBase,
+          ...(plRelaxedMode ? { plBaselineIntrusionMm, plWorsenTolMm } : {}),
+        });
         if (!candState.ok) {
           countReject(candState.reason);
+          continue;
+        }
+        if (plRelaxedMode && Number.isFinite(plBaselineIntrusionMm) && Number(candState?.intrusion) > (plBaselineIntrusionMm + plWorsenTolMm)) {
+          countReject("pl");
           continue;
         }
         const candScore = scoreSharpnessState(candState, baseState, SHARP_OPT_CFG);
@@ -11093,8 +11129,13 @@
             ...ctxBase,
             rayCount: Math.min(41, Math.max(rayCount, 29)),
             maxFieldStepDeg: Math.max(0.8, Number(SHARP_OPT_CFG.maxFieldStepDeg || 1.25) * 0.85),
+            ...(plRelaxedMode ? { plBaselineIntrusionMm, plWorsenTolMm } : {}),
           });
           if (checkState.ok) {
+            if (plRelaxedMode && Number.isFinite(plBaselineIntrusionMm) && Number(checkState?.intrusion) > (plBaselineIntrusionMm + plWorsenTolMm)) {
+              countReject("pl");
+              continue;
+            }
             const checkScore = scoreSharpnessState(checkState, baseState, SHARP_OPT_CFG);
             if (!checkScore.hardReject && checkScore.merit + 1e-9 < bestMerit) {
               bestLens = clone(cand);
@@ -11280,9 +11321,21 @@
         maxFieldScanDeg: DIST_OPT_CFG.maxFieldScanDeg,
         maxBflShortMm: DIST_OPT_CFG.maxBflShortMm,
       };
+      let plBaselineIntrusionMm = null;
+      const plWorsenTolMm = Math.max(0, Number(DIST_OPT_CFG.plWorsenTolMm || 0.05));
+      let plRelaxedMode = false;
 
       const startLens = sanitizeLens(clone(lens));
-      const baseState = measureDistortionState(startLens, ctxBase);
+      let baseState = measureDistortionState(startLens, ctxBase);
+      if (!baseState.ok && baseState.reason === "pl" && Number.isFinite(Number(baseState.intrusion))) {
+        plBaselineIntrusionMm = Number(baseState.intrusion);
+        plRelaxedMode = true;
+        baseState = measureDistortionState(startLens, {
+          ...ctxBase,
+          plBaselineIntrusionMm,
+          plWorsenTolMm,
+        });
+      }
       if (!baseState.ok) {
         setOptLog(
           `${runHeader}\n` +
@@ -11333,6 +11386,7 @@
         `${runHeader}\n` +
         `running… 0/${iters}\n` +
         `apply mode: ${autoApply ? "auto" : "manual (Apply best)"}\n` +
+        `${plRelaxedMode ? `baseline relax mode: PL ${plBaselineIntrusionMm.toFixed(2)}mm (must not worsen > +${plWorsenTolMm.toFixed(2)}mm)\n` : ""}` +
         `baseline DIST@0.7D ${Number.isFinite(baseDist70) ? baseDist70.toFixed(2) : "—"}% • RMS ${Number.isFinite(baseRms) ? baseRms.toFixed(2) : "—"}%\n` +
         `baseline EFL ${baseState.efl.toFixed(2)}mm • T ${baseState.T.toFixed(2)} • field ${baseState.maxFieldDeg.toFixed(2)}° • IC ${Number.isFinite(baseIcMm) ? baseIcMm.toFixed(2) : "—"}mm • stop #${baseState.stopIdx}`
       );
@@ -11355,9 +11409,14 @@
         const candState = measureDistortionState(cand, {
           ...ctxBase,
           lutN: DIST_OPT_CFG.lutNOptFast,
+          ...(plRelaxedMode ? { plBaselineIntrusionMm, plWorsenTolMm } : {}),
         });
         if (!candState.ok) {
           countReject(candState.reason);
+          continue;
+        }
+        if (plRelaxedMode && Number.isFinite(plBaselineIntrusionMm) && Number(candState?.intrusion) > (plBaselineIntrusionMm + plWorsenTolMm)) {
+          countReject("pl");
           continue;
         }
         const candScore = scoreDistortionState(candState, baseState, DIST_OPT_CFG);
@@ -11384,8 +11443,13 @@
           const checkState = measureDistortionState(cand, {
             ...ctxBase,
             lutN: DIST_OPT_CFG.lutNOptFinal,
+            ...(plRelaxedMode ? { plBaselineIntrusionMm, plWorsenTolMm } : {}),
           });
           if (checkState.ok) {
+            if (plRelaxedMode && Number.isFinite(plBaselineIntrusionMm) && Number(checkState?.intrusion) > (plBaselineIntrusionMm + plWorsenTolMm)) {
+              countReject("pl");
+              continue;
+            }
             const checkScore = scoreDistortionState(checkState, baseState, DIST_OPT_CFG);
             if (!checkScore.hardReject && checkScore.merit + 1e-9 < bestMerit) {
               bestLens = clone(cand);
@@ -12149,7 +12213,7 @@
     }
     const usable = scratchMinimumUsableReached({ pri: p, evalRes: optBest.eval }, targets);
     if (!usable) {
-      return toast("Best is nog niet bruikbaar (focus/scherpte/T/vignette). Eerst verder optimaliseren.");
+      toast("Waarschuwing: best is nog niet ideaal (focus/scherpte/T/vignette), maar wordt wel toegepast.");
     }
     recordCockpitSnapshot("Main pre-apply");
     loadLens(optBest.lens);
