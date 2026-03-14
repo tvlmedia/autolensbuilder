@@ -1584,6 +1584,7 @@
     maxTDriftAbsReject: 0.45,
     maxBflShortMm: 1.0,
     plWorsenTolMm: 0.05,
+    bflWorsenTolMm: 0.10,
     iterationsMin: 800,
     iterationsMax: 100000,
     progressBatch: 80,
@@ -1626,6 +1627,7 @@
     maxTDriftAbsReject: 0.42,
     maxBflShortMm: 1.0,
     plWorsenTolMm: 0.05,
+    bflWorsenTolMm: 0.10,
     maxDist70WorsenPct: 0.30,
     maxDist70WorsenRejectPct: 0.90,
     iterationsMin: 1200,
@@ -7098,11 +7100,14 @@
     return rear.length ? rear : idx;
   }
 
-  function cockpitScaleLensByFactor(surfaces, k) {
+  function cockpitScaleLensByFactor(surfaces, k, opts = {}) {
     const kk = Number(k);
     if (!Array.isArray(surfaces) || !(Number.isFinite(kk) && kk > 0)) return false;
+    const keepAperture = opts?.keepAperture !== false;
     const rearIdx = findScratchRearSurfaceIndex(surfaces);
-    const apScale = Math.sqrt(Math.max(1e-6, kk));
+    const apScale = keepAperture
+      ? (kk >= 1 ? Math.pow(kk, 0.20) : Math.max(0.995, Math.pow(Math.max(1e-6, kk), 0.08)))
+      : Math.sqrt(Math.max(1e-6, kk));
     for (let i = 0; i < surfaces.length; i++) {
       const s = surfaces[i];
       const t = String(s?.type || "").toUpperCase();
@@ -7115,7 +7120,7 @@
         s.t = clamp(Number(s.t || 0) * kk, PHYS_CFG.minThickness, PHYS_CFG.maxThickness);
       }
       s.ap = clamp(Number(s.ap || 0) * apScale, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
-      enforceApertureRadiusCoupling(s, 1.08);
+      enforceApertureRadiusCoupling(s, keepAperture ? 1.03 : 1.08);
     }
     enforceRearMountStart(surfaces);
     quickSanity(surfaces);
@@ -7130,13 +7135,67 @@
     if (!(Number.isFinite(curEfl) && curEfl > 1e-6 && Number.isFinite(targetEfl) && targetEfl > 1e-6)) {
       return { ok: false, reason: "efl" };
     }
-    const step = clamp(Number(ctx?.settings?.stepSize || COCKPIT_CFG.defaultStepSize), 0.01, 0.20);
+    const strict = String(ctx?.settings?.strictness || "normal").toLowerCase() === "strict";
+    const stepUi = clamp(Number(ctx?.settings?.stepSize || COCKPIT_CFG.defaultStepSize), 0.01, 0.20);
     const kGoal = targetEfl / curEfl;
-    const blend = randRange(0.40, 1.00);
-    let k = 1 + (kGoal - 1) * blend;
-    k = clamp(k, 1 - step, 1 + step);
-    if (!(Number.isFinite(k) && k > 0)) return { ok: false, reason: "scale" };
-    cockpitScaleLensByFactor(surfaces, k);
+    const errRelSigned = (targetEfl - curEfl) / Math.max(1e-9, curEfl);
+    const dir = Math.sign(errRelSigned);
+    if (!Number.isFinite(dir) || dir === 0) return { ok: false, reason: "target_met" };
+
+    // Use small directional steps first; large fixed FL jumps were causing hard rejects only.
+    let maxStep = Math.min(stepUi, Math.max(0.008, Math.abs(errRelSigned) * 0.55));
+    let minStep = Math.max(0.0015, maxStep * 0.12);
+
+    if (dir < 0) {
+      const curBfl = Number(ctx?.currentMetrics?.bfl);
+      const bflFloor = strict
+        ? (PL_FFD - 0.45)
+        : (PL_FFD - Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0));
+      if (Number.isFinite(curBfl)) {
+        const margin = curBfl - bflFloor;
+        if (margin < 1.2) {
+          maxStep = Math.min(maxStep, 0.006 + Math.max(0, margin) * 0.006);
+          minStep = Math.min(minStep, maxStep);
+        }
+      }
+    }
+    if (!(maxStep > 1e-6)) return { ok: false, reason: "step" };
+
+    let stepMag = randRange(Math.max(1e-4, minStep), maxStep);
+    if (Math.random() < 0.25) stepMag *= 0.35;
+    let k = 1 + dir * stepMag;
+    const kGoalBlend = clamp(1 + (kGoal - 1) * randRange(0.08, 0.45), 1 - stepUi, 1 + stepUi);
+    if (Math.random() < 0.35) k = (k * 0.6) + (kGoalBlend * 0.4);
+    k = clamp(k, 1 - stepUi, 1 + stepUi);
+    if (dir < 0) k = Math.min(k, 0.9995);
+    if (dir > 0) k = Math.max(k, 1.0005);
+    if (!(Number.isFinite(k) && k > 0 && Math.abs(k - 1) > 1e-6)) return { ok: false, reason: "scale" };
+
+    cockpitScaleLensByFactor(surfaces, k, { keepAperture: true });
+
+    // Keep BFL viable while pulling EFL down by expanding image-space gap when needed.
+    if (dir < 0) {
+      const rearIdx = findScratchRearSurfaceIndex(surfaces);
+      if (rearIdx >= 0) {
+        const rear = surfaces[rearIdx];
+        const curBfl = Number(ctx?.currentMetrics?.bfl);
+        const predBfl = Number.isFinite(curBfl) ? (curBfl * k) : NaN;
+        const bflFloor = strict
+          ? (PL_FFD - 0.45)
+          : (PL_FFD - Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0));
+        const safety = strict ? 0.22 : 0.45;
+        if (Number.isFinite(predBfl) && predBfl < (bflFloor + safety)) {
+          const need = (bflFloor + safety) - predBfl;
+          rear.t = clamp(
+            Number(rear.t || 0) + need,
+            Math.max(PHYS_CFG.minAirGap, PL_FFD + 0.8),
+            PL_FFD + 95
+          );
+        }
+      }
+    }
+    enforceRearMountStart(surfaces);
+    quickSanity(surfaces);
     return { ok: true, kind: "scale", scale: k };
   }
 
@@ -7169,6 +7228,7 @@
       }
       enforceApertureRadiusCoupling(s, 1.08);
     }
+    enforceRearMountStart(surfaces);
     quickSanity(surfaces);
     return { ok: true, kind: "stop_ap", factor };
   }
@@ -7208,6 +7268,7 @@
         ? randRange(0.03, baseDelta)
         : randRange(-baseDelta, baseDelta);
       s.t = clamp(Number(s.t || 0) + delta, PHYS_CFG.minAirGap, 24);
+      enforceRearMountStart(surfaces);
       quickSanity(surfaces);
       return { ok: true, kind: "air_gap", idx };
     }
@@ -7218,6 +7279,7 @@
       const gain = 1 + randRange(0.004, Math.max(0.01, step * 0.65));
       s.ap = clamp(Number(s.ap || 0) * gain, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
       enforceApertureRadiusCoupling(s, 1.08);
+      enforceRearMountStart(surfaces);
       quickSanity(surfaces);
       return { ok: true, kind: "aperture", idx };
     }
@@ -7232,6 +7294,7 @@
       const delta = Math.random() < 0.5 ? -frac : frac;
       s.R = sign * clamp(absR * (1 + delta), PHYS_CFG.minRadius, 650);
       enforceApertureRadiusCoupling(s, 1.08);
+      enforceRearMountStart(surfaces);
       quickSanity(surfaces);
       return { ok: true, kind: "bend", idx };
     }
@@ -7371,6 +7434,7 @@
       let bestIter = 0;
 
       const rejects = { mut: 0, hard: 0, guard: 0 };
+      const hardReasonCounts = Object.create(null);
       const batch = Math.max(20, Number(COCKPIT_CFG.progressBatch || 60) | 0);
       const t0 = performance.now();
 
@@ -7459,6 +7523,10 @@
             : { ok: false };
           if (!relax.ok) {
             rejects.hard++;
+            for (const rr of (hard.reasons || [])) {
+              const k = String(rr || "unknown").toLowerCase() || "unknown";
+              hardReasonCounts[k] = (hardReasonCounts[k] || 0) + 1;
+            }
             continue;
           }
         }
@@ -7507,7 +7575,10 @@
             `base EFL ${Number(baseMetrics?.efl).toFixed(2)}mm • T ${Number(baseMetrics?.T).toFixed(2)} • IC ${Number(baseMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm\n` +
             `best EFL ${Number(bestMetrics?.efl).toFixed(2)}mm • T ${Number(bestMetrics?.T).toFixed(2)} • IC ${Number(bestMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm • field ${Number(bestMetrics?.maxFieldDeg).toFixed(2)}°\n` +
             `best Dist@0.7 ${Number.isFinite(bestMetrics?.distortion?.dist70Pct) ? Number(bestMetrics.distortion.dist70Pct).toFixed(2) : "—"}% • RMS ${Number.isFinite(bestMetrics?.distortion?.rmsPct) ? Number(bestMetrics.distortion.rmsPct).toFixed(2) : "—"}%\n` +
-            `rejects mut ${rejects.mut} • hard ${rejects.hard} • guard ${rejects.guard}`
+            `rejects mut ${rejects.mut} • hard ${rejects.hard} • guard ${rejects.guard}` +
+            `${rejects.hard > 0
+              ? `\nhard reasons ${Object.entries(hardReasonCounts).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => `${k}:${v}`).join(" • ")}`
+              : ""}`
           );
           if (!nested) setCockpitProgress(i / iters, `${label} • ${i}/${iters}`);
           await new Promise((r) => setTimeout(r, 0));
@@ -7551,7 +7622,10 @@
         `${improved ? (applied ? "APPLIED ✅" : "improved (not applied)") : "no better candidate"}\n` +
         `before EFL ${Number(baseMetrics?.efl).toFixed(2)}mm • T ${Number(baseMetrics?.T).toFixed(2)} • IC ${Number(baseMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm • DistRMS ${Number.isFinite(baseMetrics?.distortion?.rmsPct) ? Number(baseMetrics.distortion.rmsPct).toFixed(2) : "—"}%\n` +
         `after  EFL ${Number(afterMetrics?.efl).toFixed(2)}mm • T ${Number(afterMetrics?.T).toFixed(2)} • IC ${Number(afterMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm • DistRMS ${Number.isFinite(afterMetrics?.distortion?.rmsPct) ? Number(afterMetrics.distortion.rmsPct).toFixed(2) : "—"}%\n` +
-        `rejects mut ${rejects.mut} • hard ${rejects.hard} • guard ${rejects.guard}`
+        `rejects mut ${rejects.mut} • hard ${rejects.hard} • guard ${rejects.guard}` +
+        `${rejects.hard > 0
+          ? `\nhard reasons ${Object.entries(hardReasonCounts).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `${k}:${v}`).join(" • ")}`
+          : ""}`
       );
       if (!nested) setCockpitProgress(1, `${label} • done`);
       if (!silent) toast(cockpitSummaryToast(label, baseMetrics, afterMetrics));
@@ -7596,7 +7670,7 @@
       includeSharpness: false,
       autofocusCandidates: false,
       anneal: opts?.anneal,
-      allowedBaselineHardReasons: ["pl"],
+      allowedBaselineHardReasons: ["pl", "bfl", "valid"],
       nested: !!opts?.nested,
       runContext: opts?.runContext || null,
       silent: !!opts?.silent,
@@ -7632,7 +7706,7 @@
       includeSharpness: false,
       autofocusCandidates: false,
       anneal: opts?.anneal,
-      allowedBaselineHardReasons: ["pl"],
+      allowedBaselineHardReasons: ["pl", "bfl", "valid"],
       nested: !!opts?.nested,
       runContext: opts?.runContext || null,
       silent: !!opts?.silent,
@@ -7679,7 +7753,7 @@
       includeSharpness: false,
       autofocusCandidates: false,
       anneal: opts?.anneal,
-      allowedBaselineHardReasons: ["pl"],
+      allowedBaselineHardReasons: ["pl", "bfl", "valid"],
       nested: !!opts?.nested,
       runContext: opts?.runContext || null,
       silent: !!opts?.silent,
@@ -7691,7 +7765,6 @@
     const silent = !!opts?.silent;
     const runContext = opts?.runContext || null;
     const prevCtx = optRunContext;
-    const prevAuto = !!ui.optAutoApply?.checked;
     if (!nested) {
       if (cockpitOptRunning || cockpitMacroRunning) return null;
       cockpitOptRunning = true;
@@ -7712,7 +7785,6 @@
         useCache: false,
       });
       if (!nested) recordCockpitSnapshot("Optimize Distortion • start", before);
-      if (ui.optAutoApply) ui.optAutoApply.checked = true;
       if (runContext && typeof runContext === "object") {
         setOptRunContext({
           mode: runContext.mode || "Optimize Distortion",
@@ -7738,7 +7810,6 @@
       if (!silent) toast(cockpitSummaryToast("Distortion", before, after));
       return { ok: true, before, after, improved: Number(after?.distortion?.rmsPct) < Number(before?.distortion?.rmsPct) };
     } finally {
-      if (ui.optAutoApply) ui.optAutoApply.checked = prevAuto;
       if (runContext && typeof runContext === "object") setOptRunContext(prevCtx);
       if (!nested) {
         cockpitOptRunning = false;
@@ -7754,7 +7825,6 @@
     const silent = !!opts?.silent;
     const runContext = opts?.runContext || null;
     const prevCtx = optRunContext;
-    const prevAuto = !!ui.optAutoApply?.checked;
     if (!nested) {
       if (cockpitOptRunning || cockpitMacroRunning) return null;
       cockpitOptRunning = true;
@@ -7775,7 +7845,6 @@
         useCache: false,
       });
       if (!nested) recordCockpitSnapshot("Optimize Sharpness • start", before);
-      if (ui.optAutoApply) ui.optAutoApply.checked = true;
       if (runContext && typeof runContext === "object") {
         setOptRunContext({
           mode: runContext.mode || "Optimize Sharpness",
@@ -7801,7 +7870,6 @@
       if (!silent) toast(cockpitSummaryToast("Sharpness", before, after));
       return { ok: true, before, after, improved: Number(after?.sharpness?.rmsEdge) < Number(before?.sharpness?.rmsEdge) };
     } finally {
-      if (ui.optAutoApply) ui.optAutoApply.checked = prevAuto;
       if (runContext && typeof runContext === "object") setOptRunContext(prevCtx);
       if (!nested) {
         cockpitOptRunning = false;
@@ -10226,6 +10294,18 @@
       if (!Number.isFinite(baseIntr) || !Number.isFinite(candIntr)) return { ok: false, reason: "pl-nan" };
       if (candIntr > (baseIntr + 0.05)) return { ok: false, reason: "pl-worse" };
     }
+    if (nowReasons.includes("bfl")) {
+      const baseBflShort = Number(baseMetrics?.feasible?.bflShortMm);
+      const candBflShort = Number(candMetrics?.feasible?.bflShortMm);
+      if (!Number.isFinite(baseBflShort) || !Number.isFinite(candBflShort)) return { ok: false, reason: "bfl-nan" };
+      if (candBflShort > (baseBflShort + 0.10)) return { ok: false, reason: "bfl-worse" };
+    }
+    if (nowReasons.includes("valid")) {
+      const baseValid = Number(baseMetrics?.feasible?.validCenterFrac);
+      const candValid = Number(candMetrics?.feasible?.validCenterFrac);
+      if (!Number.isFinite(baseValid) || !Number.isFinite(candValid)) return { ok: false, reason: "valid-nan" };
+      if (candValid < (baseValid - 0.03)) return { ok: false, reason: "valid-worse" };
+    }
 
     return { ok: true, reason: "relaxed" };
   }
@@ -10317,6 +10397,8 @@
       maxBflShortMm = DIST_OPT_CFG.maxBflShortMm,
       plBaselineIntrusionMm = null,
       plWorsenTolMm = DIST_OPT_CFG.plWorsenTolMm,
+      bflBaselineShortMm = null,
+      bflWorsenTolMm = DIST_OPT_CFG.bflWorsenTolMm,
     } = {}
   ) {
     if (!lensObj?.surfaces || !Array.isArray(lensObj.surfaces)) {
@@ -10357,7 +10439,10 @@
     const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
     if (!(Number.isFinite(efl) && efl > 1e-6)) return { ok: false, reason: "efl", phys };
     const bflShortMm = Number.isFinite(bfl) ? Math.max(0, MERIT_CFG.bflMin - bfl) : Infinity;
-    if (!(bflShortMm <= Number(maxBflShortMm || DIST_OPT_CFG.maxBflShortMm))) {
+    const baseBflShort = Number(bflBaselineShortMm);
+    const bflTol = Math.max(0, Number(bflWorsenTolMm ?? DIST_OPT_CFG.bflWorsenTolMm ?? 0.10));
+    const allowRelaxedBfl = Number.isFinite(baseBflShort) && baseBflShort > 1e-6 && bflShortMm <= (baseBflShort + bflTol);
+    if (!(bflShortMm <= Number(maxBflShortMm || DIST_OPT_CFG.maxBflShortMm)) && !allowRelaxedBfl) {
       return { ok: false, reason: "bfl", bflShortMm, bfl, phys };
     }
 
@@ -10402,6 +10487,8 @@
       T,
       bfl,
       bflShortMm,
+      bflRelaxed: allowRelaxedBfl,
+      bflBaselineShortMm: Number.isFinite(baseBflShort) ? baseBflShort : null,
       intrusion,
       plRelaxed: allowRelaxedPl,
       plBaselineIntrusionMm: Number.isFinite(baseIntr) ? baseIntr : null,
@@ -10639,6 +10726,7 @@
     if (!mutated) return { ok: false, reason: kind };
     enforceSingleStopSurface(surfaces);
     ensureStopInAirBothSides(surfaces);
+    enforceRearMountStart(surfaces);
     quickSanity(surfaces);
     return { ok: true, kind };
   }
@@ -10745,6 +10833,7 @@
     if (!mutated) return { ok: false, reason: kind };
     enforceSingleStopSurface(surfaces);
     ensureStopInAirBothSides(surfaces);
+    enforceRearMountStart(surfaces);
     quickSanity(surfaces);
     return { ok: true, kind };
   }
@@ -10766,6 +10855,8 @@
       withDistGuard = true,
       plBaselineIntrusionMm = null,
       plWorsenTolMm = SHARP_OPT_CFG.plWorsenTolMm,
+      bflBaselineShortMm = null,
+      bflWorsenTolMm = SHARP_OPT_CFG.bflWorsenTolMm,
     } = {}
   ) {
     if (!lensObj?.surfaces || !Array.isArray(lensObj.surfaces)) return { ok: false, reason: "lens" };
@@ -10816,7 +10907,10 @@
     const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
     if (!(Number.isFinite(efl) && efl > 1e-6)) return { ok: false, reason: "efl", focus, phys };
     const bflShortMm = Number.isFinite(bfl) ? Math.max(0, Number(MERIT_CFG.bflMin || 52) - bfl) : Infinity;
-    if (!(bflShortMm <= Number(maxBflShortMm || SHARP_OPT_CFG.maxBflShortMm))) {
+    const baseBflShort = Number(bflBaselineShortMm);
+    const bflTol = Math.max(0, Number(bflWorsenTolMm ?? SHARP_OPT_CFG.bflWorsenTolMm ?? 0.10));
+    const allowRelaxedBfl = Number.isFinite(baseBflShort) && baseBflShort > 1e-6 && bflShortMm <= (baseBflShort + bflTol);
+    if (!(bflShortMm <= Number(maxBflShortMm || SHARP_OPT_CFG.maxBflShortMm)) && !allowRelaxedBfl) {
       return { ok: false, reason: "bfl", bfl, bflShortMm, focus, phys };
     }
     const T = estimateTStopApprox(efl, surfaces);
@@ -10874,6 +10968,8 @@
       T,
       bfl,
       bflShortMm,
+      bflRelaxed: allowRelaxedBfl,
+      bflBaselineShortMm: Number.isFinite(baseBflShort) ? baseBflShort : null,
       intrusion,
       plRelaxed: allowRelaxedPl,
       plBaselineIntrusionMm: Number.isFinite(baseIntr) ? baseIntr : null,
@@ -11012,6 +11108,9 @@
       let plBaselineIntrusionMm = null;
       const plWorsenTolMm = Math.max(0, Number(SHARP_OPT_CFG.plWorsenTolMm || 0.05));
       let plRelaxedMode = false;
+      let bflBaselineShortMm = null;
+      const bflWorsenTolMm = Math.max(0, Number(SHARP_OPT_CFG.bflWorsenTolMm || 0.10));
+      let bflRelaxedMode = false;
 
       const startLens = sanitizeLens(clone(lens));
       let baseState = measureSharpnessState(startLens, ctxBase);
@@ -11022,6 +11121,15 @@
           ...ctxBase,
           plBaselineIntrusionMm,
           plWorsenTolMm,
+        });
+      }
+      if (!baseState.ok && baseState.reason === "bfl" && Number.isFinite(Number(baseState.bflShortMm))) {
+        bflBaselineShortMm = Number(baseState.bflShortMm);
+        bflRelaxedMode = true;
+        baseState = measureSharpnessState(startLens, {
+          ...ctxBase,
+          bflBaselineShortMm,
+          bflWorsenTolMm,
         });
       }
       if (!baseState.ok) {
@@ -11074,6 +11182,7 @@
         `running… 0/${iters}\n` +
         `apply mode: ${autoApply ? "auto" : "manual (Apply best)"}\n` +
         `${plRelaxedMode ? `baseline relax mode: PL ${plBaselineIntrusionMm.toFixed(2)}mm (must not worsen > +${plWorsenTolMm.toFixed(2)}mm)\n` : ""}` +
+        `${bflRelaxedMode ? `baseline relax mode: BFL short ${bflBaselineShortMm.toFixed(2)}mm (must not worsen > +${bflWorsenTolMm.toFixed(2)}mm)\n` : ""}` +
         `baseline RMS C/E ${Number(baseState?.sharp?.centerRmsMm || 0).toFixed(3)} / ${Number(baseState?.sharp?.edgeRmsMm || 0).toFixed(3)} mm\n` +
         `baseline score ${Number(baseState?.sharp?.score || 0).toFixed(4)} • EFL ${baseState.efl.toFixed(2)}mm • T ${baseState.T.toFixed(2)} • field ${baseState.maxFieldDeg.toFixed(2)}° • IC ${Number.isFinite(baseIcMm) ? baseIcMm.toFixed(2) : "—"}mm`
       );
@@ -11095,6 +11204,7 @@
         const candState = measureSharpnessState(cand, {
           ...ctxBase,
           ...(plRelaxedMode ? { plBaselineIntrusionMm, plWorsenTolMm } : {}),
+          ...(bflRelaxedMode ? { bflBaselineShortMm, bflWorsenTolMm } : {}),
         });
         if (!candState.ok) {
           countReject(candState.reason);
@@ -11130,6 +11240,7 @@
             rayCount: Math.min(41, Math.max(rayCount, 29)),
             maxFieldStepDeg: Math.max(0.8, Number(SHARP_OPT_CFG.maxFieldStepDeg || 1.25) * 0.85),
             ...(plRelaxedMode ? { plBaselineIntrusionMm, plWorsenTolMm } : {}),
+            ...(bflRelaxedMode ? { bflBaselineShortMm, bflWorsenTolMm } : {}),
           });
           if (checkState.ok) {
             if (plRelaxedMode && Number.isFinite(plBaselineIntrusionMm) && Number(checkState?.intrusion) > (plBaselineIntrusionMm + plWorsenTolMm)) {
@@ -11324,6 +11435,9 @@
       let plBaselineIntrusionMm = null;
       const plWorsenTolMm = Math.max(0, Number(DIST_OPT_CFG.plWorsenTolMm || 0.05));
       let plRelaxedMode = false;
+      let bflBaselineShortMm = null;
+      const bflWorsenTolMm = Math.max(0, Number(DIST_OPT_CFG.bflWorsenTolMm || 0.10));
+      let bflRelaxedMode = false;
 
       const startLens = sanitizeLens(clone(lens));
       let baseState = measureDistortionState(startLens, ctxBase);
@@ -11334,6 +11448,15 @@
           ...ctxBase,
           plBaselineIntrusionMm,
           plWorsenTolMm,
+        });
+      }
+      if (!baseState.ok && baseState.reason === "bfl" && Number.isFinite(Number(baseState.bflShortMm))) {
+        bflBaselineShortMm = Number(baseState.bflShortMm);
+        bflRelaxedMode = true;
+        baseState = measureDistortionState(startLens, {
+          ...ctxBase,
+          bflBaselineShortMm,
+          bflWorsenTolMm,
         });
       }
       if (!baseState.ok) {
@@ -11387,6 +11510,7 @@
         `running… 0/${iters}\n` +
         `apply mode: ${autoApply ? "auto" : "manual (Apply best)"}\n` +
         `${plRelaxedMode ? `baseline relax mode: PL ${plBaselineIntrusionMm.toFixed(2)}mm (must not worsen > +${plWorsenTolMm.toFixed(2)}mm)\n` : ""}` +
+        `${bflRelaxedMode ? `baseline relax mode: BFL short ${bflBaselineShortMm.toFixed(2)}mm (must not worsen > +${bflWorsenTolMm.toFixed(2)}mm)\n` : ""}` +
         `baseline DIST@0.7D ${Number.isFinite(baseDist70) ? baseDist70.toFixed(2) : "—"}% • RMS ${Number.isFinite(baseRms) ? baseRms.toFixed(2) : "—"}%\n` +
         `baseline EFL ${baseState.efl.toFixed(2)}mm • T ${baseState.T.toFixed(2)} • field ${baseState.maxFieldDeg.toFixed(2)}° • IC ${Number.isFinite(baseIcMm) ? baseIcMm.toFixed(2) : "—"}mm • stop #${baseState.stopIdx}`
       );
@@ -11410,6 +11534,7 @@
           ...ctxBase,
           lutN: DIST_OPT_CFG.lutNOptFast,
           ...(plRelaxedMode ? { plBaselineIntrusionMm, plWorsenTolMm } : {}),
+          ...(bflRelaxedMode ? { bflBaselineShortMm, bflWorsenTolMm } : {}),
         });
         if (!candState.ok) {
           countReject(candState.reason);
@@ -11444,6 +11569,7 @@
             ...ctxBase,
             lutN: DIST_OPT_CFG.lutNOptFinal,
             ...(plRelaxedMode ? { plBaselineIntrusionMm, plWorsenTolMm } : {}),
+            ...(bflRelaxedMode ? { bflBaselineShortMm, bflWorsenTolMm } : {}),
           });
           if (checkState.ok) {
             if (plRelaxedMode && Number.isFinite(plBaselineIntrusionMm) && Number(checkState?.intrusion) > (plBaselineIntrusionMm + plWorsenTolMm)) {
