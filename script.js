@@ -1668,8 +1668,8 @@
   const COCKPIT_CFG = {
     progressBatch: 60,
     minIterations: 80,
-    maxIterations: 120000,
-    defaultIters: 2400,
+    maxIterations: 500000,
+    defaultIters: 12000,
     defaultStepSize: 0.06,
     defaultMacroPasses: 2,
     hardMinValidCenterFrac: 0.28,
@@ -6644,8 +6644,25 @@
 
   function getCockpitSettings() {
     const stepSize = clamp(num(ui.cockpitStep?.value, COCKPIT_CFG.defaultStepSize), 0.01, 0.20);
+    const mainItersRaw = Math.round(num(ui.optIters?.value, COCKPIT_CFG.defaultIters));
+    const cockpitItersRaw = Math.round(num(ui.cockpitIters?.value, NaN));
+    let requestedIters = mainItersRaw;
+    if (Number.isFinite(cockpitItersRaw) && cockpitItersRaw > 0) {
+      const cockpitLooksDefault =
+        Math.abs(cockpitItersRaw - Number(COCKPIT_CFG.defaultIters || 0)) <= 1 ||
+        Math.abs(cockpitItersRaw - 2400) <= 1;
+      if (
+        Number.isFinite(mainItersRaw) && mainItersRaw > 0 &&
+        cockpitLooksDefault &&
+        Math.abs(mainItersRaw - cockpitItersRaw) > 1
+      ) {
+        requestedIters = mainItersRaw;
+      } else {
+        requestedIters = cockpitItersRaw;
+      }
+    }
     const iters = clamp(
-      Math.round(num(ui.cockpitIters?.value, num(ui.optIters?.value, COCKPIT_CFG.defaultIters))),
+      Math.round(num(requestedIters, COCKPIT_CFG.defaultIters)),
       COCKPIT_CFG.minIterations,
       COCKPIT_CFG.maxIterations
     );
@@ -6670,6 +6687,19 @@
       anneal: !!ui.cockpitAnneal?.checked,
       macroPasses,
     };
+  }
+
+  function syncCockpitIterationsFromMain(force = false) {
+    if (!ui.cockpitIters || !ui.optIters) return;
+    const mainVal = Math.round(num(ui.optIters.value, NaN));
+    if (!(Number.isFinite(mainVal) && mainVal > 0)) return;
+    const curCockpit = Math.round(num(ui.cockpitIters.value, NaN));
+    const curLooksDefault =
+      !Number.isFinite(curCockpit) ||
+      Math.abs(curCockpit - 2400) <= 1 ||
+      Math.abs(curCockpit - Number(COCKPIT_CFG.defaultIters || 0)) <= 1;
+    if (!force && !curLooksDefault) return;
+    ui.cockpitIters.value = String(mainVal);
   }
 
   function getCockpitTargets() {
@@ -13142,9 +13172,14 @@
     ui.cockpitSurfaceMode?.addEventListener("change", () => { syncCockpitRangeInputs(); scheduleAutosave(); });
 
     ["optTargetFL","optTargetT","optTargetIC","optIters","distOptIters","optPop","optAutoApply"].forEach((id)=>{
-      ui[id]?.addEventListener("change", () => { scheduleRenderAll(); scheduleAutosave(); });
+      ui[id]?.addEventListener("change", () => {
+        if (id === "optIters") syncCockpitIterationsFromMain(true);
+        scheduleRenderAll();
+        scheduleAutosave();
+      });
       ui[id]?.addEventListener("input", () => {
         // don't rerender constantly for iters/preset; but update merit targets
+        if (id === "optIters") syncCockpitIterationsFromMain(true);
         if (id === "optTargetFL" || id === "optTargetT" || id === "optTargetIC") scheduleRenderAll();
         scheduleAutosave();
       });
@@ -13154,6 +13189,7 @@
       ui[id]?.addEventListener("change", () => { scheduleRenderAll(); scheduleAutosave(); });
       ui[id]?.addEventListener("input", () => { scheduleAutosave(); });
     });
+    syncCockpitIterationsFromMain(true);
     syncCockpitRangeInputs();
   }
 
