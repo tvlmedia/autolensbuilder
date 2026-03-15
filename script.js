@@ -5230,6 +5230,8 @@
     stop.glass = "AIR";
     stop.stop = true;
     stop.type = "STOP";
+    stop.R = 0;
+    stop.t = Math.max(PHYS_CFG.minAirGap, Number(stop.t || 0));
     if (stopIdx > 0) {
       const prev = surfaces[stopIdx - 1];
       const tp = String(prev?.type || "").toUpperCase();
@@ -5359,7 +5361,7 @@
     stop.glass = "AIR";
     stop.stop = true;
     stop.type = "STOP";
-    enforceApertureRadiusCoupling(stop, 1.10);
+    stop.R = 0;
 
     for (let d = 1; d <= 3; d++) {
       const need = Number(stop.ap || desiredStopAp) * (1 - d * 0.10);
@@ -7213,6 +7215,46 @@
     return changedAny;
   }
 
+  function supportStopNeighborhoodForAperture(surfaces, stopIdx, targetStopAp, opts = {}) {
+    if (!Array.isArray(surfaces) || stopIdx < 0 || stopIdx >= surfaces.length) {
+      return { safeStopAp: Number(targetStopAp || 0), minNeigh: Number.NaN, count: 0 };
+    }
+    const stopAp = clamp(Number(targetStopAp || 0), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+    const rings = clamp(Math.round(Number(opts?.rings || 4)), 2, 6);
+    const boost = clamp(Number(opts?.boost || 1.0), 0.7, 1.8);
+    const marginMm = clamp(Number(opts?.marginMm || 0.60), 0.20, 0.85);
+
+    for (let d = 1; d <= rings; d++) {
+      const frac = Math.max(0.48, 0.98 - d * 0.14);
+      const need = stopAp * frac * boost;
+      for (const idx of [stopIdx - d, stopIdx + d]) {
+        if (idx <= 0 || idx >= surfaces.length - 1) continue;
+        const s = surfaces[idx];
+        if (!s || surfaceIsLocked(s)) continue;
+        const t = String(s?.type || "").toUpperCase();
+        if (t === "OBJ" || t === "IMS" || t === "STOP") continue;
+        if (Number(s.ap || 0) < need) {
+          s.ap = clamp(need, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        }
+        enforceApertureRadiusCoupling(s, 1.06 + Math.min(0.04, d * 0.01));
+      }
+    }
+
+    const neigh = [];
+    for (let d = 1; d <= 2; d++) {
+      for (const idx of [stopIdx - d, stopIdx + d]) {
+        if (idx < 0 || idx >= surfaces.length) continue;
+        const s = surfaces[idx];
+        const t = String(s?.type || "").toUpperCase();
+        if (t === "OBJ" || t === "IMS") continue;
+        neigh.push(Math.max(PHYS_CFG.minAperture, Number(s?.ap || 0)));
+      }
+    }
+    const minNeigh = neigh.length ? Math.min(...neigh) : PHYS_CFG.minAperture;
+    const safeStopAp = 1.08 * minNeigh + marginMm;
+    return { safeStopAp, minNeigh, count: neigh.length };
+  }
+
   function progressiveEflScaleTowardTarget(surfaces, targetEfl, wavePreset, opts = {}) {
     if (!Array.isArray(surfaces) || surfaces.length < 3) return false;
     const tgt = Number(targetEfl || 0);
@@ -7241,6 +7283,88 @@
       moved = true;
     }
     return moved;
+  }
+
+  function progressiveTStopTowardTarget(surfaces, targetT, wavePreset, opts = {}) {
+    if (!Array.isArray(surfaces) || surfaces.length < 3) return false;
+    const tgt = Number(targetT || 0);
+    if (!(Number.isFinite(tgt) && tgt > 0.2)) return false;
+    ensureStopExists(surfaces);
+    enforceSingleStopSurface(surfaces);
+    ensureStopInAirBothSides(surfaces);
+
+    const maxSteps = Math.max(3, Math.min(24, Number(opts?.maxSteps || 10) | 0));
+    let improved = false;
+
+    for (let i = 0; i < maxSteps; i++) {
+      computeVertices(surfaces, 0, 0);
+      const parax = estimateEflBflParaxial(surfaces, wavePreset);
+      const efl = Number(parax?.efl);
+      if (!(Number.isFinite(efl) && efl > 1e-6)) break;
+      const tNow = Number(estimateTStopApprox(efl, surfaces));
+      if (!(Number.isFinite(tNow) && tNow > 0)) break;
+      const slow = tNow - tgt;
+      if (slow <= 0.03) break;
+
+      const stopIdx = findStopSurfaceIndex(surfaces);
+      if (stopIdx < 0) break;
+      const snap = clone(surfaces);
+      const stop0 = Math.max(PHYS_CFG.minAperture, Number(surfaces[stopIdx]?.ap || 0));
+      const baseStep = clamp(0.010 + slow * 0.035, 0.010, 0.085);
+      let accepted = false;
+
+      for (let attempt = 0; attempt < 5; attempt++) {
+        surfaces.splice(0, surfaces.length, ...clone(snap));
+        const stop = surfaces[stopIdx];
+        if (!stop) continue;
+
+        const step = baseStep * Math.pow(0.58, attempt);
+        let desiredStop = clamp(
+          stop0 * (1 + step),
+          PHYS_CFG.minAperture,
+          PHYS_CFG.maxAperture
+        );
+
+        const prep = supportStopNeighborhoodForAperture(surfaces, stopIdx, desiredStop, {
+          boost: 1.00 + attempt * 0.08,
+          marginMm: 0.58,
+          rings: 4,
+        });
+        desiredStop = Math.min(desiredStop, prep.safeStopAp);
+        stop.ap = clamp(desiredStop, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        stop.R = 0;
+
+        supportStopNeighborhoodForAperture(surfaces, stopIdx, Number(stop.ap || desiredStop), {
+          boost: 1.02 + attempt * 0.10,
+          marginMm: 0.58,
+          rings: 4,
+        });
+
+        ensureStopInAirBothSides(surfaces);
+        enforceRearMountStart(surfaces);
+        repairLensForPhysicsAfterEflScale(surfaces, { passes: 1 });
+        quickSanity(surfaces);
+
+        computeVertices(surfaces, 0, 0);
+        const phys = evaluatePhysicalConstraints(surfaces);
+        if (!!phys?.hardFail) continue;
+        const eflNew = Number(estimateEflBflParaxial(surfaces, wavePreset)?.efl);
+        const tNew = Number(estimateTStopApprox(eflNew, surfaces));
+        if (Number.isFinite(tNew) && tNew < tNow - 0.001) {
+          accepted = true;
+          improved = true;
+          break;
+        }
+      }
+
+      if (!accepted) {
+        surfaces.splice(0, surfaces.length, ...snap);
+        quickSanity(surfaces);
+        break;
+      }
+    }
+
+    return improved;
   }
 
   function mutateEflCandidate(lensObj, ctx = {}) {
@@ -7287,34 +7411,58 @@
     if (dir > 0) k = Math.max(k, 1.0005);
     if (!(Number.isFinite(k) && k > 0 && Math.abs(k - 1) > 1e-6)) return { ok: false, reason: "scale" };
 
-    cockpitScaleLensByFactor(surfaces, k, { keepAperture: true });
-    repairLensForPhysicsAfterEflScale(surfaces, { passes: 2 });
+    const snap = clone(surfaces);
+    const wavePreset = ctx?.wavePreset || ui.wavePreset?.value || "d";
 
-    // Keep BFL viable while pulling EFL down by expanding image-space gap when needed.
-    if (dir < 0) {
-      const rearIdx = findScratchRearSurfaceIndex(surfaces);
-      if (rearIdx >= 0) {
-        const rear = surfaces[rearIdx];
-        const curBfl = Number(ctx?.currentMetrics?.bfl);
-        const predBfl = Number.isFinite(curBfl) ? (curBfl * k) : NaN;
-        const bflFloor = strict
-          ? (PL_FFD - 0.45)
-          : (PL_FFD - Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0));
-        const safety = strict ? 0.22 : 0.45;
-        if (Number.isFinite(predBfl) && predBfl < (bflFloor + safety)) {
-          const need = (bflFloor + safety) - predBfl;
-          rear.t = clamp(
-            Number(rear.t || 0) + need,
-            Math.max(PHYS_CFG.minAirGap, PL_FFD + 0.8),
-            PL_FFD + 95
-          );
+    for (let attempt = 0; attempt < 6; attempt++) {
+      surfaces.splice(0, surfaces.length, ...clone(snap));
+      let kTry = 1 + (k - 1) * Math.pow(0.58, attempt);
+      if (dir < 0) kTry = Math.min(kTry, 0.9997);
+      if (dir > 0) kTry = Math.max(kTry, 1.0003);
+      if (!(Number.isFinite(kTry) && kTry > 0 && Math.abs(kTry - 1) > 1e-6)) continue;
+
+      cockpitScaleLensByFactor(surfaces, kTry, { keepAperture: true });
+      repairLensForPhysicsAfterEflScale(surfaces, { passes: 2 });
+
+      // Keep BFL viable while pulling EFL down by expanding image-space gap when needed.
+      if (dir < 0) {
+        const rearIdx = findScratchRearSurfaceIndex(surfaces);
+        if (rearIdx >= 0) {
+          const rear = surfaces[rearIdx];
+          const curBfl = Number(ctx?.currentMetrics?.bfl);
+          const predBfl = Number.isFinite(curBfl) ? (curBfl * kTry) : NaN;
+          const bflFloor = strict
+            ? (PL_FFD - 0.45)
+            : (PL_FFD - Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0));
+          const safety = strict ? 0.22 : 0.45;
+          if (Number.isFinite(predBfl) && predBfl < (bflFloor + safety)) {
+            const need = (bflFloor + safety) - predBfl;
+            rear.t = clamp(
+              Number(rear.t || 0) + need,
+              Math.max(PHYS_CFG.minAirGap, PL_FFD + 0.8),
+              PL_FFD + 95
+            );
+          }
         }
       }
+
+      enforceRearMountStart(surfaces);
+      repairLensForPhysicsAfterEflScale(surfaces, { passes: 1 });
+      quickSanity(surfaces);
+
+      const phys = evaluatePhysicalConstraints(surfaces);
+      if (!!phys?.hardFail) continue;
+      const eflTry = Number(estimateEflBflParaxial(surfaces, wavePreset)?.efl);
+      if (!Number.isFinite(eflTry) || eflTry <= 1e-6) continue;
+      if (dir < 0 && !(eflTry < curEfl - 0.001)) continue;
+      if (dir > 0 && !(eflTry > curEfl + 0.001)) continue;
+
+      return { ok: true, kind: "scale", scale: kTry };
     }
-    enforceRearMountStart(surfaces);
-    repairLensForPhysicsAfterEflScale(surfaces, { passes: 1 });
+
+    surfaces.splice(0, surfaces.length, ...snap);
     quickSanity(surfaces);
-    return { ok: true, kind: "scale", scale: k };
+    return { ok: false, reason: "hard" };
   }
 
   function mutateTCandidate(lensObj, ctx = {}) {
@@ -7328,27 +7476,61 @@
     const tgtT = Number(ctx?.targets?.targetT);
     let dir = 1;
     if (Number.isFinite(curT) && Number.isFinite(tgtT)) {
-      if (curT < tgtT * 0.80) dir = -1;
-      else if (curT > tgtT) dir = 1;
-      else dir = Math.random() < 0.75 ? 1 : -1;
+      if (curT > tgtT + 0.01) dir = 1;
+      else if (curT < tgtT * 0.72) dir = -1;
+      else dir = Math.random() < 0.60 ? 1 : -1;
     }
     const pct = randRange(Math.max(0.002, step * 0.05), Math.max(0.006, step * 0.35));
-    const factor = 1 + dir * pct;
-    stop.ap = clamp(Number(stop.ap || 0) * factor, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
-    for (let d = 1; d <= 2; d++) {
-      const idx = stopIdx + d;
-      if (idx <= 0 || idx >= surfaces.length - 1) continue;
-      const s = surfaces[idx];
-      if (!s || surfaceIsLocked(s)) continue;
+    const stopAp0 = Math.max(PHYS_CFG.minAperture, Number(stop.ap || 0));
+    const snap = clone(surfaces);
+    const wavePreset = ctx?.wavePreset || ui.wavePreset?.value || "d";
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      surfaces.splice(0, surfaces.length, ...clone(snap));
+      const stopWork = surfaces[stopIdx];
+      if (!stopWork) continue;
+
+      const pctTry = pct * Math.pow(0.60, attempt);
+      const factor = 1 + dir * pctTry;
+      let targetAp = clamp(stopAp0 * factor, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+
       if (dir > 0) {
-        const floor = Number(stop.ap || 0) * (0.88 - d * 0.12);
-        if (Number(s.ap || 0) < floor) s.ap = clamp(floor, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        const prep = supportStopNeighborhoodForAperture(surfaces, stopIdx, targetAp, {
+          boost: 1.00 + attempt * 0.08,
+          marginMm: 0.58,
+          rings: 4,
+        });
+        targetAp = Math.min(targetAp, prep.safeStopAp);
       }
-      enforceApertureRadiusCoupling(s, 1.08);
+
+      stopWork.ap = targetAp;
+      stopWork.R = 0;
+
+      supportStopNeighborhoodForAperture(surfaces, stopIdx, Number(stopWork.ap || targetAp), {
+        boost: 1.02 + attempt * 0.10,
+        marginMm: 0.58,
+        rings: 4,
+      });
+
+      ensureStopInAirBothSides(surfaces);
+      enforceRearMountStart(surfaces);
+      repairLensForPhysicsAfterEflScale(surfaces, { passes: 1 });
+      quickSanity(surfaces);
+
+      const phys = evaluatePhysicalConstraints(surfaces);
+      if (!!phys?.hardFail) continue;
+
+      const parax = estimateEflBflParaxial(surfaces, wavePreset);
+      const eflNow = Number(parax?.efl);
+      const tNow = Number(estimateTStopApprox(eflNow, surfaces));
+      if (dir > 0 && Number.isFinite(curT) && Number.isFinite(tNow) && !(tNow < curT - 0.0005)) continue;
+
+      return { ok: true, kind: "stop_ap", factor: Number(stopWork.ap || targetAp) / Math.max(1e-6, stopAp0) };
     }
-    enforceRearMountStart(surfaces);
+
+    surfaces.splice(0, surfaces.length, ...snap);
     quickSanity(surfaces);
-    return { ok: true, kind: "stop_ap", factor };
+    return { ok: false, reason: "hard" };
   }
 
   function mutateIcCandidate(lensObj, ctx = {}) {
@@ -7540,10 +7722,7 @@
     const slowBefore = Number.isFinite(before?.T) ? Math.max(0, Number(before.T) - targetT) : Infinity;
     if (!(slowBefore > 1e-4)) return { applied: false, reason: "already_fast", before };
 
-    const eflRef = Number.isFinite(before?.efl) && Number(before.efl) > 1e-6
-      ? Number(before.efl)
-      : Number(targets?.targetEfl || 50);
-    const okSet = setStopForTargetTOnSurfaces(candLens.surfaces, eflRef, targetT);
+    const okSet = progressiveTStopTowardTarget(candLens.surfaces, targetT, wavePreset, { maxSteps: 12 });
     if (!okSet) return { applied: false, reason: "stop" };
     enforceRearMountStart(candLens.surfaces);
     ensureStopInAirBothSides(candLens.surfaces);
@@ -8538,7 +8717,12 @@
     for (const s of surfaces){
       const t = String(s.type || "").toUpperCase();
       if (t === "OBJ" || t === "IMS") continue;
-      s.t = Math.max(PHYS_CFG.minThickness, Number(s.t || 0));
+      if (t === "STOP") {
+        s.R = 0;
+        s.t = Math.max(PHYS_CFG.minAirGap, Number(s.t || 0));
+      } else {
+        s.t = Math.max(PHYS_CFG.minThickness, Number(s.t || 0));
+      }
       s.ap = Math.max(PHYS_CFG.minAperture, Number(s.ap || 0));
       s.glass = resolveGlassName(s.glass);
       clampSurfaceAp(s);
@@ -8915,12 +9099,7 @@
     stop.ap = (curAp < targetAp)
       ? clamp(curAp + (targetAp - curAp) * s, PHYS_CFG.minAperture, PHYS_CFG.maxAperture)
       : clamp(curAp, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
-    {
-      const signR = Math.sign(Number(stop.R || 1)) || 1;
-      const absR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(stop.R || 0)));
-      const needAbsR = (Number(stop.ap || targetAp) / AP_SAFETY) * 1.08;
-      stop.R = signR * clamp(Math.max(absR, needAbsR), PHYS_CFG.minRadius, 600);
-    }
+    stop.R = 0;
 
     // Keep immediate neighbors compatible with a larger stop.
     const neighNeed = Number(stop.ap || targetAp) / 1.08;
@@ -8944,7 +9123,7 @@
   function enforceApertureRadiusCoupling(surface, margin = 1.06) {
     if (!surface) return;
     const t = String(surface?.type || "").toUpperCase();
-    if (t === "OBJ" || t === "IMS") return;
+    if (t === "OBJ" || t === "IMS" || t === "STOP") return;
     const ap = Math.max(PHYS_CFG.minAperture, Number(surface.ap || 0));
     const signR = Math.sign(Number(surface.R || 1)) || 1;
     const absR = Math.max(PHYS_CFG.minRadius, Math.abs(Number(surface.R || 0)));
