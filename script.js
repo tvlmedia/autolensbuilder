@@ -8047,6 +8047,20 @@
       const hardReasonCounts = Object.create(null);
       const batch = Math.max(20, Number(COCKPIT_CFG.progressBatch || 60) | 0);
       const t0 = performance.now();
+      const UI_YIELD_MS = 18;
+      let lastYieldTs = performance.now();
+      const maybeYieldUi = async (iterNow, force = false) => {
+        const now = performance.now();
+        if (!force && (now - lastYieldTs) < UI_YIELD_MS) return false;
+        if (!nested) {
+          const frac = clamp(Number(iterNow || 0) / Math.max(1, iters), 0, 1);
+          const iterTxt = Math.max(0, Math.min(iters, Math.floor(Number(iterNow || 0))));
+          setCockpitProgress(frac, `${label} • ${iterTxt}/${iters}`);
+        }
+        await new Promise((r) => setTimeout(r, 0));
+        lastYieldTs = performance.now();
+        return ((!nested && (!cockpitOptRunning || cockpitStopRequested)) || (nested && cockpitStopRequested));
+      };
 
       setOptLog(
         `${runHeader}\n` +
@@ -8061,6 +8075,10 @@
       for (let i = 1; i <= iters; i++) {
         if ((!nested && (!cockpitOptRunning || cockpitStopRequested)) || (nested && cockpitStopRequested)) break;
         itersRan = i;
+        if ((i % 2) === 0) {
+          const stopNow = await maybeYieldUi(i - 1, false);
+          if (stopNow) break;
+        }
 
         const alpha = i / iters;
         const temp = useAnneal ? (0.8 * (1 - alpha) + 0.12 * alpha) : 0;
@@ -8210,7 +8228,8 @@
               : ""}`
           );
           if (!nested) setCockpitProgress(i / iters, `${label} • ${i}/${iters}`);
-          await new Promise((r) => setTimeout(r, 0));
+          const stopNow = await maybeYieldUi(i, true);
+          if (stopNow) break;
         }
       }
 
@@ -11867,6 +11886,20 @@
 
       const batch = Math.max(20, Number(SHARP_OPT_CFG.progressBatch || 60) | 0);
       const t0 = performance.now();
+      const UI_YIELD_MS = 18;
+      let lastYieldTs = performance.now();
+      const maybeYieldUi = async (iterNow, force = false) => {
+        const now = performance.now();
+        if (!force && (now - lastYieldTs) < UI_YIELD_MS) return false;
+        if (!cockpitMacroRunning) {
+          const frac = clamp(Number(iterNow || 0) / Math.max(1, iters), 0, 1);
+          const iterTxt = Math.max(0, Math.min(iters, Math.floor(Number(iterNow || 0))));
+          setCockpitProgress(frac, `Optimize Sharpness • ${iterTxt}/${iters}`);
+        }
+        await new Promise((r) => setTimeout(r, 0));
+        lastYieldTs = performance.now();
+        return (!sharpOptRunning || sharpOptStopRequested);
+      };
       setOptLog(
         `${runHeader}\n` +
         `running… 0/${iters}\n` +
@@ -11881,6 +11914,10 @@
       for (let i = 1; i <= iters; i++) {
         if (!sharpOptRunning || sharpOptStopRequested) break;
         itersRan = i;
+        if ((i % 2) === 0) {
+          const stopNow = await maybeYieldUi(i - 1, false);
+          if (stopNow) break;
+        }
         const alpha = i / iters;
         const temp = SHARP_OPT_CFG.annealTempStart * (1 - alpha) + SHARP_OPT_CFG.annealTempEnd * alpha;
         const parent = Math.random() < 0.66 ? curLens : bestLens;
@@ -11977,7 +12014,8 @@
             `rejects phys ${rejects.phys} • pl ${rejects.pl} • xover ${rejects.xover} • bfl ${rejects.bfl} • af ${rejects.af} • sharp ${rejects.sharp} • efl ${rejects.efl_guard} • t ${rejects.t_guard} • cov ${rejects.cov_guard} • dist ${rejects.dist_guard} • mut ${rejects.mutation}`
           );
           if (!cockpitMacroRunning) setCockpitProgress(i / Math.max(1, iters), `Optimize Sharpness • ${i}/${iters}`);
-          await new Promise((r) => setTimeout(r, 0));
+          const stopNow = await maybeYieldUi(i, true);
+          if (stopNow) break;
         }
       }
 
@@ -12195,6 +12233,20 @@
 
       const batch = Math.max(20, Number(DIST_OPT_CFG.progressBatch || 80) | 0);
       const t0 = performance.now();
+      const UI_YIELD_MS = 18;
+      let lastYieldTs = performance.now();
+      const maybeYieldUi = async (iterNow, force = false) => {
+        const now = performance.now();
+        if (!force && (now - lastYieldTs) < UI_YIELD_MS) return false;
+        if (!cockpitMacroRunning) {
+          const frac = clamp(Number(iterNow || 0) / Math.max(1, iters), 0, 1);
+          const iterTxt = Math.max(0, Math.min(iters, Math.floor(Number(iterNow || 0))));
+          setCockpitProgress(frac, `Optimize Distortion • ${iterTxt}/${iters}`);
+        }
+        await new Promise((r) => setTimeout(r, 0));
+        lastYieldTs = performance.now();
+        return (!distOptRunning || distOptStopRequested);
+      };
       setOptLog(
         `${runHeader}\n` +
         `running… 0/${iters}\n` +
@@ -12209,6 +12261,10 @@
       for (let i = 1; i <= iters; i++) {
         if (!distOptRunning || distOptStopRequested) break;
         itersRan = i;
+        if ((i % 2) === 0) {
+          const stopNow = await maybeYieldUi(i - 1, false);
+          if (stopNow) break;
+        }
 
         const alpha = i / iters;
         const temp = DIST_OPT_CFG.annealTempStart * (1 - alpha) + DIST_OPT_CFG.annealTempEnd * alpha;
@@ -12304,7 +12360,8 @@
             `rejects phys ${rejects.phys} • pl ${rejects.pl} • xover ${rejects.xover} • bfl ${rejects.bfl} • dist ${rejects.dist} • efl ${rejects.efl_guard} • t ${rejects.t_guard} • cov ${rejects.cov_guard} • mut ${rejects.mutation}`
           );
           if (!cockpitMacroRunning) setCockpitProgress(i / Math.max(1, iters), `Optimize Distortion • ${i}/${iters}`);
-          await new Promise((r) => setTimeout(r, 0));
+          const stopNow = await maybeYieldUi(i, true);
+          if (stopNow) break;
         }
       }
 
@@ -12404,7 +12461,12 @@
     const targetT = num(ui.optTargetT?.value, 2.0);
     const targetIC = Math.max(0, num(ui.optTargetIC?.value, 0));
     const targets = { targetEfl, targetIC, targetT };
-    const iters = Math.max(10, (num(ui.optIters?.value, 2000) | 0));
+    const itersRaw = Math.round(num(ui.optIters?.value, 2000));
+    const iters = clamp(
+      Number.isFinite(itersRaw) ? itersRaw : 2000,
+      10,
+      Number(COCKPIT_CFG.maxIterations || 500000)
+    );
     const mode = (ui.optPop?.value || "safe");
 
     // snapshot sensor settings
@@ -12471,7 +12533,23 @@
 
     const tStart = performance.now();
 
-    const BATCH = 60;
+    const BATCH = Math.max(20, Number(COCKPIT_CFG.progressBatch || 60) | 0);
+    const UI_YIELD_MS = 18;
+    let lastYieldTs = performance.now();
+    let stopRequested = false;
+    const maybeYieldUi = async (iterNow, force = false) => {
+      const now = performance.now();
+      if (!force && (now - lastYieldTs) < UI_YIELD_MS) return false;
+      if (!cockpitOptRunning && !cockpitMacroRunning) {
+        setCockpitProgress(
+          clamp(Number(iterNow || 0) / Math.max(1, iters), 0, 1),
+          `Optimize • ${Math.max(0, Math.min(iters, Number(iterNow || 0) | 0))}/${iters}`
+        );
+      }
+      await new Promise((r) => setTimeout(r, 0));
+      lastYieldTs = performance.now();
+      return !optRunning;
+    };
     let itersRan = 0;
 
     const evalCandidateTier = (lensCand, tier, priRef, baseEvalRef, iterIdx, forceAcc = false) => {
@@ -12523,6 +12601,10 @@
     for (let i = 1; i <= iters; i++){
       if (!optRunning) break;
       itersRan = i;
+      if ((i % 2) === 0) {
+        stopRequested = await maybeYieldUi(i - 1, false);
+        if (stopRequested) break;
+      }
 
       const a = i / iters;
       const temp = temp0 * (1 - a) + temp1 * a;
@@ -12565,6 +12647,11 @@
       }
 
       for (let trIdx = 0; trIdx < tries; trIdx++) {
+        if (!optRunning) { stopRequested = true; break; }
+        if ((trIdx % 3) === 2) {
+          stopRequested = await maybeYieldUi(i - 1 + ((trIdx + 1) / Math.max(1, tries)), false);
+          if (stopRequested) break;
+        }
         const rBase = Math.random();
         let baseLens = cur;
         let baseEvalRef = curEval;
@@ -12674,6 +12761,7 @@
           candPri = buildOptPriority(ce, targets);
         }
       }
+      if (stopRequested || !optRunning) break;
 
       let candAccurate = false;
       let candAccEval = null;
@@ -12950,7 +13038,8 @@
           setCockpitProgress(i / Math.max(1, iters), `Optimize • ${i}/${iters}`);
         }
         // yield to UI
-        await new Promise(r => setTimeout(r, 0));
+        stopRequested = await maybeYieldUi(i, true);
+        if (stopRequested) break;
       }
     }
 
