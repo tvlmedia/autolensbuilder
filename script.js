@@ -7255,6 +7255,54 @@
     return { safeStopAp, minNeigh, count: neigh.length };
   }
 
+  function relaxStopZoneForSpeed(surfaces, stopIdx, strength = 1.0) {
+    if (!Array.isArray(surfaces) || stopIdx < 0 || stopIdx >= surfaces.length) return false;
+    const sGain = clamp(Number(strength || 1), 0.4, 2.2);
+    let changed = false;
+
+    for (let d = 1; d <= 4; d++) {
+      for (const idx of [stopIdx - d, stopIdx + d]) {
+        if (idx <= 0 || idx >= surfaces.length - 1) continue;
+        const s = surfaces[idx];
+        if (!s || surfaceIsLocked(s)) continue;
+        const t = String(s?.type || "").toUpperCase();
+        if (t === "OBJ" || t === "IMS" || t === "STOP") continue;
+
+        // Flatten local curvatures a bit to reduce overlap risk when opening pupils.
+        const R0 = Number(s?.R || 0);
+        if (Math.abs(R0) > 1e-6) {
+          const sign = Math.sign(R0) || 1;
+          const absR = Math.max(PHYS_CFG.minRadius, Math.abs(R0));
+          const grow = 1 + (0.008 + 0.022 * sGain) * Math.max(0.45, 1 - d * 0.16);
+          const R1 = sign * clamp(absR * grow, PHYS_CFG.minRadius, 950);
+          if (Math.abs(R1 - R0) > 1e-9) {
+            s.R = R1;
+            changed = true;
+          }
+        }
+
+        // Add local axial clearance (air/glass) in stop neighborhood.
+        const medAfter = String(resolveGlassName(s?.glass || "AIR")).toUpperCase();
+        const addBase = medAfter === "AIR" ? 0.035 : 0.060;
+        const add = addBase * sGain * Math.max(0.35, 1 - d * 0.18);
+        const t0 = Number(s.t || 0);
+        const t1 = clamp(
+          t0 + add,
+          medAfter === "AIR" ? PHYS_CFG.minAirGap : PHYS_CFG.minGlassCT,
+          48
+        );
+        if (Math.abs(t1 - t0) > 1e-9) {
+          s.t = t1;
+          changed = true;
+        }
+
+        enforceApertureRadiusCoupling(s, 1.06 + Math.min(0.04, d * 0.01));
+      }
+    }
+
+    return changed;
+  }
+
   function progressiveEflScaleTowardTarget(surfaces, targetEfl, wavePreset, opts = {}) {
     if (!Array.isArray(surfaces) || surfaces.length < 3) return false;
     const tgt = Number(targetEfl || 0);
@@ -7339,6 +7387,7 @@
           marginMm: 0.58,
           rings: 4,
         });
+        relaxStopZoneForSpeed(surfaces, stopIdx, 0.95 + attempt * 0.20);
 
         ensureStopInAirBothSides(surfaces);
         enforceRearMountStart(surfaces);
@@ -7446,6 +7495,31 @@
         }
       }
 
+      // Strong BFL rescue after scaling (paraxial actual, not prediction).
+      if (dir < 0) {
+        const rearIdx = findScratchRearSurfaceIndex(surfaces);
+        if (rearIdx >= 0) {
+          const rear = surfaces[rearIdx];
+          const bflFloor = strict
+            ? (PL_FFD - 0.45)
+            : (PL_FFD - Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0));
+          for (let kFix = 0; kFix < 3; kFix++) {
+            computeVertices(surfaces, 0, 0);
+            const pNow = estimateEflBflParaxial(surfaces, wavePreset);
+            const bflNow = Number(pNow?.bfl);
+            if (Number.isFinite(bflNow) && bflNow >= (bflFloor + 0.06)) break;
+            const need = Number.isFinite(bflNow)
+              ? ((bflFloor + 0.28) - bflNow)
+              : 0.9;
+            rear.t = clamp(
+              Number(rear.t || 0) + Math.max(0.10, need),
+              Math.max(PHYS_CFG.minAirGap, PL_FFD + 0.8),
+              PL_FFD + 120
+            );
+          }
+        }
+      }
+
       enforceRearMountStart(surfaces);
       repairLensForPhysicsAfterEflScale(surfaces, { passes: 1 });
       quickSanity(surfaces);
@@ -7474,18 +7548,15 @@
     const step = clamp(Number(ctx?.settings?.stepSize || COCKPIT_CFG.defaultStepSize), 0.01, 0.20);
     const curT = Number(ctx?.currentMetrics?.T);
     const tgtT = Number(ctx?.targets?.targetT);
-    let dir = 1;
-    if (Number.isFinite(curT) && Number.isFinite(tgtT)) {
-      if (curT > tgtT + 0.01) dir = 1;
-      else if (curT < tgtT * 0.72) dir = -1;
-      else dir = Math.random() < 0.60 ? 1 : -1;
+    if (Number.isFinite(curT) && Number.isFinite(tgtT) && curT <= tgtT + 0.01) {
+      return { ok: false, reason: "already_fast" };
     }
+    const dir = 1; // one-way: T optimizer opens pupil only (faster or equal is acceptable)
     const pct = randRange(Math.max(0.002, step * 0.05), Math.max(0.006, step * 0.35));
     const stopAp0 = Math.max(PHYS_CFG.minAperture, Number(stop.ap || 0));
     const snap = clone(surfaces);
-    const wavePreset = ctx?.wavePreset || ui.wavePreset?.value || "d";
 
-    for (let attempt = 0; attempt < 5; attempt++) {
+    for (let attempt = 0; attempt < 8; attempt++) {
       surfaces.splice(0, surfaces.length, ...clone(snap));
       const stopWork = surfaces[stopIdx];
       if (!stopWork) continue;
@@ -7495,42 +7566,56 @@
       let targetAp = clamp(stopAp0 * factor, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
 
       if (dir > 0) {
+        // First free some room around stop, then open stop.
+        relaxStopZoneForSpeed(surfaces, stopIdx, 1.00 + attempt * 0.22);
         const prep = supportStopNeighborhoodForAperture(surfaces, stopIdx, targetAp, {
-          boost: 1.00 + attempt * 0.08,
+          boost: 1.04 + attempt * 0.14,
           marginMm: 0.58,
           rings: 4,
         });
-        targetAp = Math.min(targetAp, prep.safeStopAp);
+        targetAp = Math.min(targetAp, prep.safeStopAp + attempt * 0.10);
       }
+
+      // If still fully clamped, skip to a softer retry.
+      if (!(targetAp > stopAp0 + 1e-4)) continue;
 
       stopWork.ap = targetAp;
       stopWork.R = 0;
 
       supportStopNeighborhoodForAperture(surfaces, stopIdx, Number(stopWork.ap || targetAp), {
-        boost: 1.02 + attempt * 0.10,
+        boost: 1.08 + attempt * 0.16,
         marginMm: 0.58,
         rings: 4,
       });
+      relaxStopZoneForSpeed(surfaces, stopIdx, 1.05 + attempt * 0.24);
 
       ensureStopInAirBothSides(surfaces);
       enforceRearMountStart(surfaces);
       repairLensForPhysicsAfterEflScale(surfaces, { passes: 1 });
       quickSanity(surfaces);
 
-      const phys = evaluatePhysicalConstraints(surfaces);
-      if (!!phys?.hardFail) continue;
-
-      const parax = estimateEflBflParaxial(surfaces, wavePreset);
-      const eflNow = Number(parax?.efl);
-      const tNow = Number(estimateTStopApprox(eflNow, surfaces));
-      if (dir > 0 && Number.isFinite(curT) && Number.isFinite(tNow) && !(tNow < curT - 0.0005)) continue;
-
-      return { ok: true, kind: "stop_ap", factor: Number(stopWork.ap || targetAp) / Math.max(1e-6, stopAp0) };
+      const apNow = Number(stopWork.ap || 0);
+      if (Number.isFinite(apNow) && apNow > stopAp0 + 1e-5) {
+        return { ok: true, kind: "stop_ap", factor: apNow / Math.max(1e-6, stopAp0) };
+      }
     }
 
+    // Last resort: tiny guaranteed opening so engine can still evaluate candidate.
     surfaces.splice(0, surfaces.length, ...snap);
-    quickSanity(surfaces);
-    return { ok: false, reason: "hard" };
+    {
+      const stopLast = surfaces[stopIdx];
+      if (stopLast) {
+        stopLast.ap = clamp(Math.max(stopAp0 * 1.002, stopAp0 + 0.003), PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+        stopLast.R = 0;
+        ensureStopInAirBothSides(surfaces);
+        enforceRearMountStart(surfaces);
+        quickSanity(surfaces);
+        if (Number(stopLast.ap || 0) > stopAp0 + 1e-5) {
+          return { ok: true, kind: "stop_ap_fallback", factor: Number(stopLast.ap || 0) / Math.max(1e-6, stopAp0) };
+        }
+      }
+    }
+    return { ok: false, reason: "saturated" };
   }
 
   function mutateIcCandidate(lensObj, ctx = {}) {
@@ -7704,7 +7789,7 @@
     const errAfter = Math.abs(Number(after?.efl || 0) - targetEfl);
     if (!(errAfter + 0.02 < errBefore)) return { applied: false, reason: "no_gain", before, after };
 
-    const hard = canAcceptDeterministicCandidate(baseLens, before, candLens, after, settings, ["pl", "bfl", "valid"]);
+    const hard = canAcceptDeterministicCandidate(baseLens, before, candLens, after, settings, ["pl", "bfl", "valid", "physics"]);
     if (!hard.ok) return { applied: false, reason: hard.reason || "hard", before, after };
 
     applyDeterministicLocalCandidate("Optimize EFL", candLens, focus, after, {
@@ -7732,7 +7817,7 @@
     const slowAfter = Number.isFinite(after?.T) ? Math.max(0, Number(after.T) - targetT) : Infinity;
     if (!(slowAfter + 0.005 < slowBefore)) return { applied: false, reason: "no_gain", before, after };
 
-    const hard = canAcceptDeterministicCandidate(baseLens, before, candLens, after, settings, ["pl", "bfl", "valid"]);
+    const hard = canAcceptDeterministicCandidate(baseLens, before, candLens, after, settings, ["pl", "bfl", "valid", "physics"]);
     if (!hard.ok) return { applied: false, reason: hard.reason || "hard", before, after };
 
     applyDeterministicLocalCandidate("Optimize T", candLens, focus, after, {
@@ -7805,7 +7890,7 @@
       return { applied: false, reason: "guards", before, after };
     }
 
-    const hard = canAcceptDeterministicCandidate(baseLens, before, candLens, after, settings, ["pl", "bfl", "valid"]);
+    const hard = canAcceptDeterministicCandidate(baseLens, before, candLens, after, settings, ["pl", "bfl", "valid", "physics"]);
     if (!hard.ok) return { applied: false, reason: hard.reason || "hard", before, after };
 
     applyDeterministicLocalCandidate("Optimize Image Circle", candLens, focus, after, {
@@ -7928,6 +8013,7 @@
       let bestIter = 0;
 
       const rejects = { mut: 0, hard: 0, guard: 0 };
+      const mutReasonCounts = Object.create(null);
       const hardReasonCounts = Object.create(null);
       const batch = Math.max(20, Number(COCKPIT_CFG.progressBatch || 60) | 0);
       const t0 = performance.now();
@@ -7968,6 +8054,8 @@
         }) || { ok: false, reason: "mut" };
         if (!mut.ok) {
           rejects.mut++;
+          const mr = String(mut?.reason || "mut").toLowerCase() || "mut";
+          mutReasonCounts[mr] = (mutReasonCounts[mr] || 0) + 1;
           continue;
         }
         if (mut.focus && typeof mut.focus === "object") {
@@ -8021,6 +8109,20 @@
               const k = String(rr || "unknown").toLowerCase() || "unknown";
               hardReasonCounts[k] = (hardReasonCounts[k] || 0) + 1;
             }
+            if ((hard.reasons || []).includes("physics")) {
+              const p = candMetrics?.phys || {};
+              const ov = Number(p?.worstOverlap || 0);
+              const pinch = Number(p?.worstPinch || 0);
+              if (Number.isFinite(ov) && ov > 0.02) {
+                hardReasonCounts.physics_overlap = (hardReasonCounts.physics_overlap || 0) + 1;
+              }
+              if (Number.isFinite(pinch) && pinch > 0.02) {
+                hardReasonCounts.physics_pinch = (hardReasonCounts.physics_pinch || 0) + 1;
+              }
+              if (!(Number(candMetrics?.feasible?.bflShortMm || 0) <= Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0))) {
+                hardReasonCounts.physics_bfl = (hardReasonCounts.physics_bfl || 0) + 1;
+              }
+            }
             continue;
           }
         }
@@ -8070,6 +8172,9 @@
             `best EFL ${Number(bestMetrics?.efl).toFixed(2)}mm • T ${Number(bestMetrics?.T).toFixed(2)} • IC ${Number(bestMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm • field ${Number(bestMetrics?.maxFieldDeg).toFixed(2)}°\n` +
             `best Dist@0.7 ${Number.isFinite(bestMetrics?.distortion?.dist70Pct) ? Number(bestMetrics.distortion.dist70Pct).toFixed(2) : "—"}% • RMS ${Number.isFinite(bestMetrics?.distortion?.rmsPct) ? Number(bestMetrics.distortion.rmsPct).toFixed(2) : "—"}%\n` +
             `rejects mut ${rejects.mut} • hard ${rejects.hard} • guard ${rejects.guard}` +
+            `${rejects.mut > 0
+              ? `\nmut reasons ${Object.entries(mutReasonCounts).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => `${k}:${v}`).join(" • ")}`
+              : ""}` +
             `${rejects.hard > 0
               ? `\nhard reasons ${Object.entries(hardReasonCounts).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => `${k}:${v}`).join(" • ")}`
               : ""}`
@@ -8117,6 +8222,9 @@
         `before EFL ${Number(baseMetrics?.efl).toFixed(2)}mm • T ${Number(baseMetrics?.T).toFixed(2)} • IC ${Number(baseMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm • DistRMS ${Number.isFinite(baseMetrics?.distortion?.rmsPct) ? Number(baseMetrics.distortion.rmsPct).toFixed(2) : "—"}%\n` +
         `after  EFL ${Number(afterMetrics?.efl).toFixed(2)}mm • T ${Number(afterMetrics?.T).toFixed(2)} • IC ${Number(afterMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm • DistRMS ${Number.isFinite(afterMetrics?.distortion?.rmsPct) ? Number(afterMetrics.distortion.rmsPct).toFixed(2) : "—"}%\n` +
         `rejects mut ${rejects.mut} • hard ${rejects.hard} • guard ${rejects.guard}` +
+        `${rejects.mut > 0
+          ? `\nmut reasons ${Object.entries(mutReasonCounts).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `${k}:${v}`).join(" • ")}`
+          : ""}` +
         `${rejects.hard > 0
           ? `\nhard reasons ${Object.entries(hardReasonCounts).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `${k}:${v}`).join(" • ")}`
           : ""}`
@@ -8176,7 +8284,7 @@
       includeSharpness: false,
       autofocusCandidates: false,
       anneal: opts?.anneal,
-      allowedBaselineHardReasons: ["pl", "bfl", "valid"],
+      allowedBaselineHardReasons: ["pl", "bfl", "valid", "physics"],
       nested: !!opts?.nested,
       runContext: opts?.runContext || null,
       silent: !!opts?.silent,
@@ -8216,7 +8324,16 @@
         const eflDrift = Math.abs(Number(m?.efl || 0) - Number(b?.efl || 0));
         const covDrop = Math.max(0, Number(b?.maxFieldDeg || 0) - Number(m?.maxFieldDeg || 0));
         if (eflDrift > eflTol || covDrop > covTol) return { reject: true };
-        return { reject: false, penalty: 3.0 * eflDrift * eflDrift + 6.0 * covDrop * covDrop };
+        const tNow = Number(m?.T);
+        const tBase = Number(b?.T);
+        const tGoal = Number(targets?.targetT || 0);
+        const slowNow = Number.isFinite(tNow) ? Math.max(0, tNow - tGoal) : 99;
+        const slowBase = Number.isFinite(tBase) ? Math.max(0, tBase - tGoal) : 99;
+        const worsen = Math.max(0, slowNow - slowBase);
+        return {
+          reject: false,
+          penalty: 3.0 * eflDrift * eflDrift + 6.0 * covDrop * covDrop + 20.0 * worsen * worsen,
+        };
       },
       iterations: Number(opts?.iterations || settings.iterations),
       includeUsableIC: false,
@@ -8224,7 +8341,7 @@
       includeSharpness: false,
       autofocusCandidates: false,
       anneal: opts?.anneal,
-      allowedBaselineHardReasons: ["pl", "bfl", "valid"],
+      allowedBaselineHardReasons: ["pl", "bfl", "valid", "physics"],
       nested: !!opts?.nested,
       runContext: opts?.runContext || null,
       silent: !!opts?.silent,
@@ -8282,7 +8399,7 @@
       includeSharpness: false,
       autofocusCandidates: false,
       anneal: opts?.anneal,
-      allowedBaselineHardReasons: ["pl", "bfl", "valid"],
+      allowedBaselineHardReasons: ["pl", "bfl", "valid", "physics"],
       nested: !!opts?.nested,
       runContext: opts?.runContext || null,
       silent: !!opts?.silent,
@@ -10834,6 +10951,20 @@
       const candValid = Number(candMetrics?.feasible?.validCenterFrac);
       if (!Number.isFinite(baseValid) || !Number.isFinite(candValid)) return { ok: false, reason: "valid-nan" };
       if (candValid < (baseValid - 0.03)) return { ok: false, reason: "valid-worse" };
+    }
+    if (nowReasons.includes("physics")) {
+      const basePhysPenalty = Number(baseMetrics?.phys?.penalty || 0);
+      const candPhysPenalty = Number(candMetrics?.phys?.penalty || 0);
+      const baseWorstOv = Number(baseMetrics?.phys?.worstOverlap || 0);
+      const candWorstOv = Number(candMetrics?.phys?.worstOverlap || 0);
+      const baseWorstPinch = Number(baseMetrics?.phys?.worstPinch || 0);
+      const candWorstPinch = Number(candMetrics?.phys?.worstPinch || 0);
+      if (!Number.isFinite(basePhysPenalty) || !Number.isFinite(candPhysPenalty)) return { ok: false, reason: "physics-nan" };
+      if (!Number.isFinite(baseWorstOv) || !Number.isFinite(candWorstOv)) return { ok: false, reason: "physics-ov-nan" };
+      if (!Number.isFinite(baseWorstPinch) || !Number.isFinite(candWorstPinch)) return { ok: false, reason: "physics-pinch-nan" };
+      if (candPhysPenalty > (basePhysPenalty + 45)) return { ok: false, reason: "physics-penalty-worse" };
+      if (candWorstOv > (baseWorstOv + 0.06)) return { ok: false, reason: "physics-overlap-worse" };
+      if (candWorstPinch > (baseWorstPinch + 0.06)) return { ok: false, reason: "physics-pinch-worse" };
     }
 
     return { ok: true, reason: "relaxed" };
