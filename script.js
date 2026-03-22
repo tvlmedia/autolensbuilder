@@ -4099,13 +4099,56 @@
     }
     ctx.closePath();
     ctx.fill();
-
+    // Draw only true refractive boundaries (front/back curves), not side edges.
     ctx.lineWidth = 2;
     ctx.strokeStyle = "rgba(220,235,255,0.55)";
     ctx.shadowColor = "rgba(70,140,255,0.35)";
     ctx.shadowBlur = 10;
+    ctx.beginPath();
+    let pf = worldToScreen(front[0], world);
+    ctx.moveTo(pf.x, pf.y);
+    for (let i = 1; i < front.length; i++) {
+      pf = worldToScreen(front[i], world);
+      ctx.lineTo(pf.x, pf.y);
+    }
+    ctx.stroke();
+    ctx.beginPath();
+    let pb = worldToScreen(back[0], world);
+    ctx.moveTo(pb.x, pb.y);
+    for (let i = 1; i < back.length; i++) {
+      pb = worldToScreen(back[i], world);
+      ctx.lineTo(pb.x, pb.y);
+    }
     ctx.stroke();
     ctx.restore();
+  }
+
+  function buildElementDrawClipMap(surfaces) {
+    const apClip = new Map();
+    if (!Array.isArray(surfaces) || surfaces.length < 2) return apClip;
+    for (let i = 0; i < surfaces.length - 1; i++) {
+      const sA = surfaces[i];
+      const sB = surfaces[i + 1];
+      const typeA = String(sA?.type || "").toUpperCase();
+      const typeB = String(sB?.type || "").toUpperCase();
+      if (typeA === "OBJ" || typeB === "OBJ" || typeA === "IMS" || typeB === "IMS") continue;
+      const medium = String(sA?.glass || "AIR").toUpperCase();
+      if (medium === "AIR") continue;
+
+      const apA = Math.max(0, Number(sA?.ap || 0));
+      const apB = Math.max(0, Number(sB?.ap || 0));
+      const limA = maxApForSurface(sA);
+      const limB = maxApForSurface(sB);
+      let apRegion = Math.max(0.01, Math.min(apA, apB, limA, limB));
+      if (Math.abs(Number(sA?.R || 0)) > 1e-9 && Math.abs(Number(sB?.R || 0)) > 1e-9) {
+        apRegion = Math.min(apRegion, maxNonOverlappingSemiDiameter(sA, sB, 0.10));
+      }
+      const prevA = apClip.get(i);
+      const prevB = apClip.get(i + 1);
+      apClip.set(i, Number.isFinite(prevA) ? Math.min(prevA, apRegion) : apRegion);
+      apClip.set(i + 1, Number.isFinite(prevB) ? Math.min(prevB, apRegion) : apRegion);
+    }
+    return apClip;
   }
 
   function drawElementsClosed(world, surfaces) {
@@ -4146,14 +4189,15 @@
     }
   }
 
-  function drawSurface(world, s) {
+  function drawSurface(world, s, apOverride = null) {
     if (!ctx) return;
     ctx.save();
     ctx.lineWidth = 1.25;
     ctx.strokeStyle = "rgba(255,255,255,.22)";
 
     const vx = s.vx;
-    const ap = Math.min(Math.max(0, Number(s.ap || 0)), maxApForSurface(s));
+    const apRaw = Number.isFinite(apOverride) ? Number(apOverride) : Number(s.ap || 0);
+    const ap = Math.min(Math.max(0, apRaw), maxApForSurface(s));
 
     if (Math.abs(s.R) < 1e-9) {
       const a = worldToScreen({ x: vx, y: -ap }, world);
@@ -4188,8 +4232,11 @@
   }
 
   function drawLens(world, surfaces) {
+    const apClip = buildElementDrawClipMap(surfaces);
     drawElementsClosed(world, surfaces);
-    for (const s of surfaces) drawSurface(world, s);
+    for (let i = 0; i < surfaces.length; i++) {
+      drawSurface(world, surfaces[i], apClip.get(i));
+    }
   }
 
   function drawRays(world, rayTraces, sensorX) {
@@ -9591,6 +9638,58 @@
     }
   }
 
+  function hasExplicitSurfaceFunction(s) {
+    const t = String(s?.type || "").toUpperCase();
+    return (
+      t === "OBJ" ||
+      t === "IMS" ||
+      t === "STOP" ||
+      t === "MECH" ||
+      t === "BAFFLE" ||
+      t === "HOUSING" ||
+      t === "REF" ||
+      t === "PLANE"
+    );
+  }
+
+  function cleanupRearOrphanAirSurfaces(surfaces) {
+    if (!Array.isArray(surfaces) || surfaces.length < 3) return false;
+    const imsIdx = surfaces.findIndex((s) => String(s?.type || "").toUpperCase() === "IMS");
+    if (imsIdx <= 1) return false;
+
+    // Last "front of glass" surface: medium after this surface is non-AIR.
+    let lastGlassFrontIdx = -1;
+    for (let i = 0; i < imsIdx; i++) {
+      const s = surfaces[i];
+      const t = String(s?.type || "").toUpperCase();
+      if (t === "OBJ" || t === "IMS") continue;
+      const g = String(resolveGlassName(s?.glass || "AIR")).toUpperCase();
+      if (g !== "AIR") lastGlassFrontIdx = i;
+    }
+    if (lastGlassFrontIdx < 0) return false;
+
+    // Back surface of the last real element should be directly after lastGlassFrontIdx.
+    const expectedBackIdx = lastGlassFrontIdx + 1;
+    if (expectedBackIdx >= imsIdx) return false;
+
+    let changed = false;
+    for (let i = imsIdx - 1; i > expectedBackIdx; i--) {
+      const s = surfaces[i];
+      const t = String(s?.type || "").toUpperCase();
+      if (hasExplicitSurfaceFunction(s)) continue;
+      const g = String(resolveGlassName(s?.glass || "AIR")).toUpperCase();
+      const R = Number(s?.R || 0);
+      // Remove orphan non-functional AIR surfaces between last real element and IMS.
+      // This includes curved AIR leftovers and redundant AIR stubs.
+      if (g === "AIR" && (Math.abs(R) > 1e-9 || t === "")) {
+        surfaces.splice(i, 1);
+        changed = true;
+      }
+    }
+
+    return changed;
+  }
+
   function quickSanity(surfaces){
     // avoid negative thickness & crazy apertures
     for (const s of surfaces){
@@ -9619,6 +9718,9 @@
       if (ref > 0.5 && Number(b.ap || 0) < 0.45 * ref) b.ap = 0.45 * ref;
       clampSurfaceAp(b);
     }
+
+    // Hard sequence rule: no orphan AIR surfaces behind the last real glass element.
+    cleanupRearOrphanAirSurfaces(surfaces);
   }
 
   function captureTopology(lensObj) {
