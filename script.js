@@ -9191,7 +9191,24 @@
     const stopNow = findStopSurfaceIndex(candidateLens.surfaces);
     if (Number.isFinite(ctx?.stopIdx) && stopNow !== Number(ctx.stopIdx)) return { ok: false, reason: "stop_moved" };
     const hard = failsHardConstraints(candidateLens.surfaces, candidateMetrics, { strictness });
-    if (hard.fail) return { ok: false, reason: `hard_${String(hard.reasons?.[0] || "invalid")}` };
+    if (hard.fail) {
+      const allowRelax = !!ctx?.allowBaselineHardRelax;
+      const baseHard = ctx?.baseHardEval || { fail: false, reasons: [] };
+      const allowed = ctx?.allowedBaselineHardReasons || [];
+      if (!(allowRelax && baseHard?.fail)) {
+        return { ok: false, reason: `hard_${String(hard.reasons?.[0] || "invalid")}` };
+      }
+      const relax = canRelaxHardFailureForBaseline(
+        hard,
+        baseHard,
+        candidateMetrics,
+        baselineMetrics,
+        allowed
+      );
+      if (!relax?.ok) {
+        return { ok: false, reason: `hard_${String(hard.reasons?.[0] || "invalid")}` };
+      }
+    }
 
     const primaryCur = localPrimaryScore(modeKey, currentMetrics, targets, sensor);
     const primaryCand = localPrimaryScore(modeKey, candidateMetrics, targets, sensor);
@@ -9275,6 +9292,25 @@
     });
     const stopIdx = findStopSurfaceIndex(baseLens.surfaces);
     const mutable = buildMutableSurfaceList(baseLens, modeKey, { settings, profile: prof, stopIdx });
+    if (!mutable.length) {
+      return {
+        baseLens,
+        baseMetrics,
+        baseScore: localPrimaryScore(modeKey, baseMetrics, targets, sensor) + computeDesignDriftPenalty(baseLens, baseLens, prof),
+        bestLens: clone(baseLens),
+        bestMetrics: baseMetrics,
+        bestScore: localPrimaryScore(modeKey, baseMetrics, targets, sensor) + computeDesignDriftPenalty(baseLens, baseLens, prof),
+        bestIter: 0,
+        itersRan: 0,
+        iterations,
+        rejects: {},
+        modeKey,
+        profile: prof,
+      };
+    }
+    const baseHardEval = failsHardConstraints(baseLens.surfaces, baseMetrics, { strictness: String(settings?.strictness || "normal") });
+    const allowedBaselineHardReasons = normalizeHardReasonList(baseHardEval?.reasons || []);
+    const allowBaselineHardRelax = !!baseHardEval?.fail && allowedBaselineHardReasons.length > 0;
     let curLens = clone(baseLens);
     let curMetrics = baseMetrics;
     let curScore = localPrimaryScore(modeKey, curMetrics, targets, sensor) + computeDesignDriftPenalty(curLens, baseLens, prof);
@@ -9354,6 +9390,9 @@
               settings,
               profile: prof,
               stopIdx,
+              allowBaselineHardRelax,
+              baseHardEval,
+              allowedBaselineHardReasons,
             });
             if (!ev.ok) {
               incReject(ev.reason || "reject");
@@ -9389,7 +9428,6 @@
 
       if (!improvedPass) {
         noImprovePasses++;
-        if (noImprovePasses >= Number(prof.maxNoImprovePasses || 2)) break;
       } else {
         noImprovePasses = 0;
       }
