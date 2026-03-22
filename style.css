@@ -470,6 +470,10 @@ body{
 }
 
 .canvasTitle .hint{ margin-top:4px; }
+.canvasTitle .meritUnderTitle{
+  margin-top:10px;
+  display:inline-flex;
+}
 
 .topBadges{
   display:flex;
