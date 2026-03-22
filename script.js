@@ -2333,15 +2333,15 @@
 
   function formatLutDistortionBadgeText(distMetrics, compact = false) {
     if (!distMetrics || !Number.isFinite(distMetrics.distPctAt70)) {
-      return compact ? "DIST@0.7D — • RMS —" : "DIST @0.7D: — • RMS: —";
+      return compact ? "Distortion @0.7D — • gem. —" : "Distortion @0.7D: — • Gemiddeld: —";
     }
     const d70 = Number(distMetrics.distPctAt70).toFixed(2);
     const rms = Number.isFinite(distMetrics.rmsDistPct) ? Number(distMetrics.rmsDistPct).toFixed(2) : "—";
     const flavor = String(distMetrics?.flavor || "neutral");
     const tail = (flavor === "barrel" || flavor === "pincushion") ? ` • ${flavor}` : "";
     return compact
-      ? `DIST@0.7D ${d70}% • RMS ${rms}%${tail}`
-      : `DIST @0.7D: ${d70}% • RMS: ${rms}%${tail}`;
+      ? `Distortion @0.7D ${d70}% • gem. ${rms}%${tail}`
+      : `Distortion @0.7D: ${d70}% • Gemiddeld: ${rms}%${tail}`;
   }
 
   function traceBundleAtFieldForSoftIc(surfaces, fieldDeg, wavePreset, sensorX, raysPerBundle) {
@@ -3555,15 +3555,15 @@
 
   function formatEnvelopeBadgeText(envelope, compact = false) {
     if (!envelope || !Number.isFinite(envelope.frontOD) || !Number.isFinite(envelope.maxOD)) {
-      return compact ? "OD F— • M—" : "Front OD: — • Max OD: —";
+      return compact ? "OD front — • max —" : "OD: front — • max —";
     }
     const f = Number(envelope.frontOD).toFixed(1);
     const m = Number(envelope.maxOD).toFixed(1);
     const rear = Number.isFinite(envelope.rearOD) ? Number(envelope.rearOD).toFixed(1) : "—";
     const hardTag = envelope.hardInvalid ? " ❌" : "";
     return compact
-      ? `OD F${f} • M${m}${hardTag}`
-      : `Front OD: ${f}mm • Max OD: ${m}mm • Rear OD: ${rear}mm${hardTag}`;
+      ? `OD front ${f}mm • max ${m}mm${hardTag}`
+      : `OD: front ${f}mm • max ${m}mm • rear ${rear}mm${hardTag}`;
   }
 
   function formatRealismBadgeText(realismEval, compact = false) {
@@ -4663,7 +4663,7 @@
     if (ui.efl) ui.efl.textContent = `Focal Length: ${efl == null ? "—" : efl.toFixed(2)}mm`;
     if (ui.bfl) ui.bfl.textContent = `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstop) {
-      ui.tstop.textContent = `T_eff≈ ${T == null ? "—" : "T" + T.toFixed(2)} (${Tgeom == null ? "geom —" : "geom T" + Tgeom.toFixed(2)})`;
+      ui.tstop.textContent = `T-stop: effectief ${T == null ? "—" : "T" + T.toFixed(2)} • berekend ${Tgeom == null ? "—" : "T" + Tgeom.toFixed(2)}`;
     }
     if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
     if (ui.softIC) ui.softIC.textContent = softIcDetailTxt;
@@ -4675,7 +4675,7 @@
 
     if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `Focal Length: ${efl == null ? "—" : efl.toFixed(2)}mm`;
     if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
-    if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T_eff≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
+    if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T-stop: effectief ${T == null ? "—" : "T" + T.toFixed(2)} • berekend ${Tgeom == null ? "—" : "T" + Tgeom.toFixed(2)}`;
     if (ui.softICTop) ui.softICTop.textContent = softIcTxt;
     if (ui.fovTop) ui.fovTop.textContent = fovTxt;
     if (ui.distTop) ui.distTop.textContent = distBadgeTopText;
@@ -4705,7 +4705,7 @@
     if (ui.status) {
       ui.status.textContent =
         `Focal Length ${efl == null ? "—" : efl.toFixed(2)}mm • ` +
-        `T ${T == null ? "—" : T.toFixed(2)} • ` +
+        `T-stop eff ${T == null ? "—" : "T" + T.toFixed(2)} • calc ${Tgeom == null ? "—" : "T" + Tgeom.toFixed(2)} • ` +
         `${softIcTxt} • ` +
         `${fovTxt} • ` +
         `Physical Correct ${(!phys.hardFail && !rayCross.invalid && !realismPenaltyRes.hardInvalid) ? "YES" : "NO"}`;
@@ -4803,7 +4803,7 @@
     drawSensor(world, sensorX, halfH);
 
     const eflTxt = efl == null ? "—" : `${efl.toFixed(2)}mm`;
-    const tTxt   = T == null ? "—" : `T_eff ${T.toFixed(2)}`;
+    const tTxt = `T-stop eff ${T == null ? "—" : "T" + T.toFixed(2)} • berekend ${Tgeom == null ? "—" : "T" + Tgeom.toFixed(2)}`;
     const focusTxt = (focusMode === "cam")
       ? `CamFocus ${sensorX.toFixed(2)}mm`
       : `LensFocus ${lensShift.toFixed(2)}mm`;
@@ -11225,12 +11225,12 @@
     const c = Number(sharp?.centerRmsMm);
     const e = Number(sharp?.edgeRmsMm);
     if (!Number.isFinite(c) && !Number.isFinite(e)) {
-      return compact ? "RMS C/E — / —" : "RMS C/E: — / — mm";
+      return compact ? "Sharpness C/E — / —" : "Sharpness C/E: — / — mm";
     }
     const cTxt = Number.isFinite(c) ? c.toFixed(3) : "—";
     const eTxt = Number.isFinite(e) ? e.toFixed(3) : "—";
-    if (compact) return `RMS C/E ${cTxt} / ${eTxt}`;
-    return `RMS C/E: ${cTxt} / ${eTxt} mm`;
+    if (compact) return `Sharpness C/E ${cTxt} / ${eTxt}`;
+    return `Sharpness C/E: ${cTxt} / ${eTxt} mm`;
   }
 
   function getSharpnessBadgeCached({
