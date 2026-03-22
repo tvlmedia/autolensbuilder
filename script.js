@@ -8538,6 +8538,44 @@
       : 999;
     const sharpWorse = Math.max(0, sharpScore - sharpBaseScore);
 
+    const reasonPenalty = (arr) => {
+      const rs = Array.isArray(arr) ? arr : [];
+      let p = 0;
+      for (const rr of rs) {
+        const r = String(rr || "").toLowerCase();
+        if (!r) continue;
+        if (r === "physics") p += 280;
+        else if (r === "pl") p += 220;
+        else if (r === "bfl") p += 180;
+        else if (r === "xover") p += 220;
+        else if (r === "valid" || r === "vignette") p += 120;
+        else if (r === "stop") p += 360;
+        else if (r === "efl" || r === "t" || r === "lens" || r === "metrics") p += 500;
+        else p += 80;
+      }
+      return p;
+    };
+    const feasibilityDebt = (obj) => {
+      const fe = obj?.feasible || {};
+      const rs = Array.isArray(fe?.reasons) ? fe.reasons : [];
+      const intr = Math.max(0, Number(fe?.plIntrusionMm || 0));
+      const bflShort = Math.max(0, Number(fe?.bflShortMm || 0));
+      const valid = clamp(Number(fe?.validCenterFrac || 0), 0, 1);
+      const physP = Math.max(0, Number(obj?.phys?.penalty || 0));
+      const cross = Math.max(0, Number(obj?.cross?.crossPairs || fe?.crossPairs || 0));
+      return (
+        reasonPenalty(rs) +
+        1.8 * intr * intr +
+        1.6 * bflShort * bflShort +
+        180 * Math.pow(Math.max(0, 0.28 - valid), 2) +
+        220 * cross +
+        0.01 * physP
+      );
+    };
+    const feasDebt = feasibilityDebt(m);
+    const baseFeasDebt = feasibilityDebt(b);
+    const feasWorse = Math.max(0, feasDebt - baseFeasDebt);
+
     const key = String(mode || "").toLowerCase();
     if (key === "efl") {
       return (
@@ -8545,7 +8583,9 @@
         2.0 * (tSlow * tSlow) +
         8.0 * (covDrop * covDrop) +
         2.0 * (icDrop * icDrop) +
-        0.25 * (distWorse * distWorse)
+        0.25 * (distWorse * distWorse) +
+        0.35 * feasDebt +
+        0.60 * feasWorse
       );
     }
     if (key === "t") {
@@ -8554,7 +8594,9 @@
         3.5 * (eflDrift * eflDrift) +
         8.0 * (covDrop * covDrop) +
         3.0 * (icDrop * icDrop) +
-        0.20 * (distWorse * distWorse)
+        0.20 * (distWorse * distWorse) +
+        0.35 * feasDebt +
+        0.60 * feasWorse
       );
     }
     if (key === "ic") {
@@ -8563,7 +8605,9 @@
         2.0 * (eflDrift * eflDrift) +
         2.5 * (tDrift * tDrift) +
         3.0 * (distWorse * distWorse) +
-        1.5 * (dist70Worse * dist70Worse)
+        1.5 * (dist70Worse * dist70Worse) +
+        0.30 * feasDebt +
+        0.45 * feasWorse
       );
     }
     if (key === "dist") {
@@ -8574,7 +8618,9 @@
         8.0 * (tDrift * tDrift) +
         8.0 * (covDrop * covDrop) +
         3.0 * (icDrop * icDrop) +
-        1.2 * (sharpWorse * sharpWorse)
+        1.2 * (sharpWorse * sharpWorse) +
+        0.30 * feasDebt +
+        0.45 * feasWorse
       );
     }
     return (
@@ -8583,7 +8629,9 @@
       6.0 * (tDrift * tDrift) +
       8.0 * (covDrop * covDrop) +
       3.0 * (icDrop * icDrop) +
-      2.0 * (distWorse * distWorse)
+      2.0 * (distWorse * distWorse) +
+      0.32 * feasDebt +
+      0.50 * feasWorse
     );
   }
 
@@ -8593,30 +8641,43 @@
     const cReasons = Array.isArray(c?.reasons) ? c.reasons.map((r) => String(r || "").toLowerCase()) : [];
     const bReasons = Array.isArray(b?.reasons) ? b.reasons.map((r) => String(r || "").toLowerCase()) : [];
     const bSet = new Set(bReasons);
+    const baselineInvalid = bReasons.length > 0;
 
-    if (!bReasons.length && cReasons.length) return `hard_${cReasons[0] || "invalid"}`;
-    for (const r of cReasons) {
-      if (!bSet.has(r)) return `new_${r}`;
+    if (!baselineInvalid && cReasons.length) return `hard_${cReasons[0] || "invalid"}`;
+    if (baselineInvalid) {
+      const criticalNew = new Set(["lens", "metrics", "stop", "efl", "t"]);
+      for (const r of cReasons) {
+        if (!bSet.has(r) && criticalNew.has(r)) return `new_${r}`;
+      }
+      if (cReasons.length > (bReasons.length + 2)) return "hard_more";
+    } else {
+      for (const r of cReasons) {
+        if (!bSet.has(r)) return `new_${r}`;
+      }
     }
 
     const cIntr = Number(c?.plIntrusionMm || 0);
     const bIntr = Number(b?.plIntrusionMm || 0);
-    if (bSet.has("pl") && Number.isFinite(cIntr) && Number.isFinite(bIntr) && cIntr > bIntr + 0.20) return "pl_worse";
+    const plWorseTol = baselineInvalid ? 2.50 : 0.20;
+    if (bSet.has("pl") && Number.isFinite(cIntr) && Number.isFinite(bIntr) && cIntr > bIntr + plWorseTol) return "pl_worse";
     const cBfl = Number(c?.bflShortMm || 0);
     const bBfl = Number(b?.bflShortMm || 0);
-    if (bSet.has("bfl") && Number.isFinite(cBfl) && Number.isFinite(bBfl) && cBfl > bBfl + 0.35) return "bfl_worse";
+    const bflWorseTol = baselineInvalid ? 2.50 : 0.35;
+    if (bSet.has("bfl") && Number.isFinite(cBfl) && Number.isFinite(bBfl) && cBfl > bBfl + bflWorseTol) return "bfl_worse";
     const cValid = Number(c?.validCenterFrac || 0);
     const bValid = Number(b?.validCenterFrac || 0);
-    if (bSet.has("valid") && Number.isFinite(cValid) && Number.isFinite(bValid) && cValid < bValid - 0.10) return "valid_worse";
+    const validTol = baselineInvalid ? 0.18 : 0.10;
+    if (bSet.has("valid") && Number.isFinite(cValid) && Number.isFinite(bValid) && cValid < bValid - validTol) return "valid_worse";
     if (bSet.has("xover")) {
       const cCross = Number(candMetrics?.cross?.crossPairs || c?.crossPairs || 0);
       const bCross = Number(baseMetrics?.cross?.crossPairs || b?.crossPairs || 0);
-      if (cCross > bCross) return "xover_worse";
+      if (cCross > bCross + (baselineInvalid ? 1 : 0)) return "xover_worse";
     }
     if (bSet.has("physics")) {
       const cPhys = Number(candMetrics?.phys?.penalty || 0);
       const bPhys = Number(baseMetrics?.phys?.penalty || 0);
-      if (Number.isFinite(cPhys) && Number.isFinite(bPhys) && cPhys > bPhys + 120) return "physics_worse";
+      const physTol = baselineInvalid ? 1200 : 120;
+      if (Number.isFinite(cPhys) && Number.isFinite(bPhys) && cPhys > bPhys + physTol) return "physics_worse";
     }
 
     const m = String(mode || "").toLowerCase();
@@ -8624,18 +8685,18 @@
     const tDrift = Math.abs(Number(candMetrics?.T || 0) - Number(baseMetrics?.T || 0));
     const covDrop = Math.max(0, Number(baseMetrics?.maxFieldDeg || 0) - Number(candMetrics?.maxFieldDeg || 0));
     if (m === "efl") {
-      if (tDrift > 1.80) return "guard_t";
-      if (covDrop > 2.80) return "guard_cov";
+      if (tDrift > (baselineInvalid ? 2.80 : 1.80)) return "guard_t";
+      if (covDrop > (baselineInvalid ? 4.50 : 2.80)) return "guard_cov";
     } else if (m === "t") {
-      if (eflDrift > 5.00) return "guard_efl";
-      if (covDrop > 2.80) return "guard_cov";
+      if (eflDrift > (baselineInvalid ? 9.00 : 5.00)) return "guard_efl";
+      if (covDrop > (baselineInvalid ? 4.50 : 2.80)) return "guard_cov";
     } else if (m === "ic") {
-      if (eflDrift > 6.50) return "guard_efl";
-      if (tDrift > 1.20) return "guard_t";
+      if (eflDrift > (baselineInvalid ? 12.0 : 6.50)) return "guard_efl";
+      if (tDrift > (baselineInvalid ? 2.00 : 1.20)) return "guard_t";
     } else if (m === "dist" || m === "sharp") {
-      if (eflDrift > 1.50) return "guard_efl";
-      if (tDrift > 0.35) return "guard_t";
-      if (covDrop > 1.20) return "guard_cov";
+      if (eflDrift > (baselineInvalid ? 4.00 : 1.50)) return "guard_efl";
+      if (tDrift > (baselineInvalid ? 1.10 : 0.35)) return "guard_t";
+      if (covDrop > (baselineInvalid ? 2.80 : 1.20)) return "guard_cov";
     }
     return "";
   }
@@ -8750,12 +8811,6 @@
       localRepairForHardConstraints(cand.surfaces, { passes: attempt < 2 ? 2 : 1 });
       quickSanity(cand.surfaces);
 
-      computeVertices(cand.surfaces, 0, 0);
-      const phys = evaluatePhysicalConstraints(cand.surfaces);
-      if (!!phys?.hardFail) {
-        lastReason = "hard";
-        continue;
-      }
       return { ok: true, lens: cand };
     }
 
@@ -8814,9 +8869,9 @@
       const autofocusCandidates = (key === "sharp");
       const targetICDisplay = Math.max(Number(targets?.targetIC || 0), Math.hypot(sensor.w, sensor.h));
 
-      const baseLens = sanitizeLens(clone(lens));
-      const topology = captureTopology(baseLens);
-      const baseMetrics = computeMetrics({
+      let baseLens = sanitizeLens(clone(lens));
+      let topology = captureTopology(baseLens);
+      let baseMetrics = computeMetrics({
         surfaces: baseLens.surfaces,
         wavePreset,
         focusMode: focus.focusMode,
@@ -8834,6 +8889,56 @@
         autofocusOptions: SHARP_OPT_CFG.autofocus,
         useCache: false,
       });
+      const baseReasons0 = Array.isArray(baseMetrics?.feasible?.reasons)
+        ? baseMetrics.feasible.reasons.map((r) => String(r || "").toLowerCase())
+        : [];
+      if (baseReasons0.length) {
+        const repaired = sanitizeLens(clone(baseLens));
+        localRepairForHardConstraints(repaired.surfaces, { passes: 3 });
+        if (baseReasons0.includes("pl") || baseReasons0.includes("bfl")) {
+          const rearIdx = findScratchRearSurfaceIndex(repaired.surfaces);
+          if (rearIdx >= 0) {
+            const rear = repaired.surfaces[rearIdx];
+            rear.glass = "AIR";
+            rear.t = clamp(
+              Math.max(Number(rear.t || 0), PL_FFD + 2.0),
+              Math.max(PHYS_CFG.minAirGap, PL_FFD + 0.8),
+              PL_FFD + 120
+            );
+          }
+        }
+        repairLensForPhysicsAfterEflScale(repaired.surfaces, { passes: 2 });
+        ensureStopExists(repaired.surfaces);
+        enforceSingleStopSurface(repaired.surfaces);
+        ensureStopInAirBothSides(repaired.surfaces);
+        enforceRearMountStart(repaired.surfaces);
+        quickSanity(repaired.surfaces);
+        const repairedMetrics = computeMetrics({
+          surfaces: repaired.surfaces,
+          wavePreset,
+          focusMode: focus.focusMode,
+          sensorX: focus.sensorX,
+          lensShift: focus.lensShift,
+          sensorW: sensor.w,
+          sensorH: sensor.h,
+          objDist: COCKPIT_CFG.defaultObjDistMm,
+          rayCount: rayCountEval,
+          lutN: lutNEval,
+          includeUsableIC,
+          includeDistortion,
+          includeSharpness,
+          autofocus: autofocusCandidates,
+          autofocusOptions: SHARP_OPT_CFG.autofocus,
+          useCache: false,
+        });
+        const baseRef = scoreLocalOptMerit(key, baseMetrics, baseMetrics, targets, sensor);
+        const repairedRef = scoreLocalOptMerit(key, repairedMetrics, baseMetrics, targets, sensor);
+        if (Number.isFinite(repairedRef) && Number.isFinite(baseRef) && repairedRef + 1e-6 < baseRef) {
+          baseLens = repaired;
+          baseMetrics = repairedMetrics;
+          topology = captureTopology(baseLens);
+        }
+      }
       if (!nested) recordCockpitSnapshot(`${label} • start`, baseMetrics);
 
       let curLens = clone(baseLens);
