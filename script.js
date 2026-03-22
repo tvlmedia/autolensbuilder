@@ -8219,6 +8219,7 @@
       const mutReasonCounts = Object.create(null);
       const hardReasonCounts = Object.create(null);
       const batch = Math.max(20, Number(COCKPIT_CFG.progressBatch || 60) | 0);
+      const scoreLabel = key === "merit" ? "sharp score" : "merit";
       const t0 = performance.now();
       const UI_YIELD_MS = 18;
       let lastYieldTs = performance.now();
@@ -8655,15 +8656,9 @@
     }
     if (key === "merit") {
       return (
-        1.2 * (eflErr * eflErr) +
-        6.0 * (tSlow * tSlow) +
-        1.8 * (icShort * icShort) +
-        7.0 * (covDrop * covDrop) +
-        2.2 * (distRms * distRms) +
-        1.0 * (dist70 * dist70) +
-        1.8 * (sharpScore * sharpScore) +
-        0.34 * feasDebt +
-        0.55 * feasWorse
+        (sharpScore * sharpScore) +
+        0.06 * feasDebt +
+        0.10 * feasWorse
       );
     }
     if (key === "dist") {
@@ -8756,12 +8751,7 @@
       const icDrop = Math.max(0, Number(baseMetrics?.usableIC?.diameterMm || 0) - Number(candMetrics?.usableIC?.diameterMm || 0));
       if (icDrop > (baselineInvalid ? 2.00 : 0.70)) return "guard_ic";
     } else if (m === "merit") {
-      // Merit optimizer may rebalance multiple terms; keep guards but less tight than dist/sharp local polish.
-      if (eflDrift > (baselineInvalid ? 7.00 : 3.20)) return "guard_efl";
-      if (tDrift > (baselineInvalid ? 2.20 : 0.95)) return "guard_t";
-      if (covDrop > (baselineInvalid ? 4.00 : 2.20)) return "guard_cov";
-      const icDrop = Math.max(0, Number(baseMetrics?.usableIC?.diameterMm || 0) - Number(candMetrics?.usableIC?.diameterMm || 0));
-      if (icDrop > (baselineInvalid ? 3.50 : 1.80)) return "guard_ic";
+      // Merit=sharpness mode: rely on hard constraints; no extra drift guards.
     }
     return "";
   }
@@ -8856,50 +8846,14 @@
           });
         }
       } else if (key === "merit") {
-        // Merit mode reuses the stable per-target mutators to avoid unphysical exploration.
-        const r = Math.random();
-        let okMerit = false;
-        if (r < 0.40) {
-          okMerit = !!mutateEflCandidate(cand, {
-            currentMetrics: parentMetrics,
-            targets,
-            settings,
-            wavePreset,
-          })?.ok;
-          if (!okMerit) {
-            lastReason = "efl_mut";
-            continue;
-          }
-        } else if (r < 0.72) {
-          okMerit = !!mutateTCandidate(cand, {
-            currentMetrics: parentMetrics,
-            targets,
-            settings,
-            wavePreset,
-          })?.ok;
-          if (!okMerit) {
-            lastReason = "t_mut";
-            continue;
-          }
-        } else {
-          okMerit = !!mutateIcCandidate(cand, {
-            currentMetrics: parentMetrics,
-            targets,
-            settings,
-            wavePreset,
-          })?.ok;
-          if (!okMerit) {
-            lastReason = "ic_mut";
-            continue;
-          }
+        // Merit mode = sharpness-only local tuning.
+        const sm = applyOneSharpnessMutation(cand.surfaces, SHARP_OPT_CFG);
+        if (!sm?.ok) {
+          lastReason = `sharp_${sm?.reason || "mut"}`;
+          continue;
         }
-
-        // Optional tiny local polish moves, only sometimes.
-        if (Math.random() < (0.20 * Math.max(0.35, damp))) {
+        if (Math.random() < (0.28 * Math.max(0.35, damp))) {
           applyOneSharpnessMutation(cand.surfaces, SHARP_OPT_CFG);
-        }
-        if (Math.random() < (0.14 * Math.max(0.35, damp))) {
-          applyOneDistortionMutation(cand.surfaces, DIST_OPT_CFG);
         }
       } else if (key === "dist") {
         const dm = applyOneDistortionMutation(cand.surfaces, DIST_OPT_CFG);
@@ -8927,20 +8881,6 @@
       enforceRearMountStart(cand.surfaces);
       localRepairForHardConstraints(cand.surfaces, { passes: key === "merit" ? 3 : (attempt < 2 ? 2 : 1) });
       quickSanity(cand.surfaces);
-
-      if (key === "merit") {
-        // Prefilter: skip clearly too-short BFL before expensive full metric evaluation.
-        computeVertices(cand.surfaces, 0, 0);
-        const parax = estimateEflBflParaxial(cand.surfaces, wavePreset);
-        const bflTry = Number(parax?.bfl);
-        const bflFloor = Number(MERIT_CFG.bflMin || 52);
-        const baseBfl = Number(parentMetrics?.bfl || 0);
-        const floor = Number.isFinite(baseBfl) && baseBfl < bflFloor ? (baseBfl - 0.15) : (bflFloor - 0.10);
-        if (Number.isFinite(bflTry) && bflTry < floor) {
-          lastReason = "bfl_pref";
-          continue;
-        }
-      }
 
       return { ok: true, lens: cand };
     }
@@ -8993,9 +8933,9 @@
       const iters = localOptIterationsForMode(key, { iterations }, settings);
       const batch = Math.max(20, Number(COCKPIT_CFG.progressBatch || 60) | 0);
       const rayCountEval = clamp(Number(num(ui.rayCount?.value, COCKPIT_CFG.defaultRayCount)) | 0, 11, 31);
-      const lutNEval = (key === "dist" || key === "merit") ? 280 : 220;
-      const includeUsableIC = (key === "ic" || key === "merit");
-      const includeDistortion = (key === "dist" || key === "merit");
+      const lutNEval = key === "dist" ? 280 : 220;
+      const includeUsableIC = (key === "ic");
+      const includeDistortion = (key === "dist");
       const includeSharpness = (key === "sharp" || key === "merit");
       const autofocusCandidates = (key === "sharp" || key === "merit");
       const targetICDisplay = Math.max(Number(targets?.targetIC || 0), Math.hypot(sensor.w, sensor.h));
@@ -9195,7 +9135,7 @@
           setOptLog(
             `${runHeader}\n` +
             `running… ${i}/${iters} (${ips.toFixed(1)} it/s)\n` +
-            `current merit ${curMerit.toFixed(4)} • best merit ${bestMerit.toFixed(4)} @${bestIter || 0}\n` +
+            `current ${scoreLabel} ${curMerit.toFixed(4)} • best ${scoreLabel} ${bestMerit.toFixed(4)} @${bestIter || 0}\n` +
             `best EFL ${Number(bestMetrics?.efl || 0).toFixed(2)}mm • T ${Number(bestMetrics?.T || 0).toFixed(2)} • IC ${Number(bestMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm` +
             `${includeDistortion ? ` • DistRMS ${Number(bestMetrics?.distortion?.rmsPct || 0).toFixed(2)}%` : ""}` +
             `${includeSharpness ? ` • Sharp C/E ${Number(bestMetrics?.sharpness?.rmsCenter || 0).toFixed(3)}/${Number(bestMetrics?.sharpness?.rmsEdge || 0).toFixed(3)}mm` : ""}` +
