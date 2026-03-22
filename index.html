@@ -147,7 +147,7 @@
             </div>
 
             <div class="ctrl">
-              <label for="optTargetIC">Target Image Circle (mm)</label>
+              <label for="optTargetIC">Target IC (mm)</label>
               <input id="optTargetIC" type="number" step="0.1" value="0" min="0" />
             </div>
 
@@ -206,7 +206,7 @@
                 </thead>
                 <tbody>
                   <tr>
-                    <td>EFL (mm)</td>
+                    <td>Focal Length (mm)</td>
                     <td id="cockpitValEfl">—</td>
                     <td id="cockpitDeltaEfl" class="cockpitDelta">—</td>
                   </tr>
@@ -226,7 +226,7 @@
                     <td id="cockpitDeltaCov" class="cockpitDelta">—</td>
                   </tr>
                   <tr>
-                    <td>Usable IC</td>
+                    <td>IC</td>
                     <td id="cockpitValIc">—</td>
                     <td id="cockpitDeltaIc" class="cockpitDelta">—</td>
                   </tr>
@@ -241,7 +241,7 @@
                     <td id="cockpitDeltaSharp" class="cockpitDelta">—</td>
                   </tr>
                   <tr>
-                    <td>Feasibility</td>
+                    <td>Physical Correct</td>
                     <td id="cockpitValFeas">—</td>
                     <td id="cockpitDeltaFeas" class="cockpitDelta">—</td>
                   </tr>
@@ -252,9 +252,9 @@
             <div class="ctrl two">
               <div class="cockpitBtnGrid">
                 <button id="btnBaselineLens" class="btn btnPrimary" type="button">Make Baseline Lens</button>
-                <button id="btnOptEfl" class="btn" type="button">Optimize EFL</button>
+                <button id="btnOptEfl" class="btn" type="button">Optimize Focal Length</button>
                 <button id="btnOptTLocal" class="btn" type="button">Optimize T</button>
-                <button id="btnOptICLocal" class="btn" type="button">Optimize Image Circle</button>
+                <button id="btnOptICLocal" class="btn" type="button">Optimize IC</button>
                 <button id="btnOptApplyLocal" class="btn btnPrimary" type="button">Apply best</button>
               </div>
             </div>
@@ -312,6 +312,10 @@
                     <label for="cockpitAnneal">Use annealing</label>
                     <input id="cockpitAnneal" type="checkbox" checked />
                   </div>
+                  <div class="field fieldFull">
+                    <label for="cockpitDiagnostics">Advanced diagnostics</label>
+                    <pre id="cockpitDiagnostics" class="cockpitDiagnostics">—</pre>
+                  </div>
                 </div>
               </details>
             </div>
@@ -343,11 +347,11 @@
         <div id="statusText" class="statusLine">—</div>
 
         <div class="badges">
-          <div id="badgeEfl" class="badge">EFL: —</div>
+          <div id="badgeEfl" class="badge">Focal Length: —</div>
           <div id="badgeBfl" class="badge">BFL: —</div>
           <div id="badgeT" class="badge">T≈ —</div>
           <div id="badgeVig" class="badge">Vignette: —</div>
-          <div id="badgeSoftIC" class="badge">Image Circle: —</div>
+          <div id="badgeSoftIC" class="badge">IC: —</div>
           <div id="badgeDist" class="badge">DIST @0.7D: — • RMS: —</div>
           <div id="badgeSharp" class="badge">RMS C/E: — / — mm</div>
           <div id="badgeOD" class="badge">Front OD: — • Max OD: —</div>
@@ -375,7 +379,7 @@
         </div>
 
         <div class="topBadges" aria-label="Top badges">
-          <div id="badgeEflTop" class="pill">EFL: —</div>
+          <div id="badgeEflTop" class="pill">Focal Length: —</div>
           <div id="badgeBflTop" class="pill">BFL: —</div>
           <div id="badgeTTop" class="pill">T≈ —</div>
           <div id="badgeSoftICTop" class="pill">IC: —</div>

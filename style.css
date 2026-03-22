@@ -330,6 +330,23 @@ body{
   grid-template-columns:1fr 1fr;
   gap:10px;
 }
+.cockpitDiagnostics{
+  margin:0;
+  width:100%;
+  min-height:120px;
+  max-height:220px;
+  overflow:auto;
+  padding:10px;
+  border-radius:10px;
+  border:1px solid rgba(255,255,255,.10);
+  background:rgba(0,0,0,.24);
+  color:var(--muted);
+  font-family:var(--mono);
+  font-size:12px;
+  line-height:1.35;
+  white-space:pre-wrap;
+  word-break:break-word;
+}
 
 @media (max-width: 740px){
   .cockpitBtnGrid{ grid-template-columns:1fr; }

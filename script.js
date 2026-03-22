@@ -111,6 +111,7 @@
     cockpitProgress: $("#cockpitProgress"),
     cockpitProgressText: $("#cockpitProgressText"),
     cockpitCompareInfo: $("#cockpitCompareInfo"),
+    cockpitDiagnostics: $("#cockpitDiagnostics"),
 
     cockpitValEfl: $("#cockpitValEfl"),
     cockpitDeltaEfl: $("#cockpitDeltaEfl"),
@@ -4499,8 +4500,8 @@
     const softIcValid = Number.isFinite(icDiameterMm) && icDiameterMm > 0.1;
     const softIcTxt = softIcValid ? `IC: Ø${icDiameterMm.toFixed(1)}mm` : "IC: —";
     const softIcDetailTxt = softIcValid
-      ? `Image Circle: Ø${icDiameterMm.toFixed(1)}mm (IC${Math.round(Number(softIc?.thresholdRel || SOFT_IC_CFG.thresholdRel || 0.35) * 100)}%)`
-      : "Image Circle: —";
+      ? `IC: Ø${icDiameterMm.toFixed(1)}mm (IC${Math.round(Number(softIc?.thresholdRel || SOFT_IC_CFG.thresholdRel || 0.35) * 100)}%)`
+      : "IC: —";
 
     const rearVx = lastPhysicalVertexX(lens.surfaces);
     const intrusion = rearVx - plX;
@@ -4672,7 +4673,7 @@
     if (ui.realism) ui.realism.textContent = realismBadgeText;
     if (ui.fov) ui.fov.textContent = fovTxt;
 
-    if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
+    if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `Focal Length: ${efl == null ? "—" : efl.toFixed(2)}mm`;
     if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
     if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T_eff≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
     if (ui.softICTop) ui.softICTop.textContent = softIcTxt;
@@ -4703,7 +4704,25 @@
 
     if (ui.status) {
       ui.status.textContent =
-        `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • xover ${rayCross.crossPairs} • ${softIcTxt} • ${meritTxt}`;
+        `Focal Length ${efl == null ? "—" : efl.toFixed(2)}mm • ` +
+        `T ${T == null ? "—" : T.toFixed(2)} • ` +
+        `${softIcTxt} • ` +
+        `${fovTxt} • ` +
+        `Physical Correct ${(!phys.hardFail && !rayCross.invalid && !realismPenaltyRes.hardInvalid) ? "YES" : "NO"}`;
+    }
+    if (ui.cockpitDiagnostics) {
+      ui.cockpitDiagnostics.textContent =
+        `selected ${selectedIndex}\n` +
+        `rays traced ${traces.length} • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} (${vigPct}%) • tir ${tirCount}\n` +
+        `xover pairs ${rayCross.crossPairs} • segments ${rayCross.crossSegments}\n` +
+        `rear intrusion ${Number.isFinite(intrusion) ? intrusion.toFixed(2) : "—"}mm • overlap ${Number(phys?.worstOverlap || 0).toFixed(3)}mm • pinch ${Number(phys?.worstPinch || 0).toFixed(3)}mm\n` +
+        `throughput ${(centerTp.goodFrac * 100).toFixed(1)}% • t-loss ${Number.isFinite(tLoss) ? `+${tLoss.toFixed(2)}st` : "—"}\n` +
+        `dist chief ${chiefDistBadgeTopText}\n` +
+        `dist lut ${distBadgeText}\n` +
+        `sharp ${sharpBadgeText}\n` +
+        `od ${odBadgeText}\n` +
+        `realism ${realismBadgeText}\n` +
+        `merit ${meritTxt}`;
     }
     if (ui.metaInfo) {
       ui.metaInfo.textContent =
@@ -4785,29 +4804,20 @@
 
     const eflTxt = efl == null ? "—" : `${efl.toFixed(2)}mm`;
     const tTxt   = T == null ? "—" : `T_eff ${T.toFixed(2)}`;
-    const tGeomTxt = Tgeom == null ? "—" : `T_geom ${Tgeom.toFixed(2)}`;
-    const tpTxt = `Tp0 ${(centerTp.goodFrac * 100).toFixed(0)}%${Number.isFinite(tLoss) ? ` • +${tLoss.toFixed(2)}st` : ""}`;
     const focusTxt = (focusMode === "cam")
       ? `CamFocus ${sensorX.toFixed(2)}mm`
       : `LensFocus ${lensShift.toFixed(2)}mm`;
-    const crossTxt = rayCross.crossPairs > 0
-      ? `XOVER ${rayCross.crossPairs} ❌`
-      : "XOVER 0";
 
     drawTitleOverlay([
       lens?.name || "Lens",
-      `EFL ${eflTxt}`,
+      `Focal Length ${eflTxt}`,
       `BFL ${bfl == null ? "—" : bfl.toFixed(2) + "mm"}`,
       tTxt,
-      tGeomTxt,
-      tpTxt,
       softIcTxt,
-      crossTxt,
       distBadgeTopText,
       sharpBadgeTopText,
-      chiefDistBadgeTopText,
       odBadgeTopText,
-      realismBadgeTopText,
+      `Merit ${Number.isFinite(m) ? m.toFixed(2) : "—"}`,
       fovTxt,
       rearTxt,
       lenTxt,
@@ -6885,8 +6895,8 @@
     }
     if (ui.cockpitValFeas) {
       ui.cockpitValFeas.textContent = feasOk
-        ? `OK • intr ${Number.isFinite(intr) ? intr.toFixed(2) : "—"}mm`
-        : `FAIL • intr ${Number.isFinite(intr) ? intr.toFixed(2) : "—"}mm${reasons.length ? ` • ${reasons.join(",")}` : ""}`;
+        ? `YES • intr ${Number.isFinite(intr) ? intr.toFixed(2) : "—"}mm`
+        : `NO • intr ${Number.isFinite(intr) ? intr.toFixed(2) : "—"}mm${reasons.length ? ` • ${reasons.join(",")}` : ""}`;
     }
 
     if (!base) {
@@ -7954,7 +7964,7 @@
     const hard = canAcceptDeterministicCandidate(baseLens, before, candLens, after, settings, ["pl", "bfl", "valid", "physics"]);
     if (!hard.ok) return { applied: false, reason: hard.reason || "hard", before, after };
 
-    applyDeterministicLocalCandidate("Optimize EFL", candLens, focus, after, {
+    applyDeterministicLocalCandidate("Optimize Focal Length", candLens, focus, after, {
       silent,
       recordSnapshots: !nested,
     });
@@ -8055,7 +8065,7 @@
     const hard = canAcceptDeterministicCandidate(baseLens, before, candLens, after, settings, ["pl", "bfl", "valid", "physics"]);
     if (!hard.ok) return { applied: false, reason: hard.reason || "hard", before, after };
 
-    applyDeterministicLocalCandidate("Optimize Image Circle", candLens, focus, after, {
+    applyDeterministicLocalCandidate("Optimize IC", candLens, focus, after, {
       silent,
       recordSnapshots: !nested,
     });
@@ -9180,7 +9190,7 @@
   async function runOptimizeEflLocal(opts = {}) {
     return runResetLocalOptimizer({
       mode: "efl",
-      label: "Optimize EFL",
+      label: "Optimize Focal Length",
       iterations: opts?.iterations,
       nested: !!opts?.nested,
       silent: !!opts?.silent,
@@ -9202,7 +9212,7 @@
   async function runOptimizeImageCircleLocal(opts = {}) {
     return runResetLocalOptimizer({
       mode: "ic",
-      label: "Optimize Image Circle",
+      label: "Optimize IC",
       iterations: opts?.iterations,
       nested: !!opts?.nested,
       silent: !!opts?.silent,
