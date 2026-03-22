@@ -4811,16 +4811,11 @@
     drawTitleOverlay([
       lens?.name || "Lens",
       `Focal Length ${eflTxt}`,
-      `BFL ${bfl == null ? "—" : bfl.toFixed(2) + "mm"}`,
       tTxt,
       softIcTxt,
       distBadgeTopText,
       sharpBadgeTopText,
-      odBadgeTopText,
-      `Merit ${Number.isFinite(m) ? m.toFixed(2) : "—"}`,
-      fovTxt,
       rearTxt,
-      lenTxt,
       focusTxt,
     ]);
   }
