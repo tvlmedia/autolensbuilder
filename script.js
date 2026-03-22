@@ -9325,6 +9325,18 @@
     let bestMetrics = curMetrics;
     let bestScore = curScore;
     let bestIter = 0;
+    const strictness = String(settings?.strictness || "normal");
+    let bestValidLens = null;
+    let bestValidMetrics = null;
+    let bestValidScore = Number.POSITIVE_INFINITY;
+    let bestValidIter = 0;
+    const baseHardCheck = failsHardConstraints(baseLens.surfaces, baseMetrics, { strictness });
+    if (!baseHardCheck.fail) {
+      bestValidLens = clone(baseLens);
+      bestValidMetrics = baseMetrics;
+      bestValidScore = curScore;
+      bestValidIter = 0;
+    }
     let itersRan = 0;
     let noImprovePasses = 0;
     let pass = 0;
@@ -9405,6 +9417,7 @@
               incReject(ev.reason || "reject");
               continue;
             }
+            const candHard = failsHardConstraints(cand.lens.surfaces, candMetrics, { strictness });
             accepted = {
               lens: cand.lens,
               metrics: candMetrics,
@@ -9413,6 +9426,7 @@
               drift: ev.drift,
               mut: cand.mut,
               iter: itersRan,
+              hardFail: !!candHard?.fail,
             };
             break;
           }
@@ -9428,6 +9442,12 @@
             bestMetrics = curMetrics;
             bestScore = curScore;
             bestIter = accepted.iter;
+          }
+          if (!accepted.hardFail && curScore + 1e-9 < bestValidScore) {
+            bestValidLens = clone(curLens);
+            bestValidMetrics = curMetrics;
+            bestValidScore = curScore;
+            bestValidIter = accepted.iter;
           }
           break;
         }
@@ -9542,11 +9562,16 @@
       bestMetrics,
       bestScore,
       bestIter,
+      bestValidLens,
+      bestValidMetrics,
+      bestValidScore,
+      bestValidIter,
       itersRan,
       iterations,
       rejects,
       modeKey,
       profile: prof,
+      baseHardFail: !!baseHardCheck?.fail,
     };
   }
 
@@ -9695,14 +9720,30 @@
         runHeader,
       });
 
-      const bestLens = runRes?.bestLens || baseLens;
-      const bestMetrics = runRes?.bestMetrics || baseMetrics;
-      const bestMerit = Number(runRes?.bestScore);
+      let bestLens = runRes?.bestLens || baseLens;
+      let bestMetrics = runRes?.bestMetrics || baseMetrics;
+      let bestMerit = Number(runRes?.bestScore);
       const baseMerit = Number(runRes?.baseScore);
-      const bestIter = Number(runRes?.bestIter || 0);
+      let bestIter = Number(runRes?.bestIter || 0);
       const itersRan = Number(runRes?.itersRan || 0);
       const rejects = runRes?.rejects || {};
-      const improved = Number.isFinite(bestMerit) && Number.isFinite(baseMerit) && (bestMerit + 1e-9 < baseMerit);
+      const hardBest = failsHardConstraints(bestLens?.surfaces || [], bestMetrics, { strictness: settings.strictness });
+      let usedValidFallback = false;
+      if (hardBest?.fail) {
+        const vLens = runRes?.bestValidLens;
+        const vMetrics = runRes?.bestValidMetrics;
+        const vScore = Number(runRes?.bestValidScore);
+        const vIter = Number(runRes?.bestValidIter || 0);
+        if (vLens && vMetrics && Number.isFinite(vScore)) {
+          bestLens = vLens;
+          bestMetrics = vMetrics;
+          bestMerit = vScore;
+          bestIter = vIter;
+          usedValidFallback = true;
+        }
+      }
+      const finalHard = failsHardConstraints(bestLens?.surfaces || [], bestMetrics, { strictness: settings.strictness });
+      const improved = !finalHard.fail && Number.isFinite(bestMerit) && Number.isFinite(baseMerit) && (bestMerit + 1e-9 < baseMerit);
       const bestFocus = {
         focusMode: focus.focusMode,
         sensorX: Number(bestMetrics?.focus?.sensorX ?? focus.sensorX ?? 0),
@@ -9763,6 +9804,7 @@
         `${runHeader}\n` +
         `${cockpitStopRequested ? "stopped" : "done"} ${itersRan}/${iters}\n` +
         `best iteration ${bestIterTxt}\n` +
+        `${usedValidFallback ? "best valid fallback used\n" : ""}` +
         `${improved ? (shouldApply ? "APPLIED ✅" : "QUEUED (Apply best)") : "no better candidate"}\n` +
         `before EFL ${Number(baseMetrics?.efl || 0).toFixed(2)}mm • T ${Number(baseMetrics?.T || 0).toFixed(2)} • IC ${Number(baseMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm` +
         `${includeDistortion ? ` • DistRMS ${Number(baseMetrics?.distortion?.rmsPct || 0).toFixed(2)}%` : ""}` +
