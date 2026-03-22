@@ -9228,10 +9228,14 @@
     const covDrop = Math.max(0, baseCov - Number(candidateMetrics?.maxFieldDeg || 0));
     const sharpWorse = Math.max(0, candSharp - curSharp);
 
-    const eflTol = (modeKey === "focal") ? Infinity : (String(strictness).toLowerCase() === "strict" ? 0.45 : 1.35) * guardScale;
-    const tTol = (modeKey === "tstop") ? Infinity : (String(strictness).toLowerCase() === "strict" ? 0.10 : 0.35) * guardScale;
-    const icTol = (modeKey === "imageCircle") ? Infinity : (String(strictness).toLowerCase() === "strict" ? 0.45 : 1.20) * guardScale;
-    const covTol = (modeKey === "imageCircle" ? 1.8 : 1.1) * guardScale;
+    const isStrict = String(strictness).toLowerCase() === "strict";
+    const meritGuardMul = modeKey === "merit"
+      ? (profile?.level === "macro" ? 3.8 : (profile?.level === "local" ? 2.6 : 1.8))
+      : 1.0;
+    const eflTol = (modeKey === "focal") ? Infinity : (isStrict ? 0.45 : 1.35) * guardScale * meritGuardMul;
+    const tTol = (modeKey === "tstop") ? Infinity : (isStrict ? 0.10 : 0.35) * guardScale * meritGuardMul;
+    const icTol = (modeKey === "imageCircle") ? Infinity : (isStrict ? 0.45 : 1.20) * guardScale * meritGuardMul;
+    const covTol = (modeKey === "imageCircle" ? 1.8 : 1.1) * guardScale * (modeKey === "merit" ? 2.3 : 1.0);
     const sharpTol = (modeKey === "merit" ? 0.05 : 0.22) * guardScale;
 
     if (eflDrift > eflTol) return { ok: false, reason: "guard_efl" };
@@ -9242,8 +9246,11 @@
 
     const drift = computeDesignDriftPenalty(candidateLens, baselineLens, profile);
     const curDrift = computeDesignDriftPenalty(currentLens, baselineLens, profile);
-    const score = primaryCand + drift;
-    const curScore = primaryCur + curDrift;
+    const driftMul = modeKey === "merit"
+      ? (profile?.level === "macro" ? 0.22 : (profile?.level === "local" ? 0.35 : 0.55))
+      : 1.0;
+    const score = primaryCand + driftMul * drift;
+    const curScore = primaryCur + driftMul * curDrift;
     if (!(score + 1e-9 < curScore)) return { ok: false, reason: "drift" };
 
     return {
@@ -9435,7 +9442,13 @@
         for (let k = 0; k < kickAttempts && itersRan < iterations; k++) {
           itersRan++;
           const candLens = sanitizeLens(clone(curLens));
-          const sm = applyOneSharpnessMutation(candLens.surfaces, SHARP_OPT_CFG);
+          const mutCount = prof.level === "macro" ? 3 : (prof.level === "local" ? 2 : 1);
+          let sm = { ok: false, reason: "mut" };
+          for (let m = 0; m < mutCount; m++) {
+            const r = applyOneSharpnessMutation(candLens.surfaces, SHARP_OPT_CFG);
+            if (m === 0) sm = r || sm;
+            if (!r?.ok) break;
+          }
           if (!sm?.ok) {
             incReject(`kick_${String(sm?.reason || "mut")}`);
             continue;
