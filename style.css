@@ -469,13 +469,21 @@ body{
   gap:12px;
 }
 
+.canvasTitle{
+  flex:0 0 auto;
+}
 .canvasTitle .hint{ margin-top:4px; }
 .canvasTitle .meritUnderTitle{
   margin-top:10px;
   display:inline-flex;
+  white-space:nowrap;
+  width:max-content;
+  font-size:12px;
+  line-height:1.2;
 }
 
 .topBadges{
+  flex:1 1 auto;
   display:flex;
   gap:8px;
   flex-wrap:wrap;
