@@ -9426,6 +9426,77 @@
         }
       }
 
+      if (!improvedPass && modeKey === "merit" && itersRan < iterations) {
+        const kickAttempts = clamp(
+          Math.round((prof.level === "macro" ? 10 : (prof.level === "local" ? 7 : 4))),
+          2,
+          14
+        );
+        for (let k = 0; k < kickAttempts && itersRan < iterations; k++) {
+          itersRan++;
+          const candLens = sanitizeLens(clone(curLens));
+          const sm = applyOneSharpnessMutation(candLens.surfaces, SHARP_OPT_CFG);
+          if (!sm?.ok) {
+            incReject(`kick_${String(sm?.reason || "mut")}`);
+            continue;
+          }
+          ensureStopExists(candLens.surfaces);
+          enforceSingleStopSurface(candLens.surfaces);
+          ensureStopInAirBothSides(candLens.surfaces);
+          clampAllApertures(candLens.surfaces);
+          quickSanity(candLens.surfaces);
+
+          const candMetrics = computeMetrics({
+            surfaces: candLens.surfaces,
+            wavePreset,
+            focusMode: focus?.focusMode || "lens",
+            sensorX: Number(focus?.sensorX || 0),
+            lensShift: Number(focus?.lensShift || 0),
+            sensorW: Number(sensor?.w || 36.7),
+            sensorH: Number(sensor?.h || 25.54),
+            objDist: COCKPIT_CFG.defaultObjDistMm,
+            rayCount,
+            lutN,
+            includeUsableIC: true,
+            includeDistortion: true,
+            includeSharpness: true,
+            autofocus: true,
+            autofocusOptions: SHARP_OPT_CFG.autofocus,
+            useCache: false,
+          });
+          const ev = evaluateCandidateForMode(candLens, candMetrics, {
+            mode: modeKey,
+            currentMetrics: curMetrics,
+            baselineMetrics: baseMetrics,
+            currentLens: curLens,
+            baselineLens: baseLens,
+            targets,
+            sensor,
+            settings,
+            profile: prof,
+            stopIdx,
+            allowBaselineHardRelax,
+            baseHardEval,
+            allowedBaselineHardReasons,
+          });
+          if (!ev.ok) {
+            incReject(ev.reason || "kick_reject");
+            continue;
+          }
+          curLens = candLens;
+          curMetrics = candMetrics;
+          curScore = ev.score;
+          improvedPass = true;
+          if (curScore + 1e-9 < bestScore) {
+            bestLens = clone(curLens);
+            bestMetrics = curMetrics;
+            bestScore = curScore;
+            bestIter = itersRan;
+          }
+          break;
+        }
+      }
+
       if (!improvedPass) {
         noImprovePasses++;
       } else {
