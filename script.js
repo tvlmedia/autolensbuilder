@@ -136,6 +136,7 @@
     btnOptDistLocal: $("#btnOptDistLocal"),
     btnOptSharpLocal: $("#btnOptSharpLocal"),
     btnOptAllMacro: $("#btnOptAllMacro"),
+    btnOptApplyLocal: $("#btnOptApplyLocal"),
 
     btnSnapshotSave: $("#btnSnapshotSave"),
     btnSnapshotUndo: $("#btnSnapshotUndo"),
@@ -6633,6 +6634,7 @@
       ui.btnOptDistLocal,
       ui.btnOptSharpLocal,
       ui.btnOptAllMacro,
+      ui.btnOptApplyLocal,
       ui.btnSnapshotSave,
       ui.btnSnapshotUndo,
       ui.btnSnapshotRedo,
@@ -8720,14 +8722,19 @@
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const damp = Math.pow(0.58, attempt);
-      let cand = mutateLens(parentLens, mutMode, topo, {
-        stage,
-        targetEfl: Number(targets?.targetEfl || 50),
-        targetT: Number(targets?.targetT || 2.8),
-        targetIC: Number(targets?.targetIC || 0),
-        icNeedMm: icNeed,
-        keepFl: key !== "efl",
-      });
+      let cand = null;
+      if (key === "efl" || key === "t" || key === "ic") {
+        cand = clone(parentLens);
+      } else {
+        cand = mutateLens(parentLens, mutMode, topo, {
+          stage,
+          targetEfl: Number(targets?.targetEfl || 50),
+          targetT: Number(targets?.targetT || 2.8),
+          targetIC: Number(targets?.targetIC || 0),
+          icNeedMm: icNeed,
+          keepFl: key !== "efl",
+        });
+      }
       cand = sanitizeLens(cand);
       if (!cand?.surfaces || !Array.isArray(cand.surfaces)) {
         lastReason = "mut";
@@ -8863,8 +8870,8 @@
       const batch = Math.max(20, Number(COCKPIT_CFG.progressBatch || 60) | 0);
       const rayCountEval = clamp(Number(num(ui.rayCount?.value, COCKPIT_CFG.defaultRayCount)) | 0, 11, 31);
       const lutNEval = key === "dist" ? 280 : 220;
-      const includeUsableIC = (key === "ic" || key === "dist" || key === "sharp");
-      const includeDistortion = (key === "dist" || key === "sharp");
+      const includeUsableIC = (key === "ic");
+      const includeDistortion = (key === "dist");
       const includeSharpness = (key === "sharp");
       const autofocusCandidates = (key === "sharp");
       const targetICDisplay = Math.max(Number(targets?.targetIC || 0), Math.hypot(sensor.w, sensor.h));
@@ -9082,9 +9089,10 @@
         lensShift: Number(bestMetrics?.focus?.lensShift ?? focus.lensShift ?? 0),
       };
 
-      const autoApplyLocal = (key === "dist" || key === "sharp")
-        ? (nested ? true : postOptAutoApplyEnabled())
-        : true;
+      // Local cockpit optimizers are manual-apply by default:
+      // run optimizer -> inspect -> click Apply best.
+      // Nested runs (macro) still auto-apply between stages.
+      const autoApplyLocal = nested ? true : false;
       const shouldApply = improved && autoApplyLocal;
 
       if (improved) {
@@ -9237,17 +9245,17 @@
     setCockpitProgress(0, "Optimize All • init");
     const settings = getCockpitSettings();
     const passes = Math.max(1, Number(settings.macroPasses || 1) | 0);
-    const stepsPerPass = 5;
+    const stepsPerPass = 3;
     const totalSteps = passes * stepsPerPass;
     const startMetrics = computeMetrics({
       surfaces: lens.surfaces,
       wavePreset: ui.wavePreset?.value || "d",
       ...getFocusStateFromUi(),
       ...getSensorWH(),
-      includeDistortion: true,
-      includeSharpness: true,
+      includeDistortion: false,
+      includeSharpness: false,
       rayCount: clamp(num(ui.rayCount?.value, 21) | 0, 11, 41),
-      lutN: 260,
+      lutN: 220,
       useCache: false,
     });
     recordCockpitSnapshot("Optimize All • start", startMetrics);
@@ -9290,46 +9298,25 @@
         if (cockpitStopRequested) break;
         setCockpitProgress(step / totalSteps, `Optimize All • ${tag} • IC`);
 
-        step++;
-        await runOptimizeSharpnessLocal({
-          nested: true,
-          silent: true,
-          runContext: { mode: "Optimize All", label: `${tag} • sharpness`, stepIndex: step, stepTotal: totalSteps },
-        });
-        if (cockpitStopRequested) break;
-        setCockpitProgress(step / totalSteps, `Optimize All • ${tag} • sharpness`);
-
-        step++;
-        await runOptimizeDistortionLocal({
-          nested: true,
-          silent: true,
-          runContext: { mode: "Optimize All", label: `${tag} • distortion`, stepIndex: step, stepTotal: totalSteps },
-        });
-        setCockpitProgress(step / totalSteps, `Optimize All • ${tag} • distortion`);
-
         const m = computeMetrics({
           surfaces: lens.surfaces,
           wavePreset: ui.wavePreset?.value || "d",
           ...getFocusStateFromUi(),
           ...getSensorWH(),
-          includeDistortion: true,
-          includeSharpness: true,
+          includeDistortion: false,
+          includeSharpness: false,
           rayCount: clamp(num(ui.rayCount?.value, 21) | 0, 11, 41),
-          lutN: 260,
+          lutN: 220,
           useCache: false,
         });
         const prevScore =
           Math.abs(Number(curMetrics?.efl || 0) - Number(getCockpitTargets().targetEfl || 0)) * 0.8 +
           Math.max(0, Number(curMetrics?.T || 0) - Number(getCockpitTargets().targetT || 0)) * 3.0 +
-          Math.max(0, Number(getCockpitTargets().targetIC || 0) - Number(curMetrics?.usableIC?.diameterMm || 0)) * 1.2 +
-          Math.abs(Number(curMetrics?.distortion?.rmsPct || 0)) * 0.35 +
-          Number(curMetrics?.sharpness?.rmsEdge || 0) * 40;
+          Math.max(0, Number(getCockpitTargets().targetIC || 0) - Number(curMetrics?.usableIC?.diameterMm || 0)) * 1.2;
         const nowScore =
           Math.abs(Number(m?.efl || 0) - Number(getCockpitTargets().targetEfl || 0)) * 0.8 +
           Math.max(0, Number(m?.T || 0) - Number(getCockpitTargets().targetT || 0)) * 3.0 +
-          Math.max(0, Number(getCockpitTargets().targetIC || 0) - Number(m?.usableIC?.diameterMm || 0)) * 1.2 +
-          Math.abs(Number(m?.distortion?.rmsPct || 0)) * 0.35 +
-          Number(m?.sharpness?.rmsEdge || 0) * 40;
+          Math.max(0, Number(getCockpitTargets().targetIC || 0) - Number(m?.usableIC?.diameterMm || 0)) * 1.2;
         curMetrics = m;
         if (p > 0 && (prevScore - nowScore) < 0.02) break;
       }
@@ -13884,10 +13871,6 @@
     // optimizer
     ui.btnBuildScratch?.addEventListener("click", openBuildScratchModal);
     ui.btnOptStart?.addEventListener("click", runOptimizeAllMacro);
-    ui.btnOptDist?.addEventListener("click", () => runOptimizeDistortionLocal());
-    ui.btnOptDistApply?.addEventListener("click", applyDistortionBest);
-    ui.btnOptSharp?.addEventListener("click", () => runOptimizeSharpnessLocal());
-    ui.btnOptSharpApply?.addEventListener("click", applySharpnessBest);
     ui.btnOptStop?.addEventListener("click", stopOptimizer);
     ui.btnOptApply?.addEventListener("click", applyBest);
     ui.btnOptBench?.addEventListener("click", benchOptimizer);
@@ -13897,9 +13880,7 @@
     ui.btnOptEfl?.addEventListener("click", () => runOptimizeEflLocal());
     ui.btnOptTLocal?.addEventListener("click", () => runOptimizeTLocal());
     ui.btnOptICLocal?.addEventListener("click", () => runOptimizeImageCircleLocal());
-    ui.btnOptDistLocal?.addEventListener("click", () => runOptimizeDistortionLocal());
-    ui.btnOptSharpLocal?.addEventListener("click", () => runOptimizeSharpnessLocal());
-    ui.btnOptAllMacro?.addEventListener("click", runOptimizeAllMacro);
+    ui.btnOptApplyLocal?.addEventListener("click", applyBest);
 
     ui.btnSnapshotSave?.addEventListener("click", saveCockpitSnapshotManual);
     ui.btnSnapshotUndo?.addEventListener("click", undoCockpitSnapshot);
