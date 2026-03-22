@@ -8935,6 +8935,499 @@
     return { ok: false, reason: lastReason };
   }
 
+  function normalizeLocalMode(mode) {
+    const k = String(mode || "").toLowerCase();
+    if (k === "focal" || k === "efl") return "focal";
+    if (k === "t" || k === "tstop") return "tstop";
+    if (k === "ic" || k === "imagecircle" || k === "image_circle") return "imageCircle";
+    return "merit";
+  }
+
+  function localProfileFromUi(settings = {}, mode = "focal") {
+    const exp = String(ui.optPop?.value || "safe").toLowerCase();
+    const level = exp === "wild" ? "macro" : (exp === "normal" ? "local" : "micro");
+    const sMul = clamp(Number(settings?.stepSize || COCKPIT_CFG.defaultStepSize) / COCKPIT_CFG.defaultStepSize, 0.55, 2.6);
+    const relRBase = [0.001, 0.0025, 0.005, 0.01];
+    if (level !== "micro") relRBase.push(level === "macro" ? 0.02 : 0.015);
+    const absRBase = [0.05, 0.10, 0.20, 0.40];
+    if (level !== "micro") absRBase.push(level === "macro" ? 0.80 : 0.50);
+    const tBase = [0.02, 0.05, 0.10, 0.20];
+    if (level !== "micro") tBase.push(level === "macro" ? 0.50 : 0.35);
+    const apBase = [0.02, 0.05, 0.10];
+    const strict = String(settings?.strictness || "normal").toLowerCase() === "strict";
+    const guardBase = strict ? 0.80 : 1.00;
+    const modeKey = normalizeLocalMode(mode);
+    return {
+      level,
+      modeKey,
+      relRadiusSteps: relRBase.map((v) => clamp(v * sMul, 0.0006, 0.03)),
+      absRadiusSteps: absRBase.map((v) => clamp(v * sMul, 0.02, 1.20)),
+      thicknessSteps: tBase.map((v) => clamp(v * sMul, 0.01, 0.70)),
+      apertureSteps: apBase.map((v) => clamp(v * sMul, 0.01, 0.18)),
+      allowGlassSwap: level !== "micro",
+      maxGlassCandidates: level === "macro" ? 8 : 5,
+      maxNoImprovePasses: level === "macro" ? 5 : (level === "local" ? 3 : 2),
+      guardScale: guardBase * (level === "macro" ? 1.35 : (level === "local" ? 1.05 : 0.82)),
+      driftWeight: level === "macro" ? 0.55 : (level === "local" ? 1.25 : 2.60),
+      glassSwapPenalty: level === "macro" ? 0.22 : (level === "local" ? 0.42 : 0.85),
+    };
+  }
+
+  function rankGlassNeighbors(glassName) {
+    const base = resolveGlassName(glassName || "AIR");
+    if (base === "AIR" || !GLASS_DB[base]) return [];
+    const b = GLASS_DB[base];
+    const nd0 = Number(b?.nd || 1.5);
+    const vd0 = Number(b?.Vd || 55);
+    return GLASS_LIST
+      .filter((g) => g !== base && !!GLASS_DB[g])
+      .map((g) => {
+        const gg = GLASS_DB[g];
+        const nd = Number(gg?.nd || nd0);
+        const vd = Number(gg?.Vd || vd0);
+        const dNd = Math.abs(nd - nd0);
+        const dVd = Math.abs(vd - vd0);
+        return { glass: g, score: dNd * 120 + dVd * 0.45 };
+      })
+      .sort((a, b2) => a.score - b2.score)
+      .map((x) => x.glass);
+  }
+
+  function computeDesignDriftPenalty(candidateLens, baselineLens, profile = {}) {
+    const cs = candidateLens?.surfaces || [];
+    const bs = baselineLens?.surfaces || [];
+    const n = Math.min(cs.length, bs.length);
+    if (!n) return Number.POSITIVE_INFINITY;
+    let sum = 0;
+    for (let i = 0; i < n; i++) {
+      const c = cs[i], b = bs[i];
+      const tc = String(c?.type || "").toUpperCase();
+      if (tc === "OBJ" || tc === "IMS") continue;
+      const R0 = Number(b?.R || 0);
+      const R1 = Number(c?.R || 0);
+      const t0 = Number(b?.t || 0);
+      const t1 = Number(c?.t || 0);
+      const a0 = Number(b?.ap || 0);
+      const a1 = Number(c?.ap || 0);
+      const dR = Math.abs(Math.abs(R0) >= 15 ? ((R1 - R0) / Math.max(1e-6, Math.abs(R0))) : ((R1 - R0) / 0.35));
+      const dT = Math.abs((t1 - t0) / 0.12);
+      const dA = Math.abs((a1 - a0) / 0.10);
+      sum += 0.65 * dR * dR + 0.60 * dT * dT + 0.42 * dA * dA;
+      if (resolveGlassName(c?.glass || "AIR") !== resolveGlassName(b?.glass || "AIR")) {
+        sum += Number(profile?.glassSwapPenalty || 0.45);
+      }
+    }
+    return Number(profile?.driftWeight || 1.0) * sum;
+  }
+
+  function localPrimaryScore(modeKey, metricsObj, targets, sensor) {
+    const m = metricsObj || {};
+    const targetEfl = Number(targets?.targetEfl || 50);
+    const targetT = Number(targets?.targetT || 2.8);
+    const targetIC = Math.max(
+      Number(targets?.targetIC || 0),
+      Math.hypot(Number(sensor?.w || 36.7), Number(sensor?.h || 25.54))
+    );
+    if (modeKey === "focal") {
+      return Math.abs(Number(m?.efl || 0) - targetEfl);
+    }
+    if (modeKey === "tstop") {
+      return Math.max(0, Number(m?.T || 0) - targetT);
+    }
+    if (modeKey === "imageCircle") {
+      return Math.max(0, targetIC - Number(m?.usableIC?.diameterMm || 0));
+    }
+    const c = Number(m?.sharpness?.rmsCenter);
+    const e = Number(m?.sharpness?.rmsEdge);
+    return Number.isFinite(c) && Number.isFinite(e) ? (0.35 * c + 0.65 * e) : Number.POSITIVE_INFINITY;
+  }
+
+  function buildMutableSurfaceList(lensObj, mode, opts = {}) {
+    const surfaces = lensObj?.surfaces || [];
+    const modeKey = normalizeLocalMode(mode);
+    const profile = opts?.profile || localProfileFromUi(opts?.settings || {}, modeKey);
+    const stopIdx = Number.isFinite(opts?.stopIdx) ? Number(opts.stopIdx) : findStopSurfaceIndex(surfaces);
+    const settings = opts?.settings || {};
+    const useManualRange = String(settings?.surfaceMode || "auto").toLowerCase() === "manual";
+    const iMin = useManualRange ? Math.max(1, Number(settings?.rangeStart || 1) - 1) : 1;
+    const iMax = useManualRange ? Math.min(surfaces.length - 2, Number(settings?.rangeEnd || surfaces.length - 2) - 1) : (surfaces.length - 2);
+    const out = [];
+    for (let i = Math.max(1, iMin); i <= iMax; i++) {
+      const s = surfaces[i];
+      if (!s || surfaceIsLocked(s)) continue;
+      const t = String(s?.type || "").toUpperCase();
+      const isStop = i === stopIdx || t === "STOP" || !!s.stop;
+      const dStop = stopIdx >= 0 ? Math.abs(i - stopIdx) : 99;
+      const prevGlass = i > 0 ? resolveGlassName(surfaces[i - 1]?.glass || "AIR") : "AIR";
+      const nextGlass = resolveGlassName(s?.glass || "AIR");
+      const dn = Math.abs(glassN(prevGlass, "d") - glassN(nextGlass, "d"));
+      const absR = Math.max(1e-6, Math.abs(Number(s?.R || 0)));
+      const power = dn / absR;
+      let priority = 1.0 + 260 * power;
+      if (dStop <= 2) priority += 1.8;
+      if (modeKey === "focal") priority += 180 * power;
+      if (modeKey === "imageCircle" && stopIdx >= 0 && i > stopIdx) priority += 1.6;
+      if (modeKey === "tstop" && dStop <= 3) priority += 1.4;
+      if (modeKey === "merit" && dStop <= 4) priority += 1.0;
+      out.push({
+        idx: i,
+        isStop,
+        allow: {
+          R: !isStop,
+          t: !isStop,
+          ap: isStop ? (modeKey === "tstop") : (modeKey === "tstop" || (modeKey === "imageCircle" && dStop <= 3)),
+          glass: !isStop && profile.allowGlassSwap && resolveGlassName(s?.glass || "AIR") !== "AIR",
+        },
+        priority,
+      });
+    }
+    out.sort((a, b) => b.priority - a.priority);
+    return out;
+  }
+
+  function localCandidateParamOrder(entry, mode) {
+    const modeKey = normalizeLocalMode(mode);
+    if (modeKey === "tstop") return ["ap", "t", "R", "glass"];
+    return ["R", "t", "ap", "glass"];
+  }
+
+  function generateLocalCandidates(lensObj, surfaceIndex, paramKey, mode, opts = {}) {
+    const base = sanitizeLens(clone(lensObj));
+    const surfaces = base?.surfaces || [];
+    if (!Array.isArray(surfaces) || surfaceIndex <= 0 || surfaceIndex >= surfaces.length - 1) return [];
+    const s0 = surfaces[surfaceIndex];
+    if (!s0 || surfaceIsLocked(s0)) return [];
+    const stopIdx = Number.isFinite(opts?.stopIdx) ? Number(opts.stopIdx) : findStopSurfaceIndex(surfaces);
+    const profile = opts?.profile || localProfileFromUi(opts?.settings || {}, normalizeLocalMode(mode));
+    const out = [];
+    const addCandidate = (mutator, magnitude, label) => {
+      const cand = sanitizeLens(clone(base));
+      if (!cand?.surfaces || !cand.surfaces[surfaceIndex]) return;
+      mutator(cand.surfaces[surfaceIndex], cand.surfaces, cand);
+      ensureStopExists(cand.surfaces);
+      enforceSingleStopSurface(cand.surfaces);
+      ensureStopInAirBothSides(cand.surfaces);
+      clampAllApertures(cand.surfaces);
+      quickSanity(cand.surfaces);
+      out.push({
+        lens: cand,
+        mut: { idx: surfaceIndex, param: paramKey, magnitude: Number(magnitude || 0), label: String(label || paramKey) },
+      });
+    };
+
+    if (paramKey === "R") {
+      const R0 = Number(s0?.R || 0);
+      const relSteps = profile.relRadiusSteps || [0.001, 0.0025, 0.005, 0.01];
+      const absSteps = profile.absRadiusSteps || [0.05, 0.1, 0.2, 0.4];
+      const useRel = Math.abs(R0) >= 25;
+      const steps = useRel ? relSteps : absSteps;
+      for (const step of steps) {
+        for (const sign of [-1, 1]) {
+          addCandidate((s) => {
+            const r = Number(s?.R || 0);
+            const rNew = useRel
+              ? (r * (1 + sign * step))
+              : (r + sign * step * (Math.sign(r) || 1));
+            s.R = clamp(Math.sign(rNew || r || 1) * Math.max(PHYS_CFG.minRadius, Math.abs(rNew)), -3000, 3000);
+          }, Number(step), `R ${sign > 0 ? "+" : "-"}${step}`);
+        }
+      }
+    } else if (paramKey === "t") {
+      const steps = profile.thicknessSteps || [0.02, 0.05, 0.10, 0.20];
+      for (const step of steps) {
+        for (const sign of [-1, 1]) {
+          addCandidate((s) => {
+            const medAfter = resolveGlassName(s?.glass || "AIR");
+            const tMin = medAfter === "AIR" ? Number(PHYS_CFG.minAirGap || 0.12) : Number(PHYS_CFG.minGlassCT || 0.35);
+            const t0 = Number(s?.t || 0);
+            s.t = clamp(t0 + sign * step, tMin, Number(PHYS_CFG.maxThickness || 55));
+          }, Number(step), `t ${sign > 0 ? "+" : "-"}${step}`);
+        }
+      }
+    } else if (paramKey === "ap") {
+      const steps = profile.apertureSteps || [0.02, 0.05, 0.10];
+      const modeKey = normalizeLocalMode(mode);
+      const signs = (modeKey === "tstop" && surfaceIndex === stopIdx) ? [1, -1] : [-1, 1];
+      for (const step of steps) {
+        for (const sign of signs) {
+          addCandidate((s) => {
+            s.ap = clamp(Number(s?.ap || 0) + sign * step, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+          }, Number(step), `ap ${sign > 0 ? "+" : "-"}${step}`);
+        }
+      }
+    } else if (paramKey === "glass") {
+      const cur = resolveGlassName(s0?.glass || "AIR");
+      if (cur !== "AIR") {
+        const neigh = rankGlassNeighbors(cur).slice(0, Math.max(1, Number(profile.maxGlassCandidates || 5)));
+        for (let i = 0; i < neigh.length; i++) {
+          const g = neigh[i];
+          addCandidate((s) => { s.glass = g; }, (i + 1) * 0.5, `glass ${cur}→${g}`);
+        }
+      }
+    }
+    out.sort((a, b) => Number(a?.mut?.magnitude || 0) - Number(b?.mut?.magnitude || 0));
+    return out;
+  }
+
+  function evaluateCandidateForMode(candidateLens, candidateMetrics, ctx = {}) {
+    const modeKey = normalizeLocalMode(ctx?.mode || "focal");
+    const currentMetrics = ctx?.currentMetrics || {};
+    const baselineMetrics = ctx?.baselineMetrics || {};
+    const baselineLens = ctx?.baselineLens || {};
+    const currentLens = ctx?.currentLens || {};
+    const profile = ctx?.profile || {};
+    const targets = ctx?.targets || {};
+    const sensor = ctx?.sensor || getSensorWH();
+    const strictness = String(ctx?.settings?.strictness || "normal");
+
+    if (!candidateLens?.surfaces || candidateLens.surfaces.length !== (baselineLens?.surfaces || []).length) {
+      return { ok: false, reason: "topology_len" };
+    }
+    for (let i = 0; i < candidateLens.surfaces.length; i++) {
+      const tCand = String(candidateLens.surfaces[i]?.type || "").toUpperCase();
+      const tBase = String(baselineLens?.surfaces?.[i]?.type || "").toUpperCase();
+      if (tCand !== tBase) return { ok: false, reason: "topology_type" };
+    }
+    const stopNow = findStopSurfaceIndex(candidateLens.surfaces);
+    if (Number.isFinite(ctx?.stopIdx) && stopNow !== Number(ctx.stopIdx)) return { ok: false, reason: "stop_moved" };
+    const hard = failsHardConstraints(candidateLens.surfaces, candidateMetrics, { strictness });
+    if (hard.fail) return { ok: false, reason: `hard_${String(hard.reasons?.[0] || "invalid")}` };
+
+    const primaryCur = localPrimaryScore(modeKey, currentMetrics, targets, sensor);
+    const primaryCand = localPrimaryScore(modeKey, candidateMetrics, targets, sensor);
+    if (!(Number.isFinite(primaryCur) && Number.isFinite(primaryCand))) return { ok: false, reason: "primary_nan" };
+    if (!(primaryCand + 1e-9 < primaryCur)) return { ok: false, reason: "no_primary" };
+
+    const guardScale = Number(profile?.guardScale || 1.0);
+    const baseEfl = Number(baselineMetrics?.efl || 0);
+    const baseT = Number(baselineMetrics?.T || 0);
+    const baseIC = Number(baselineMetrics?.usableIC?.diameterMm || 0);
+    const baseCov = Number(baselineMetrics?.maxFieldDeg || 0);
+    const curSharp = Number(currentMetrics?.sharpness?.score || (0.4 * Number(currentMetrics?.sharpness?.rmsCenter || 0) + 0.6 * Number(currentMetrics?.sharpness?.rmsEdge || 0)));
+    const candSharp = Number(candidateMetrics?.sharpness?.score || (0.4 * Number(candidateMetrics?.sharpness?.rmsCenter || 0) + 0.6 * Number(candidateMetrics?.sharpness?.rmsEdge || 0)));
+    const eflDrift = Math.abs(Number(candidateMetrics?.efl || 0) - baseEfl);
+    const tDrift = Math.abs(Number(candidateMetrics?.T || 0) - baseT);
+    const icDrop = Math.max(0, baseIC - Number(candidateMetrics?.usableIC?.diameterMm || 0));
+    const covDrop = Math.max(0, baseCov - Number(candidateMetrics?.maxFieldDeg || 0));
+    const sharpWorse = Math.max(0, candSharp - curSharp);
+
+    const eflTol = (modeKey === "focal") ? Infinity : (String(strictness).toLowerCase() === "strict" ? 0.45 : 1.35) * guardScale;
+    const tTol = (modeKey === "tstop") ? Infinity : (String(strictness).toLowerCase() === "strict" ? 0.10 : 0.35) * guardScale;
+    const icTol = (modeKey === "imageCircle") ? Infinity : (String(strictness).toLowerCase() === "strict" ? 0.45 : 1.20) * guardScale;
+    const covTol = (modeKey === "imageCircle" ? 1.8 : 1.1) * guardScale;
+    const sharpTol = (modeKey === "merit" ? 0.05 : 0.22) * guardScale;
+
+    if (eflDrift > eflTol) return { ok: false, reason: "guard_efl" };
+    if (tDrift > tTol) return { ok: false, reason: "guard_t" };
+    if (icDrop > icTol) return { ok: false, reason: "guard_ic" };
+    if (covDrop > covTol) return { ok: false, reason: "guard_cov" };
+    if (sharpWorse > sharpTol) return { ok: false, reason: "guard_sharp" };
+
+    const drift = computeDesignDriftPenalty(candidateLens, baselineLens, profile);
+    const curDrift = computeDesignDriftPenalty(currentLens, baselineLens, profile);
+    const score = primaryCand + drift;
+    const curScore = primaryCur + curDrift;
+    if (!(score + 1e-9 < curScore)) return { ok: false, reason: "drift" };
+
+    return {
+      ok: true,
+      score,
+      primary: primaryCand,
+      drift,
+    };
+  }
+
+  async function runLocalOptimizer({
+    mode = "focal",
+    label = "Local Optimizer",
+    iterations = 12000,
+    baselineLens = null,
+    baselineMetrics = null,
+    targets = null,
+    sensor = null,
+    focus = null,
+    settings = null,
+    wavePreset = "d",
+    rayCount = 21,
+    lutN = 220,
+    nested = false,
+    runHeader = "",
+  } = {}) {
+    const modeKey = normalizeLocalMode(mode);
+    const prof = localProfileFromUi(settings || {}, modeKey);
+    const baseLens = sanitizeLens(clone(baselineLens || lens));
+    const baseMetrics = baselineMetrics || computeMetrics({
+      surfaces: baseLens.surfaces,
+      wavePreset,
+      focusMode: focus?.focusMode || "lens",
+      sensorX: Number(focus?.sensorX || 0),
+      lensShift: Number(focus?.lensShift || 0),
+      sensorW: Number(sensor?.w || 36.7),
+      sensorH: Number(sensor?.h || 25.54),
+      objDist: COCKPIT_CFG.defaultObjDistMm,
+      rayCount,
+      lutN,
+      includeUsableIC: true,
+      includeDistortion: true,
+      includeSharpness: true,
+      autofocus: false,
+      useCache: false,
+    });
+    const stopIdx = findStopSurfaceIndex(baseLens.surfaces);
+    const mutable = buildMutableSurfaceList(baseLens, modeKey, { settings, profile: prof, stopIdx });
+    let curLens = clone(baseLens);
+    let curMetrics = baseMetrics;
+    let curScore = localPrimaryScore(modeKey, curMetrics, targets, sensor) + computeDesignDriftPenalty(curLens, baseLens, prof);
+    let bestLens = clone(curLens);
+    let bestMetrics = curMetrics;
+    let bestScore = curScore;
+    let bestIter = 0;
+    let itersRan = 0;
+    let noImprovePasses = 0;
+    let pass = 0;
+    const rejects = Object.create(null);
+    const incReject = (r) => { rejects[r] = (rejects[r] || 0) + 1; };
+    const t0 = performance.now();
+    const UI_YIELD_MS = 18;
+    let lastYieldTs = performance.now();
+    const maybeYieldUi = async (iterNow, force = false) => {
+      const now = performance.now();
+      if (!force && (now - lastYieldTs) < UI_YIELD_MS) return false;
+      if (!nested) {
+        const frac = clamp(Number(iterNow || 0) / Math.max(1, iterations), 0, 1);
+        const iterTxt = Math.max(0, Math.min(iterations, Math.floor(Number(iterNow || 0))));
+        setCockpitProgress(frac, `${label} • ${iterTxt}/${iterations}`);
+      }
+      await new Promise((r) => setTimeout(r, 0));
+      lastYieldTs = performance.now();
+      return (!nested && (!cockpitOptRunning || cockpitStopRequested)) || (nested && cockpitStopRequested);
+    };
+
+    while (itersRan < iterations) {
+      if ((!nested && (!cockpitOptRunning || cockpitStopRequested)) || (nested && cockpitStopRequested)) break;
+      pass++;
+      let improvedPass = false;
+      for (const entry of mutable) {
+        if (itersRan >= iterations) break;
+        const params = localCandidateParamOrder(entry, modeKey);
+        let accepted = null;
+        for (const p of params) {
+          if (!entry.allow[p]) continue;
+          const cands = generateLocalCandidates(curLens, entry.idx, p, modeKey, {
+            profile: prof,
+            stopIdx,
+            settings,
+          });
+          for (const cand of cands) {
+            if (itersRan >= iterations) break;
+            itersRan++;
+            if ((itersRan % 2) === 0) {
+              const stopNow = await maybeYieldUi(itersRan - 1, false);
+              if (stopNow) break;
+            }
+            const candMetrics = computeMetrics({
+              surfaces: cand.lens.surfaces,
+              wavePreset,
+              focusMode: focus?.focusMode || "lens",
+              sensorX: Number(focus?.sensorX || 0),
+              lensShift: Number(focus?.lensShift || 0),
+              sensorW: Number(sensor?.w || 36.7),
+              sensorH: Number(sensor?.h || 25.54),
+              objDist: COCKPIT_CFG.defaultObjDistMm,
+              rayCount,
+              lutN,
+              includeUsableIC: true,
+              includeDistortion: true,
+              includeSharpness: true,
+              autofocus: modeKey === "merit",
+              autofocusOptions: SHARP_OPT_CFG.autofocus,
+              useCache: false,
+            });
+            const ev = evaluateCandidateForMode(cand.lens, candMetrics, {
+              mode: modeKey,
+              currentMetrics: curMetrics,
+              baselineMetrics: baseMetrics,
+              currentLens: curLens,
+              baselineLens: baseLens,
+              targets,
+              sensor,
+              settings,
+              profile: prof,
+              stopIdx,
+            });
+            if (!ev.ok) {
+              incReject(ev.reason || "reject");
+              continue;
+            }
+            accepted = {
+              lens: cand.lens,
+              metrics: candMetrics,
+              score: ev.score,
+              primary: ev.primary,
+              drift: ev.drift,
+              mut: cand.mut,
+              iter: itersRan,
+            };
+            break;
+          }
+          if (accepted) break;
+        }
+        if (accepted) {
+          curLens = accepted.lens;
+          curMetrics = accepted.metrics;
+          curScore = accepted.score;
+          improvedPass = true;
+          if (curScore + 1e-9 < bestScore) {
+            bestLens = clone(curLens);
+            bestMetrics = curMetrics;
+            bestScore = curScore;
+            bestIter = accepted.iter;
+          }
+          break;
+        }
+      }
+
+      if (!improvedPass) {
+        noImprovePasses++;
+        if (noImprovePasses >= Number(prof.maxNoImprovePasses || 2)) break;
+      } else {
+        noImprovePasses = 0;
+      }
+
+      if ((itersRan % Math.max(20, Number(COCKPIT_CFG.progressBatch || 60))) === 0) {
+        const dt = Math.max(1e-6, (performance.now() - t0) / 1000);
+        const ips = itersRan / dt;
+        setOptLog(
+          `${runHeader}\n` +
+          `running… ${itersRan}/${iterations} (${ips.toFixed(1)} it/s)\n` +
+          `pass ${pass} • profile ${prof.level} • mode ${modeKey}\n` +
+          `current score ${curScore.toFixed(5)} • best ${bestScore.toFixed(5)} @${bestIter || 0}\n` +
+          `current Focal Length ${Number(curMetrics?.efl || 0).toFixed(2)}mm • T ${Number(curMetrics?.T || 0).toFixed(2)} • IC ${Number(curMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm\n` +
+          `current Sharp C/E ${Number(curMetrics?.sharpness?.rmsCenter || 0).toFixed(3)}/${Number(curMetrics?.sharpness?.rmsEdge || 0).toFixed(3)}mm\n` +
+          `rejects ${Object.entries(rejects).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, v]) => `${k}:${v}`).join(" • ")}`
+        );
+        if (!nested) setCockpitProgress(itersRan / iterations, `${label} • ${itersRan}/${iterations}`);
+        const stopNow = await maybeYieldUi(itersRan, true);
+        if (stopNow) break;
+      }
+    }
+
+    return {
+      baseLens,
+      baseMetrics,
+      baseScore: localPrimaryScore(modeKey, baseMetrics, targets, sensor) + computeDesignDriftPenalty(baseLens, baseLens, prof),
+      bestLens,
+      bestMetrics,
+      bestScore,
+      bestIter,
+      itersRan,
+      iterations,
+      rejects,
+      modeKey,
+      profile: prof,
+    };
+  }
+
   async function runResetLocalOptimizer({
     mode = "efl",
     label = "Local Optimizer",
@@ -8978,17 +9471,15 @@
       const focus = getFocusStateFromUi();
       const wavePreset = ui.wavePreset?.value || "d";
       const iters = localOptIterationsForMode(key, { iterations }, settings);
-      const batch = Math.max(20, Number(COCKPIT_CFG.progressBatch || 60) | 0);
       const rayCountEval = clamp(Number(num(ui.rayCount?.value, COCKPIT_CFG.defaultRayCount)) | 0, 11, 31);
-      const lutNEval = key === "dist" ? 280 : 220;
-      const includeUsableIC = (key === "ic");
-      const includeDistortion = (key === "dist");
-      const includeSharpness = (key === "sharp" || key === "merit");
-      const autofocusCandidates = (key === "sharp" || key === "merit");
+      const lutNEval = 220;
+      const includeUsableIC = true;
+      const includeDistortion = true;
+      const includeSharpness = true;
+      const autofocusCandidates = normalizeLocalMode(key) === "merit";
       const targetICDisplay = Math.max(Number(targets?.targetIC || 0), Math.hypot(sensor.w, sensor.h));
 
       let baseLens = sanitizeLens(clone(lens));
-      let topology = captureTopology(baseLens);
       let baseMetrics = computeMetrics({
         surfaces: baseLens.surfaces,
         wavePreset,
@@ -9054,146 +9545,41 @@
         if (Number.isFinite(repairedRef) && Number.isFinite(baseRef) && repairedRef + 1e-6 < baseRef) {
           baseLens = repaired;
           baseMetrics = repairedMetrics;
-          topology = captureTopology(baseLens);
         }
       }
       if (!nested) recordCockpitSnapshot(`${label} • start`, baseMetrics);
-
-      let curLens = clone(baseLens);
-      let curMetrics = baseMetrics;
-      const baseMerit = scoreLocalOptMerit(key, baseMetrics, baseMetrics, targets, sensor);
-      let curMerit = baseMerit;
-      let bestLens = clone(baseLens);
-      let bestMetrics = baseMetrics;
-      let bestMerit = baseMerit;
-      let bestIter = 0;
-
-      const rejects = Object.create(null);
-      const countReject = (reason) => {
-        const r = String(reason || "reject");
-        rejects[r] = (rejects[r] || 0) + 1;
-      };
-
-      const UI_YIELD_MS = 18;
-      let lastYieldTs = performance.now();
-      const t0 = performance.now();
-      const maybeYieldUi = async (iterNow, force = false) => {
-        const now = performance.now();
-        if (!force && (now - lastYieldTs) < UI_YIELD_MS) return false;
-        if (!nested) {
-          const frac = clamp(Number(iterNow || 0) / Math.max(1, iters), 0, 1);
-          const iterTxt = Math.max(0, Math.min(iters, Math.floor(Number(iterNow || 0))));
-          setCockpitProgress(frac, `${label} • ${iterTxt}/${iters}`);
-        }
-        await new Promise((r) => setTimeout(r, 0));
-        lastYieldTs = performance.now();
-        return (!nested && (!cockpitOptRunning || cockpitStopRequested)) || (nested && cockpitStopRequested);
-      };
 
       setOptLog(
         `${runHeader}\n` +
         `running… 0/${iters}\n` +
         `target FL ${Number(targets?.targetEfl || 0).toFixed(2)}mm • T ${Number(targets?.targetT || 0).toFixed(2)} • IC ${targetICDisplay.toFixed(2)}mm\n` +
-        `baseline EFL ${Number(baseMetrics?.efl || 0).toFixed(2)}mm • T ${Number(baseMetrics?.T || 0).toFixed(2)} • IC ${Number(baseMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm` +
-        `${includeDistortion ? ` • DistRMS ${Number(baseMetrics?.distortion?.rmsPct || 0).toFixed(2)}%` : ""}` +
-        `${includeSharpness ? ` • Sharp C/E ${Number(baseMetrics?.sharpness?.rmsCenter || 0).toFixed(3)}/${Number(baseMetrics?.sharpness?.rmsEdge || 0).toFixed(3)}mm` : ""}`
+        `baseline EFL ${Number(baseMetrics?.efl || 0).toFixed(2)}mm • T ${Number(baseMetrics?.T || 0).toFixed(2)} • IC ${Number(baseMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm`
       );
 
-      let itersRan = 0;
-      for (let i = 1; i <= iters; i++) {
-        if ((!nested && (!cockpitOptRunning || cockpitStopRequested)) || (nested && cockpitStopRequested)) break;
-        itersRan = i;
-        if ((i % 2) === 0) {
-          const stopNow = await maybeYieldUi(i - 1, false);
-          if (stopNow) break;
-        }
+      const runRes = await runLocalOptimizer({
+        mode: key,
+        label,
+        iterations: iters,
+        baselineLens: baseLens,
+        baselineMetrics: baseMetrics,
+        targets,
+        sensor,
+        focus,
+        settings,
+        wavePreset,
+        rayCount: rayCountEval,
+        lutN: lutNEval,
+        nested,
+        runHeader,
+      });
 
-        const alpha = i / Math.max(1, iters);
-        const temp = 0.95 * (1 - alpha) + 0.10 * alpha;
-        const useBestParent = Math.random() < 0.66;
-        const parentLens = useBestParent ? bestLens : curLens;
-        const parentMetrics = useBestParent ? bestMetrics : curMetrics;
-
-        const mut = mutateForLocalOpt(key, parentLens, parentMetrics, {
-          targets,
-          sensor,
-          wavePreset,
-          topology,
-          settings,
-          mutMode: ui.optPop?.value || "safe",
-        });
-        if (!mut?.ok || !mut?.lens) {
-          countReject(mut?.reason || "mut");
-          continue;
-        }
-
-        const candMetrics = computeMetrics({
-          surfaces: mut.lens.surfaces,
-          wavePreset,
-          focusMode: focus.focusMode,
-          sensorX: focus.sensorX,
-          lensShift: focus.lensShift,
-          sensorW: sensor.w,
-          sensorH: sensor.h,
-          objDist: COCKPIT_CFG.defaultObjDistMm,
-          rayCount: rayCountEval,
-          lutN: lutNEval,
-          includeUsableIC,
-          includeDistortion,
-          includeSharpness,
-          autofocus: autofocusCandidates,
-          autofocusOptions: SHARP_OPT_CFG.autofocus,
-          useCache: false,
-        });
-        const rejectReason = localOptRejectReason(key, candMetrics, baseMetrics);
-        if (rejectReason) {
-          countReject(rejectReason);
-          continue;
-        }
-
-        const candMerit = scoreLocalOptMerit(key, candMetrics, baseMetrics, targets, sensor);
-        if (!Number.isFinite(candMerit)) {
-          countReject("merit");
-          continue;
-        }
-
-        let accept = candMerit < curMerit;
-        if (!accept) {
-          const uphill = candMerit - curMerit;
-          const norm = Math.max(1e-6, Math.abs(curMerit) * 0.35 + 1.0);
-          const pAcc = Math.exp(-uphill / Math.max(1e-6, norm * temp));
-          accept = Math.random() < pAcc;
-        }
-        if (accept) {
-          curLens = mut.lens;
-          curMetrics = candMetrics;
-          curMerit = candMerit;
-        }
-        if (candMerit + 1e-9 < bestMerit) {
-          bestLens = clone(mut.lens);
-          bestMetrics = candMetrics;
-          bestMerit = candMerit;
-          bestIter = i;
-        }
-
-        if ((i % batch) === 0) {
-          const dt = Math.max(1e-6, (performance.now() - t0) / 1000);
-          const ips = i / dt;
-          setOptLog(
-            `${runHeader}\n` +
-            `running… ${i}/${iters} (${ips.toFixed(1)} it/s)\n` +
-            `current ${scoreLabel} ${curMerit.toFixed(4)} • best ${scoreLabel} ${bestMerit.toFixed(4)} @${bestIter || 0}\n` +
-            `best EFL ${Number(bestMetrics?.efl || 0).toFixed(2)}mm • T ${Number(bestMetrics?.T || 0).toFixed(2)} • IC ${Number(bestMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm` +
-            `${includeDistortion ? ` • DistRMS ${Number(bestMetrics?.distortion?.rmsPct || 0).toFixed(2)}%` : ""}` +
-            `${includeSharpness ? ` • Sharp C/E ${Number(bestMetrics?.sharpness?.rmsCenter || 0).toFixed(3)}/${Number(bestMetrics?.sharpness?.rmsEdge || 0).toFixed(3)}mm` : ""}` +
-            `\nrejects ${Object.entries(rejects).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, v]) => `${k}:${v}`).join(" • ")}`
-          );
-          if (!nested) setCockpitProgress(i / iters, `${label} • ${i}/${iters}`);
-          const stopNow = await maybeYieldUi(i, true);
-          if (stopNow) break;
-        }
-      }
-
+      const bestLens = runRes?.bestLens || baseLens;
+      const bestMetrics = runRes?.bestMetrics || baseMetrics;
+      const bestMerit = Number(runRes?.bestScore);
+      const baseMerit = Number(runRes?.baseScore);
+      const bestIter = Number(runRes?.bestIter || 0);
+      const itersRan = Number(runRes?.itersRan || 0);
+      const rejects = runRes?.rejects || {};
       const improved = Number.isFinite(bestMerit) && Number.isFinite(baseMerit) && (bestMerit + 1e-9 < baseMerit);
       const bestFocus = {
         focusMode: focus.focusMode,
