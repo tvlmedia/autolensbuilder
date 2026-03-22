@@ -4659,8 +4659,17 @@
       `${bd.physPenalty > 0 ? ` • PHYS +${bd.physPenalty.toFixed(1)}` : ""}` +
       `${bd.hardInvalid ? " • INVALID ❌" : ""})`;
 
-    if (ui.merit) ui.merit.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
-    if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"}`;
+    const meritParts = Array.isArray(bd?.meritFieldRms) ? bd.meritFieldRms : [];
+    const meritSplitTxt = meritParts.length
+      ? meritParts
+          .map((p, idx) => {
+            const tag = idx === 0 ? "C" : (idx === 1 ? "1/3" : (idx === 2 ? "2/3" : "E"));
+            return `${tag} ${Number.isFinite(p?.rmsMm) ? Number(p.rmsMm).toFixed(3) : "—"}`;
+          })
+          .join(" • ")
+      : "C — • 1/3 — • 2/3 — • E —";
+    if (ui.merit) ui.merit.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} • ${meritSplitTxt}`;
+    if (ui.meritTop) ui.meritTop.textContent = `Merit: ${Number.isFinite(m) ? m.toFixed(2) : "—"} • ${meritSplitTxt}`;
 
     const rearTxt = (intrusion > 0)
       ? `REAR INTRUSION: +${intrusion.toFixed(2)}mm ❌`
@@ -8761,6 +8770,7 @@
     const wavePreset = ctx?.wavePreset || "d";
     const targets = ctx?.targets || {};
     const sensor = ctx?.sensor || getSensorWH();
+    const settings = ctx?.settings || getCockpitSettings();
     const topo = ctx?.topology || null;
     const mutMode = String(ctx?.mutMode || ui.optPop?.value || "safe");
     const key = String(mode || "").toLowerCase();
@@ -8846,55 +8856,50 @@
           });
         }
       } else if (key === "merit") {
-        // Conservative mixed mutation: improve global score while keeping geometry feasible.
-        const tgtEfl = Number(targets?.targetEfl || 50);
-        const tgtT = Number(targets?.targetT || 2.8);
-        const tgtIC = Math.max(
-          Number(targets?.targetIC || 0),
-          Math.hypot(Number(sensor?.w || 36.7), Number(sensor?.h || 25.54))
-        );
-        const meritStrength = Math.max(0.25, damp);
-
-        if (Math.random() < 0.85) {
-          nudgeLensTowardFocal(
-            cand,
-            tgtEfl,
+        // Merit mode reuses the stable per-target mutators to avoid unphysical exploration.
+        const r = Math.random();
+        let okMerit = false;
+        if (r < 0.40) {
+          okMerit = !!mutateEflCandidate(cand, {
+            currentMetrics: parentMetrics,
+            targets,
+            settings,
             wavePreset,
-            randRange(0.28, 0.62) * meritStrength,
-            randRange(0.010, 0.040) * meritStrength,
-            { keepAperture: true }
-          );
-        }
-        if (Math.random() < 0.75) {
-          nudgeStopTowardTargetT(
-            cand.surfaces,
-            tgtEfl,
-            tgtT,
-            randRange(0.28, 0.70) * meritStrength
-          );
-        }
-        if (Math.random() < 0.65) {
-          applyCoverageBoostMutation(cand.surfaces, {
-            targetIC: tgtIC,
-            targetEfl: tgtEfl,
-            targetT: tgtT,
-            icNeedMm: Math.max(0, icNeed) * randRange(0.35, 0.95),
-            keepFl: true,
-          });
-        }
-        if (Math.random() < 0.45) {
-          const sm = applyOneSharpnessMutation(cand.surfaces, SHARP_OPT_CFG);
-          if (!sm?.ok) {
-            lastReason = `sharp_${sm?.reason || "mut"}`;
+          })?.ok;
+          if (!okMerit) {
+            lastReason = "efl_mut";
+            continue;
+          }
+        } else if (r < 0.72) {
+          okMerit = !!mutateTCandidate(cand, {
+            currentMetrics: parentMetrics,
+            targets,
+            settings,
+            wavePreset,
+          })?.ok;
+          if (!okMerit) {
+            lastReason = "t_mut";
+            continue;
+          }
+        } else {
+          okMerit = !!mutateIcCandidate(cand, {
+            currentMetrics: parentMetrics,
+            targets,
+            settings,
+            wavePreset,
+          })?.ok;
+          if (!okMerit) {
+            lastReason = "ic_mut";
             continue;
           }
         }
-        if (Math.random() < 0.38) {
-          const dm = applyOneDistortionMutation(cand.surfaces, DIST_OPT_CFG);
-          if (!dm?.ok) {
-            lastReason = `dist_${dm?.reason || "mut"}`;
-            continue;
-          }
+
+        // Optional tiny local polish moves, only sometimes.
+        if (Math.random() < (0.20 * Math.max(0.35, damp))) {
+          applyOneSharpnessMutation(cand.surfaces, SHARP_OPT_CFG);
+        }
+        if (Math.random() < (0.14 * Math.max(0.35, damp))) {
+          applyOneDistortionMutation(cand.surfaces, DIST_OPT_CFG);
         }
       } else if (key === "dist") {
         const dm = applyOneDistortionMutation(cand.surfaces, DIST_OPT_CFG);
@@ -8922,6 +8927,20 @@
       enforceRearMountStart(cand.surfaces);
       localRepairForHardConstraints(cand.surfaces, { passes: key === "merit" ? 3 : (attempt < 2 ? 2 : 1) });
       quickSanity(cand.surfaces);
+
+      if (key === "merit") {
+        // Prefilter: skip clearly too-short BFL before expensive full metric evaluation.
+        computeVertices(cand.surfaces, 0, 0);
+        const parax = estimateEflBflParaxial(cand.surfaces, wavePreset);
+        const bflTry = Number(parax?.bfl);
+        const bflFloor = Number(MERIT_CFG.bflMin || 52);
+        const baseBfl = Number(parentMetrics?.bfl || 0);
+        const floor = Number.isFinite(baseBfl) && baseBfl < bflFloor ? (baseBfl - 0.15) : (bflFloor - 0.10);
+        if (Number.isFinite(bflTry) && bflTry < floor) {
+          lastReason = "bfl_pref";
+          continue;
+        }
+      }
 
       return { ok: true, lens: cand };
     }
@@ -9113,6 +9132,7 @@
           sensor,
           wavePreset,
           topology,
+          settings,
           mutMode: ui.optPop?.value || "safe",
         });
         if (!mut?.ok || !mut?.lens) {
