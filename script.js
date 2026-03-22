@@ -6642,6 +6642,16 @@
     });
   }
 
+  function resetLegacyOptimizerFlagsIfIdle() {
+    // Local cockpit flow is now the primary path; stale legacy flags must not block it.
+    if (scratchBuildRunning) return;
+    optRunning = false;
+    distOptRunning = false;
+    sharpOptRunning = false;
+    distOptStopRequested = false;
+    sharpOptStopRequested = false;
+  }
+
   function getCockpitSettings() {
     const stepSize = clamp(num(ui.cockpitStep?.value, COCKPIT_CFG.defaultStepSize), 0.01, 0.20);
     const mainItersRaw = Math.round(num(ui.optIters?.value, COCKPIT_CFG.defaultIters));
@@ -8761,9 +8771,10 @@
     runContext = null,
   } = {}) {
     const key = String(mode || "efl").toLowerCase();
+    resetLegacyOptimizerFlagsIfIdle();
     if (!nested) {
       if (cockpitOptRunning || cockpitMacroRunning) return null;
-      if (optRunning || scratchBuildRunning || distOptRunning || sharpOptRunning) {
+      if (scratchBuildRunning) {
         toast("Stop other optimizer/build runs first.");
         return null;
       }
@@ -9109,8 +9120,9 @@
   }
 
   async function runOptimizeAllMacro() {
+    resetLegacyOptimizerFlagsIfIdle();
     if (cockpitMacroRunning || cockpitOptRunning) return;
-    if (optRunning || scratchBuildRunning || distOptRunning || sharpOptRunning) {
+    if (scratchBuildRunning) {
       toast("Stop current optimizer/build first.");
       return;
     }
