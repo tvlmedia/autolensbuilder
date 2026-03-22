@@ -134,6 +134,7 @@
     btnOptEfl: $("#btnOptEfl"),
     btnOptTLocal: $("#btnOptTLocal"),
     btnOptICLocal: $("#btnOptICLocal"),
+    btnOptMeritLocal: $("#btnOptMeritLocal"),
     btnOptDistLocal: $("#btnOptDistLocal"),
     btnOptSharpLocal: $("#btnOptSharpLocal"),
     btnOptAllMacro: $("#btnOptAllMacro"),
@@ -3794,7 +3795,7 @@
     centerVigWeight: 180.0,
     midVigWeight: 60.0,
     intrusionWeight: 16.0,
-    fieldWeights: [1.0, 1.5, 2.0],
+    fieldWeights: [1.0, 1.25, 1.6, 2.2],
     distSampleFracs: [0.25, 0.55, 0.85, 1.00], // chief-ray samples across image height/diag
     distNormPct: 0.55,        // RMS distortion normalization target
     distMaxNormPct: 0.95,     // MAX distortion normalization target
@@ -3874,11 +3875,15 @@
   }){
     const edge = Number.isFinite(fov?.dfov) ? clamp(fov.dfov * 0.5, 4, 60) : 15;
     const f0 = 0;
-    const f1 = edge * 0.65;
-    const f2 = edge * 0.95;
+    const f1 = edge / 3;
+    const f2 = (2 * edge) / 3;
+    const f3 = edge;
 
-    const fields = [f0, f1, f2];
-    const fieldWeights = MERIT_CFG.fieldWeights;
+    // Requested merit sampling: center, 1/3, 2/3, corner.
+    const fields = [f0, f1, f2, f3];
+    const fieldWeights = Array.isArray(MERIT_CFG.fieldWeights) && MERIT_CFG.fieldWeights.length >= fields.length
+      ? MERIT_CFG.fieldWeights
+      : [1.0, 1.25, 1.6, 2.2];
 
     let merit = 0;
     let rmsCenter = null, rmsEdge = null;
@@ -3901,7 +3906,8 @@
       if (k === 1) vigMid = pack.vigFrac;
 
       const rn = rms / MERIT_CFG.rmsNorm;
-      merit += fieldWeights[k] * (rn * rn);
+      const wk = Number.isFinite(fieldWeights[k]) ? Number(fieldWeights[k]) : 1.0;
+      merit += wk * (rn * rn);
     }
 
     merit += MERIT_CFG.vigWeight * (vigAvg * vigAvg);
@@ -6636,6 +6642,7 @@
       ui.btnOptEfl,
       ui.btnOptTLocal,
       ui.btnOptICLocal,
+      ui.btnOptMeritLocal,
       ui.btnOptDistLocal,
       ui.btnOptSharpLocal,
       ui.btnOptAllMacro,
@@ -8617,6 +8624,19 @@
         0.45 * feasWorse
       );
     }
+    if (key === "merit") {
+      return (
+        1.2 * (eflErr * eflErr) +
+        6.0 * (tSlow * tSlow) +
+        1.8 * (icShort * icShort) +
+        7.0 * (covDrop * covDrop) +
+        2.2 * (distRms * distRms) +
+        1.0 * (dist70 * dist70) +
+        1.8 * (sharpScore * sharpScore) +
+        0.34 * feasDebt +
+        0.55 * feasWorse
+      );
+    }
     if (key === "dist") {
       return (
         (distRms * distRms) +
@@ -8700,10 +8720,12 @@
     } else if (m === "ic") {
       if (eflDrift > (baselineInvalid ? 12.0 : 6.50)) return "guard_efl";
       if (tDrift > (baselineInvalid ? 2.00 : 1.20)) return "guard_t";
-    } else if (m === "dist" || m === "sharp") {
+    } else if (m === "dist" || m === "sharp" || m === "merit") {
       if (eflDrift > (baselineInvalid ? 4.00 : 1.50)) return "guard_efl";
       if (tDrift > (baselineInvalid ? 1.10 : 0.35)) return "guard_t";
       if (covDrop > (baselineInvalid ? 2.80 : 1.20)) return "guard_cov";
+      const icDrop = Math.max(0, Number(baseMetrics?.usableIC?.diameterMm || 0) - Number(candMetrics?.usableIC?.diameterMm || 0));
+      if (icDrop > (baselineInvalid ? 2.00 : 0.70)) return "guard_ic";
     }
     return "";
   }
@@ -8875,10 +8897,10 @@
       const batch = Math.max(20, Number(COCKPIT_CFG.progressBatch || 60) | 0);
       const rayCountEval = clamp(Number(num(ui.rayCount?.value, COCKPIT_CFG.defaultRayCount)) | 0, 11, 31);
       const lutNEval = key === "dist" ? 280 : 220;
-      const includeUsableIC = (key === "ic");
-      const includeDistortion = (key === "dist");
-      const includeSharpness = (key === "sharp");
-      const autofocusCandidates = (key === "sharp");
+      const includeUsableIC = (key === "ic" || key === "merit");
+      const includeDistortion = (key === "dist" || key === "merit");
+      const includeSharpness = (key === "sharp" || key === "merit");
+      const autofocusCandidates = (key === "sharp" || key === "merit");
       const targetICDisplay = Math.max(Number(targets?.targetIC || 0), Math.hypot(sensor.w, sensor.h));
 
       let baseLens = sanitizeLens(clone(lens));
@@ -9208,6 +9230,17 @@
     return runResetLocalOptimizer({
       mode: "ic",
       label: "Optimize IC",
+      iterations: opts?.iterations,
+      nested: !!opts?.nested,
+      silent: !!opts?.silent,
+      runContext: opts?.runContext || null,
+    });
+  }
+
+  async function runOptimizeMeritLocal(opts = {}) {
+    return runResetLocalOptimizer({
+      mode: "merit",
+      label: "Optimize Merit",
       iterations: opts?.iterations,
       nested: !!opts?.nested,
       silent: !!opts?.silent,
@@ -13885,6 +13918,7 @@
     ui.btnOptEfl?.addEventListener("click", () => runOptimizeEflLocal());
     ui.btnOptTLocal?.addEventListener("click", () => runOptimizeTLocal());
     ui.btnOptICLocal?.addEventListener("click", () => runOptimizeImageCircleLocal());
+    ui.btnOptMeritLocal?.addEventListener("click", () => runOptimizeMeritLocal());
     ui.btnOptApplyLocal?.addEventListener("click", applyBest);
 
     ui.btnSnapshotSave?.addEventListener("click", saveCockpitSnapshotManual);
