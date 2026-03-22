@@ -3891,6 +3891,7 @@
     let vigCenter = 1;
     let vigMid = 1;
     let validMin = 999;
+    const meritFieldRms = [];
 
     for (let k = 0; k < fields.length; k++){
       const fa = fields[k];
@@ -3900,6 +3901,11 @@
       vigAvg += pack.vigFrac / fields.length;
 
       const rms = Number.isFinite(pack.rms) ? pack.rms : 999;
+      meritFieldRms.push({
+        fieldDeg: Number.isFinite(fa) ? Number(fa) : NaN,
+        rmsMm: Number.isFinite(pack.rms) ? Number(pack.rms) : NaN,
+        validRays: Number(pack.n || 0),
+      });
       if (k === 0) rmsCenter = rms;
       if (k === fields.length - 1) rmsEdge = rms;
       if (k === 0) vigCenter = pack.vigFrac;
@@ -3996,6 +4002,7 @@
       realismPackagingPenalty: Number.isFinite(realismBreakdown?.packagingPenalty) ? Number(realismBreakdown.packagingPenalty) : 0,
       realismProfileLabel: String(realismBreakdown?.profileLabel || envelopeStats?.profileLabel || ""),
       realismLargeSensor: !!realismBreakdown?.largeSensor,
+      meritFieldRms,
     };
 
     return { merit, breakdown };
@@ -4717,9 +4724,22 @@
         `Physical Correct ${(!phys.hardFail && !rayCross.invalid && !realismPenaltyRes.hardInvalid) ? "YES" : "NO"}`;
     }
     if (ui.cockpitDiagnostics) {
+      const meritFieldTxt = Array.isArray(bd?.meritFieldRms) && bd.meritFieldRms.length
+        ? bd.meritFieldRms
+            .map((p, idx) => {
+              const tag = idx === 0
+                ? "center"
+                : (idx === 1 ? "1/3" : (idx === 2 ? "2/3" : "corner"));
+              const ang = Number.isFinite(p?.fieldDeg) ? `${Number(p.fieldDeg).toFixed(1)}°` : "—";
+              const rms = Number.isFinite(p?.rmsMm) ? `${Number(p.rmsMm).toFixed(3)}mm` : "—";
+              return `${tag} ${ang}=${rms}`;
+            })
+            .join(" • ")
+        : "center — • 1/3 — • 2/3 — • corner —";
       ui.cockpitDiagnostics.textContent =
         `selected ${selectedIndex}\n` +
         `rays traced ${traces.length} • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} (${vigPct}%) • tir ${tirCount}\n` +
+        `merit fields ${meritFieldTxt}\n` +
         `xover pairs ${rayCross.crossPairs} • segments ${rayCross.crossSegments}\n` +
         `rear intrusion ${Number.isFinite(intrusion) ? intrusion.toFixed(2) : "—"}mm • overlap ${Number(phys?.worstOverlap || 0).toFixed(3)}mm • pinch ${Number(phys?.worstPinch || 0).toFixed(3)}mm\n` +
         `throughput ${(centerTp.goodFrac * 100).toFixed(1)}% • t-loss ${Number.isFinite(tLoss) ? `+${tLoss.toFixed(2)}st` : "—"}\n` +
@@ -8720,12 +8740,19 @@
     } else if (m === "ic") {
       if (eflDrift > (baselineInvalid ? 12.0 : 6.50)) return "guard_efl";
       if (tDrift > (baselineInvalid ? 2.00 : 1.20)) return "guard_t";
-    } else if (m === "dist" || m === "sharp" || m === "merit") {
+    } else if (m === "dist" || m === "sharp") {
       if (eflDrift > (baselineInvalid ? 4.00 : 1.50)) return "guard_efl";
       if (tDrift > (baselineInvalid ? 1.10 : 0.35)) return "guard_t";
       if (covDrop > (baselineInvalid ? 2.80 : 1.20)) return "guard_cov";
       const icDrop = Math.max(0, Number(baseMetrics?.usableIC?.diameterMm || 0) - Number(candMetrics?.usableIC?.diameterMm || 0));
       if (icDrop > (baselineInvalid ? 2.00 : 0.70)) return "guard_ic";
+    } else if (m === "merit") {
+      // Merit optimizer may rebalance multiple terms; keep guards but less tight than dist/sharp local polish.
+      if (eflDrift > (baselineInvalid ? 7.00 : 3.20)) return "guard_efl";
+      if (tDrift > (baselineInvalid ? 2.20 : 0.95)) return "guard_t";
+      if (covDrop > (baselineInvalid ? 4.00 : 2.20)) return "guard_cov";
+      const icDrop = Math.max(0, Number(baseMetrics?.usableIC?.diameterMm || 0) - Number(candMetrics?.usableIC?.diameterMm || 0));
+      if (icDrop > (baselineInvalid ? 3.50 : 1.80)) return "guard_ic";
     }
     return "";
   }
@@ -8750,7 +8777,7 @@
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const damp = Math.pow(0.58, attempt);
       let cand = null;
-      if (key === "efl" || key === "t" || key === "ic") {
+      if (key === "efl" || key === "t" || key === "ic" || key === "merit") {
         cand = clone(parentLens);
       } else {
         cand = mutateLens(parentLens, mutMode, topo, {
@@ -8818,6 +8845,57 @@
             keepFl: true,
           });
         }
+      } else if (key === "merit") {
+        // Conservative mixed mutation: improve global score while keeping geometry feasible.
+        const tgtEfl = Number(targets?.targetEfl || 50);
+        const tgtT = Number(targets?.targetT || 2.8);
+        const tgtIC = Math.max(
+          Number(targets?.targetIC || 0),
+          Math.hypot(Number(sensor?.w || 36.7), Number(sensor?.h || 25.54))
+        );
+        const meritStrength = Math.max(0.25, damp);
+
+        if (Math.random() < 0.85) {
+          nudgeLensTowardFocal(
+            cand,
+            tgtEfl,
+            wavePreset,
+            randRange(0.28, 0.62) * meritStrength,
+            randRange(0.010, 0.040) * meritStrength,
+            { keepAperture: true }
+          );
+        }
+        if (Math.random() < 0.75) {
+          nudgeStopTowardTargetT(
+            cand.surfaces,
+            tgtEfl,
+            tgtT,
+            randRange(0.28, 0.70) * meritStrength
+          );
+        }
+        if (Math.random() < 0.65) {
+          applyCoverageBoostMutation(cand.surfaces, {
+            targetIC: tgtIC,
+            targetEfl: tgtEfl,
+            targetT: tgtT,
+            icNeedMm: Math.max(0, icNeed) * randRange(0.35, 0.95),
+            keepFl: true,
+          });
+        }
+        if (Math.random() < 0.45) {
+          const sm = applyOneSharpnessMutation(cand.surfaces, SHARP_OPT_CFG);
+          if (!sm?.ok) {
+            lastReason = `sharp_${sm?.reason || "mut"}`;
+            continue;
+          }
+        }
+        if (Math.random() < 0.38) {
+          const dm = applyOneDistortionMutation(cand.surfaces, DIST_OPT_CFG);
+          if (!dm?.ok) {
+            lastReason = `dist_${dm?.reason || "mut"}`;
+            continue;
+          }
+        }
       } else if (key === "dist") {
         const dm = applyOneDistortionMutation(cand.surfaces, DIST_OPT_CFG);
         if (!dm?.ok) {
@@ -8842,7 +8920,7 @@
       enforceSingleStopSurface(cand.surfaces);
       ensureStopInAirBothSides(cand.surfaces);
       enforceRearMountStart(cand.surfaces);
-      localRepairForHardConstraints(cand.surfaces, { passes: attempt < 2 ? 2 : 1 });
+      localRepairForHardConstraints(cand.surfaces, { passes: key === "merit" ? 3 : (attempt < 2 ? 2 : 1) });
       quickSanity(cand.surfaces);
 
       return { ok: true, lens: cand };
@@ -8896,7 +8974,7 @@
       const iters = localOptIterationsForMode(key, { iterations }, settings);
       const batch = Math.max(20, Number(COCKPIT_CFG.progressBatch || 60) | 0);
       const rayCountEval = clamp(Number(num(ui.rayCount?.value, COCKPIT_CFG.defaultRayCount)) | 0, 11, 31);
-      const lutNEval = key === "dist" ? 280 : 220;
+      const lutNEval = (key === "dist" || key === "merit") ? 280 : 220;
       const includeUsableIC = (key === "ic" || key === "merit");
       const includeDistortion = (key === "dist" || key === "merit");
       const includeSharpness = (key === "sharp" || key === "merit");
