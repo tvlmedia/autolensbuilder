@@ -1222,12 +1222,15 @@
     for (let i = 0; i < surfaces.length; i++) {
       const s = surfaces[i];
       const type = String(s?.type || "").toUpperCase();
+      const isOBJ = type === "OBJ";
       const isIMS = type === "IMS";
       const isMECH = type === "MECH" || type === "BAFFLE" || type === "HOUSING";
 
+      // OBJ is a reference/object plane, not a physical refracting sheet.
+      if (isOBJ) continue;
       if (skipIMS && isIMS) continue;
 
-      const hitInfo = intersectSurface(ray, s);
+      let hitInfo = intersectSurface(ray, s);
       const mountHit = (!skipIMS && nBefore <= 1.000001)
         ? mountClipHitAlongRay(ray, hitInfo?.t ?? Infinity)
         : null;
@@ -1237,19 +1240,32 @@
         clippedByMount = true;
         if (!visualFallback) break;
         ray = { p: mountHit.hit, d: ray.d };
+        // Re-evaluate this same surface from the post-clip point.
+        hitInfo = intersectSurface(ray, s);
       }
 
       if (!hitInfo) {
         vignetted = true;
         if (!visualFallback) break;
-        if (Math.abs(ray?.d?.x || 0) > 1e-12) {
-          const tPlane = (Number(s?.vx || ray.p.x) - ray.p.x) / ray.d.x;
-          if (Number.isFinite(tPlane) && tPlane > 1e-9) {
-            const missHit = add(ray.p, mul(ray.d, tPlane));
-            pts.push(missHit);
-            ray = { p: missHit, d: ray.d };
-            continue;
+        const xSurf = Number(s?.vx);
+        if (Number.isFinite(xSurf)) {
+          let xHit = xSurf;
+          let yHit = Number(ray?.p?.y || 0);
+          const dx = Number(ray?.d?.x || 0);
+          if (Math.abs(dx) > 1e-12) {
+            const tPlane = (xSurf - ray.p.x) / dx;
+            if (Number.isFinite(tPlane) && tPlane > 1e-9) {
+              yHit = ray.p.y + ray.d.y * tPlane;
+            } else {
+              xHit = ray.p.x + 0.5; // keep visual path marching forward
+            }
+          } else {
+            xHit = ray.p.x + 0.5;
           }
+          const missHit = { x: xHit, y: yHit };
+          pts.push(missHit);
+          ray = { p: missHit, d: ray.d };
+          continue;
         }
         break;
       }
@@ -4340,13 +4356,22 @@
       }
 
       const last = tr.endRay;
+      let drewToSensor = false;
       if (last && Number.isFinite(sensorX) && last.d && Math.abs(last.d.x) > 1e-9) {
         const t = (sensorX - last.p.x) / last.d.x;
         if (t > 0) {
           const hit = add(last.p, mul(last.d, t));
           const ps = worldToScreen(hit, world);
           ctx.lineTo(ps.x, ps.y);
+          drewToSensor = true;
         }
+      }
+      if (!drewToSensor && tr.visualFallback && last?.p && last?.d) {
+        const d = normalize(last.d);
+        const dUse = (Math.abs(d.x) > 1e-9 || Math.abs(d.y) > 1e-9) ? d : { x: 1, y: 0 };
+        const ext = add(last.p, mul(dUse, 35));
+        const pe = worldToScreen(ext, world);
+        ctx.lineTo(pe.x, pe.y);
       }
       ctx.stroke();
     }
