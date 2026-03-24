@@ -1208,6 +1208,7 @@
 
   function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     const skipIMS = !!opts.skipIMS;
+    const visualFallback = !!opts.visualFallback;
 
     let pts = [];
     let vignetted = false;
@@ -1230,13 +1231,35 @@
       const mountHit = (!skipIMS && nBefore <= 1.000001)
         ? mountClipHitAlongRay(ray, hitInfo?.t ?? Infinity)
         : null;
-      if (mountHit) { pts.push(mountHit.hit); vignetted = true; clippedByMount = true; break; }
+      if (mountHit) {
+        pts.push(mountHit.hit);
+        vignetted = true;
+        clippedByMount = true;
+        if (!visualFallback) break;
+        ray = { p: mountHit.hit, d: ray.d };
+      }
 
-      if (!hitInfo) { vignetted = true; break; }
+      if (!hitInfo) {
+        vignetted = true;
+        if (!visualFallback) break;
+        if (Math.abs(ray?.d?.x || 0) > 1e-12) {
+          const tPlane = (Number(s?.vx || ray.p.x) - ray.p.x) / ray.d.x;
+          if (Number.isFinite(tPlane) && tPlane > 1e-9) {
+            const missHit = add(ray.p, mul(ray.d, tPlane));
+            pts.push(missHit);
+            ray = { p: missHit, d: ray.d };
+            continue;
+          }
+        }
+        break;
+      }
 
       pts.push(hitInfo.hit);
 
-      if (!isIMS && hitInfo.vignetted) { vignetted = true; break; }
+      if (!isIMS && hitInfo.vignetted) {
+        vignetted = true;
+        if (!visualFallback) break;
+      }
 
       if (isIMS || isMECH) {
         ray = { p: hitInfo.hit, d: ray.d };
@@ -1252,13 +1275,18 @@
       }
 
       const newDir = refract(ray.d, hitInfo.normal, nBefore, nAfter);
-      if (!newDir) { tir = true; break; }
+      if (!newDir) {
+        tir = true;
+        if (!visualFallback) break;
+        ray = { p: hitInfo.hit, d: ray.d };
+        continue;
+      }
 
       ray = { p: hitInfo.hit, d: newDir };
       nBefore = nAfter;
     }
 
-    return { pts, vignetted, tir, clippedByMount, endRay: ray };
+    return { pts, vignetted, tir, clippedByMount, endRay: ray, visualFallback };
   }
 
   // -------------------- ray bundles --------------------
@@ -4299,7 +4327,9 @@
 
     for (const tr of rayTraces) {
       if (!tr.pts || tr.pts.length < 2) continue;
-      ctx.globalAlpha = tr.vignetted ? 0.10 : 1.0;
+      ctx.globalAlpha = tr.vignetted
+        ? (tr.visualFallback ? 0.45 : 0.12)
+        : 1.0;
 
       ctx.beginPath();
       const p0 = worldToScreen(tr.pts[0], world);
@@ -4585,6 +4615,9 @@
 
     const rays = buildRays(lens.surfaces, fieldAngle, rayCount);
     const traces = rays.map((r) => traceRayForward(clone(r), lens.surfaces, wavePreset));
+    const tracesVisual = rays.map((r) =>
+      traceRayForward(clone(r), lens.surfaces, wavePreset, { visualFallback: true })
+    );
     const rayCross = detectInternalRayCrossings(traces, lens.surfaces, wavePreset);
     const crossPenalty = internalCrossPenaltyFromStats(rayCross);
 
@@ -4930,7 +4963,7 @@
     drawPLFlange(world, plX);
     drawLens(world, lens.surfaces);
     drawStop(world, lens.surfaces);
-    drawRays(world, traces, sensorX);
+    drawRays(world, tracesVisual, sensorX);
     drawPLMountCutout(world, plX);
     drawSensor(world, sensorX, halfH);
 
