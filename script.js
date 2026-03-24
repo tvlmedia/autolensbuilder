@@ -9062,7 +9062,10 @@
 
   function localProfileFromUi(settings = {}, mode = "focal") {
     const exp = String(ui.optPop?.value || "safe").toLowerCase();
-    const level = exp === "wild" ? "macro" : (exp === "normal" ? "local" : "micro");
+    const levelRaw = exp === "wild" ? "macro" : (exp === "normal" ? "local" : "micro");
+    const modeKey = normalizeLocalMode(mode);
+    // Merit runs in "safe" often stall in micro; promote to local by default.
+    const level = (modeKey === "merit" && levelRaw === "micro") ? "local" : levelRaw;
     const sMul = clamp(Number(settings?.stepSize || COCKPIT_CFG.defaultStepSize) / COCKPIT_CFG.defaultStepSize, 0.55, 2.6);
     const relRBase = [0.001, 0.0025, 0.005, 0.01];
     if (level !== "micro") relRBase.push(level === "macro" ? 0.02 : 0.015);
@@ -9073,19 +9076,21 @@
     const apBase = [0.02, 0.05, 0.10];
     const strict = String(settings?.strictness || "normal").toLowerCase() === "strict";
     const guardBase = strict ? 0.80 : 1.00;
-    const modeKey = normalizeLocalMode(mode);
+    const meritStepBoost = modeKey === "merit" ? 1.25 : 1.0;
     return {
       level,
       modeKey,
-      relRadiusSteps: relRBase.map((v) => clamp(v * sMul, 0.0006, 0.03)),
-      absRadiusSteps: absRBase.map((v) => clamp(v * sMul, 0.02, 1.20)),
-      thicknessSteps: tBase.map((v) => clamp(v * sMul, 0.01, 0.70)),
-      apertureSteps: apBase.map((v) => clamp(v * sMul, 0.01, 0.18)),
+      relRadiusSteps: relRBase.map((v) => clamp(v * sMul * meritStepBoost, 0.0006, 0.03)),
+      absRadiusSteps: absRBase.map((v) => clamp(v * sMul * meritStepBoost, 0.02, 1.20)),
+      thicknessSteps: tBase.map((v) => clamp(v * sMul * meritStepBoost, 0.01, 0.70)),
+      apertureSteps: apBase.map((v) => clamp(v * sMul * meritStepBoost, 0.01, 0.22)),
       allowGlassSwap: level !== "micro",
       maxGlassCandidates: level === "macro" ? 8 : 5,
       maxNoImprovePasses: level === "macro" ? 5 : (level === "local" ? 3 : 2),
       guardScale: guardBase * (level === "macro" ? 1.35 : (level === "local" ? 1.05 : 0.82)),
-      driftWeight: level === "macro" ? 0.55 : (level === "local" ? 1.25 : 2.60),
+      driftWeight: modeKey === "merit"
+        ? (level === "macro" ? 0.30 : (level === "local" ? 0.55 : 1.10))
+        : (level === "macro" ? 0.55 : (level === "local" ? 1.25 : 2.60)),
       glassSwapPenalty: level === "macro" ? 0.22 : (level === "local" ? 0.42 : 0.85),
     };
   }
@@ -9192,7 +9197,9 @@
         allow: {
           R: !isStop,
           t: !isStop,
-          ap: isStop ? (modeKey === "tstop") : (modeKey === "tstop" || (modeKey === "imageCircle" && dStop <= 3)),
+          ap: isStop
+            ? (modeKey === "tstop" || modeKey === "merit")
+            : (modeKey === "tstop" || (modeKey === "imageCircle" && dStop <= 3) || (modeKey === "merit" && dStop <= 2)),
           glass: !isStop && profile.allowGlassSwap && resolveGlassName(s?.glass || "AIR") !== "AIR",
         },
         priority,
@@ -9264,7 +9271,7 @@
     } else if (paramKey === "ap") {
       const steps = profile.apertureSteps || [0.02, 0.05, 0.10];
       const modeKey = normalizeLocalMode(mode);
-      const signs = (modeKey === "tstop" && surfaceIndex === stopIdx) ? [1, -1] : [-1, 1];
+      const signs = ((modeKey === "tstop" || modeKey === "merit") && surfaceIndex === stopIdx) ? [1, -1] : [-1, 1];
       for (const step of steps) {
         for (const sign of signs) {
           addCandidate((s) => {
@@ -9330,7 +9337,13 @@
     const primaryCur = localPrimaryScore(modeKey, currentMetrics, targets, sensor);
     const primaryCand = localPrimaryScore(modeKey, candidateMetrics, targets, sensor);
     if (!(Number.isFinite(primaryCur) && Number.isFinite(primaryCand))) return { ok: false, reason: "primary_nan" };
-    if (!(primaryCand + 1e-9 < primaryCur)) return { ok: false, reason: "no_primary" };
+    if (modeKey !== "merit") {
+      if (!(primaryCand + 1e-9 < primaryCur)) return { ok: false, reason: "no_primary" };
+    } else {
+      // Merit mode: allow tiny non-worsening steps so drift can be paid down while escaping plateaus.
+      const primaryTol = profile?.level === "macro" ? 0.030 : (profile?.level === "local" ? 0.016 : 0.008);
+      if (primaryCand > primaryCur + primaryTol) return { ok: false, reason: "no_primary" };
+    }
 
     const guardScale = Number(profile?.guardScale || 1.0);
     const baseEfl = Number(baselineMetrics?.efl || 0);
@@ -9363,12 +9376,20 @@
 
     const drift = computeDesignDriftPenalty(candidateLens, baselineLens, profile);
     const curDrift = computeDesignDriftPenalty(currentLens, baselineLens, profile);
-    const driftMul = modeKey === "merit"
-      ? (profile?.level === "macro" ? 0.22 : (profile?.level === "local" ? 0.35 : 0.55))
+    const baselineInvalid = !!(baselineMetrics?.feasible && baselineMetrics.feasible.ok === false);
+    const driftMulRaw = modeKey === "merit"
+      ? (profile?.level === "macro" ? 0.05 : (profile?.level === "local" ? 0.08 : 0.14))
       : 1.0;
+    const driftMul = baselineInvalid ? (driftMulRaw * 0.45) : driftMulRaw;
     const score = primaryCand + driftMul * drift;
     const curScore = primaryCur + driftMul * curDrift;
-    if (!(score + 1e-9 < curScore)) return { ok: false, reason: "drift" };
+    if (modeKey !== "merit") {
+      if (!(score + 1e-9 < curScore)) return { ok: false, reason: "drift" };
+    } else {
+      const strongPrimaryGain = (primaryCand < (primaryCur - 0.004)) || (primaryCur > 1e-9 && primaryCand < (primaryCur * 0.985));
+      const relaxedPass = strongPrimaryGain && score <= (curScore + 0.012);
+      if (!((score + 1e-9 < curScore) || relaxedPass)) return { ok: false, reason: "drift" };
+    }
 
     return {
       ok: true,
