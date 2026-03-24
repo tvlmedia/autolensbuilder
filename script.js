@@ -9442,7 +9442,12 @@
     } else {
       const strongPrimaryGain = (primaryCand < (primaryCur - 0.004)) || (primaryCur > 1e-9 && primaryCand < (primaryCur * 0.985));
       const relaxedPass = strongPrimaryGain && score <= (curScore + (baselineInvalid ? 0.065 : 0.028));
-      if (!((score + 1e-9 < curScore) || relaxedPass)) return { ok: false, reason: "drift" };
+      // Escape hatch for merit local minima: allow a candidate that pays down
+      // design drift significantly while keeping sharpness almost unchanged.
+      const driftImproved = Number.isFinite(drift) && Number.isFinite(curDrift) && (drift <= (curDrift * 0.92));
+      const primaryNearlySame = primaryCand <= (primaryCur + (baselineInvalid ? 0.020 : 0.010));
+      const driftEscapePass = driftImproved && primaryNearlySame;
+      if (!((score + 1e-9 < curScore) || relaxedPass || driftEscapePass)) return { ok: false, reason: "drift" };
     }
 
     return {
@@ -9735,19 +9740,20 @@
       // Merit mode can keep wandering with tiny accepted changes.
       // Stop early when best score has plateaued for too long.
       if (modeKey === "merit") {
-        const minWarmup = Math.max(450, Math.round(iterations * 0.006));
+        const minWarmup = Math.max(180, Math.round(iterations * 0.002));
         // Stop much earlier on merit plateaus; long "macro merit" runs otherwise waste time.
         const plateauLimit = Math.max(
-          900,
+          260,
           Math.min(
-            6000,
-            Math.round(iterations * (prof.level === "macro" ? 0.015 : (prof.level === "local" ? 0.010 : 0.008)))
+            1800,
+            Math.round(iterations * (prof.level === "macro" ? 0.006 : (prof.level === "local" ? 0.004 : 0.003)))
           )
         );
         if (itersRan > minWarmup) {
           const staleFor = itersRan - Math.max(0, lastBestUpdateIter);
           if (staleFor >= plateauLimit) {
             stoppedByPlateau = true;
+            rejects._plateau_limit = plateauLimit;
             break;
           }
         }
