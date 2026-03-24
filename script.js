@@ -953,6 +953,33 @@
     clearanceMm: 0.08,  // tiny safety clearance to avoid optimistic edge cases
   };
 
+  function plMountWindowX() {
+    const xFlange = -PL_FFD;
+    return {
+      xMin: xFlange - Number(MOUNT_TRACE_CFG.lensLip || 0),
+      xMax: xFlange + Number(MOUNT_TRACE_CFG.camDepth || 0),
+    };
+  }
+
+  function isStopInsidePlMount(surfaces, marginMm = 0) {
+    if (!Array.isArray(surfaces) || !surfaces.length) return false;
+    const stopIdx = findStopSurfaceIndex(surfaces);
+    if (stopIdx < 0 || !surfaces[stopIdx]) return false;
+    const x = Number(surfaces[stopIdx].vx);
+    if (!Number.isFinite(x)) return false;
+    const m = Math.max(0, Number(marginMm || 0));
+    const w = plMountWindowX();
+    return x >= (w.xMin - m) && x <= (w.xMax + m);
+  }
+
+  function effectiveBflShortMm(bfl, plIntrusionMm = 0) {
+    const bflMin = Number(MERIT_CFG.bflMin || 52);
+    const allowGlassInMount = !!COCKPIT_CFG.allowGlassInPlMount;
+    const intr = allowGlassInMount ? Math.max(0, Number(plIntrusionMm || 0)) : 0;
+    const required = Math.max(0, bflMin - intr);
+    return Number.isFinite(bfl) ? Math.max(0, required - bfl) : Infinity;
+  }
+
   function minGapBetweenSurfaces(sFront, sBack, yMax, samples = 11) {
     const n = Math.max(3, samples | 0);
     const ym = Math.max(0.001, Number(yMax || 0));
@@ -1780,6 +1807,9 @@
     defaultMacroPasses: 2,
     hardMinValidCenterFrac: 0.28,
     plIntrusionRejectMm: 0.50,
+    allowGlassInPlMount: true,
+    stopMustStayOutOfPlMount: true,
+    stopInMountMarginMm: 0.0,
     maxBflShortRejectMm: 1.0,
     defaultObjDistMm: Number(DIST_OPT_CFG.objDistMm || 20000),
     defaultLutN: 240,
@@ -4682,6 +4712,7 @@
 
     const rearVx = lastPhysicalVertexX(lens.surfaces);
     const intrusion = rearVx - plX;
+    const stopInMountNow = isStopInsidePlMount(lens.surfaces, Number(COCKPIT_CFG.stopInMountMarginMm || 0));
     const phys = evaluatePhysicalConstraints(lens.surfaces);
     const physPenaltyBase = Number(phys.penalty || 0);
     const targetEflUi = num(ui.optTargetFL?.value, NaN);
@@ -4712,7 +4743,8 @@
         T,
         softIcMm: softIcValid ? icDiameterMm : 0,
         intrusion,
-        hardInvalid: !!phys.hardFail || !!rayCross.invalid || !!realismBase?.hardInvalid,
+        stopInMount: stopInMountNow,
+        hardInvalid: !!phys.hardFail || !!rayCross.invalid || !!realismBase?.hardInvalid || (!!COCKPIT_CFG.stopMustStayOutOfPlMount && stopInMountNow),
         physPenalty: physPenaltyBase,
         worstOverlap: Number(phys.worstOverlap || 0),
         worstPinch: Number(phys.worstPinch || 0),
@@ -4938,10 +4970,12 @@
       ? (Math.atan((0.5 * Math.hypot(sensorW, sensorH)) / efl) * 180 / Math.PI)
       : Number.NaN;
     const cockpitReasons = [];
-    const bflShortMm = Number.isFinite(bfl) ? Math.max(0, Number(MERIT_CFG.bflMin || 52) - bfl) : Infinity;
+    const stopInMount = isStopInsidePlMount(lens.surfaces, Number(COCKPIT_CFG.stopInMountMarginMm || 0));
+    const bflShortMm = effectiveBflShortMm(bfl, intrusion);
     if (phys.hardFail) cockpitReasons.push("physics");
     if (rayCross.invalid) cockpitReasons.push("xover");
-    if (!(intrusion <= Number(COCKPIT_CFG.plIntrusionRejectMm || 0.5))) cockpitReasons.push("pl");
+    if (!!COCKPIT_CFG.stopMustStayOutOfPlMount && stopInMount) cockpitReasons.push("stop_pl");
+    if (!COCKPIT_CFG.allowGlassInPlMount && !(intrusion <= Number(COCKPIT_CFG.plIntrusionRejectMm || 0.5))) cockpitReasons.push("pl");
     if (!(bflShortMm <= Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0))) cockpitReasons.push("bfl");
     if (!Number.isFinite(T) || T <= 0) cockpitReasons.push("t");
     if (!Number.isFinite(efl) || efl <= 0) cockpitReasons.push("efl");
@@ -4953,6 +4987,7 @@
         overlapOk: !phys.hardFail && Number(phys.worstOverlap || 0) <= 1e-4,
         thicknessOk: !phys.hardFail && Number(phys.worstPinch || 0) <= 1e-4,
         stopOk: findStopSurfaceIndex(lens.surfaces) >= 0,
+        stopInMount,
         validCenterFrac: clamp(1 - (vigPct / 100), 0, 1),
         bflShortMm,
       },
@@ -7187,6 +7222,8 @@
       Number(state?.distScore) ||
       Number(state?.score) ||
       0;
+    const hardInvalid = !!meta?.hardInvalid;
+    const stopInMount = !!(meta?.stopInMount ?? state?.stopInMount);
     optBest = {
       lens: sanitizeLens(clone(bestLens)),
       eval: {
@@ -7198,11 +7235,12 @@
         physPenalty: Number.isFinite(Number(phys?.penalty)) ? Number(phys.penalty) : 0,
         worstOverlap: Number.isFinite(Number(phys?.worstOverlap)) ? Number(phys.worstOverlap) : 0,
         worstPinch: Number.isFinite(Number(phys?.worstPinch)) ? Number(phys.worstPinch) : 0,
-        hardInvalid: false,
+        hardInvalid,
         internalCrossPairs: Math.max(0, Number(cross?.crossPairs || 0)),
         internalCrossSegments: Math.max(0, Number(cross?.crossSegments || 0)),
         lensShift,
         softIcMm: Number.isFinite(Number(meta?.softIcMm)) ? Number(meta.softIcMm) : 0,
+        stopInMount,
         rms0: Number.isFinite(Number(state?.sharp?.centerRmsMm)) ? Number(state.sharp.centerRmsMm) : null,
         rmsE: Number.isFinite(Number(state?.sharp?.edgeRmsMm)) ? Number(state.sharp.edgeRmsMm) : null,
         distEdgePct: Number.isFinite(Number(state?.dist70Pct)) ? Number(state.dist70Pct) : null,
@@ -7213,6 +7251,8 @@
         focusMode,
         sensorX: Number.isFinite(sensorX) ? sensorX : 0,
         lensShift: Number.isFinite(lensShift) ? lensShift : 0,
+        hardInvalid,
+        stopInMount,
       },
     };
     return true;
@@ -8674,6 +8714,7 @@
       T: Number(m?.T),
       bfl: Number(m?.bfl),
       intrusion: Number(m?.feasible?.plIntrusionMm || 0),
+      stopInMount: !!m?.feasible?.stopInMount,
       phys: m?.phys || {},
       cross: m?.cross || {},
       dist70Pct: Number(m?.distortion?.dist70Pct),
@@ -9882,7 +9923,7 @@
       }
       const finalHard = failsHardConstraints(bestLens?.surfaces || [], bestMetrics, { strictness: settings.strictness });
       const improved = !finalHard.fail && Number.isFinite(bestMerit) && Number.isFinite(baseMerit) && (bestMerit + 1e-9 < baseMerit);
-      const hasUsableBest = !finalHard.fail && bestIter > 0;
+      const hasUsableBest = bestIter > 0;
       const queuedBest = improved || hasUsableBest;
       const bestFocus = {
         focusMode: focus.focusMode,
@@ -9905,6 +9946,7 @@
           sensorX: bestFocus.sensorX,
           lensShift: bestFocus.lensShift,
           softIcMm: Number(bestMetrics?.usableIC?.diameterMm || 0),
+          hardInvalid: !!finalHard?.fail,
         });
         if (key === "dist") {
           queueDistortionBest(bestLens, st, {
@@ -9945,7 +9987,7 @@
         `${cockpitStopRequested ? "stopped" : "done"} ${itersRan}/${iters}\n` +
         `best iteration ${bestIterTxt}\n` +
         `${usedValidFallback ? "best valid fallback used\n" : ""}` +
-        `${queuedBest ? (shouldApply ? "APPLIED ✅" : "QUEUED (Apply best)") : "no better candidate"}\n` +
+        `${queuedBest ? (shouldApply ? "APPLIED ✅" : (finalHard?.fail ? "QUEUED (Apply best • invalid best)" : "QUEUED (Apply best)")) : "no better candidate"}\n` +
         `before EFL ${Number(baseMetrics?.efl || 0).toFixed(2)}mm • T ${Number(baseMetrics?.T || 0).toFixed(2)} • IC ${Number(baseMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm` +
         `${includeDistortion ? ` • DistRMS ${Number(baseMetrics?.distortion?.rmsPct || 0).toFixed(2)}%` : ""}` +
         `${includeSharpness ? ` • Sharp C/E ${Number(baseMetrics?.sharpness?.rmsCenter || 0).toFixed(3)}/${Number(baseMetrics?.sharpness?.rmsEdge || 0).toFixed(3)}mm` : ""}` +
@@ -11549,17 +11591,20 @@
     const afOk = evalRes?.afOk !== false;
     const hardInvalid = !!evalRes?.hardInvalid || crossPairs > 0 || realismHardInvalid || !afOk;
     const intrusionMm = Math.max(0, Number(evalRes?.intrusion || 0));
+    const stopInMount = !!evalRes?.stopInMount;
     const overlapMm = Math.max(0, Number(evalRes?.worstOverlap || 0));
     const pinchMm = Math.max(0, Number(evalRes?.worstPinch || 0));
     const physPenalty = Math.max(0, Number(evalRes?.physPenalty || 0));
-    const bflShortMm = Number.isFinite(bfl) ? Math.max(0, MERIT_CFG.bflMin - bfl) : MERIT_CFG.bflMin;
+    const bflShortMm = effectiveBflShortMm(bfl, intrusionMm);
     const bflHardShortMm = Math.max(0.1, Number(OPT_STAGE_CFG.bflHardShortMm || 0.8));
     const bflHardFail = bflShortMm > bflHardShortMm;
     const bflBad = bflShortMm > 0.5;
-    const feasible = !hardInvalid && !bflHardFail && intrusionMm <= 1e-3 && overlapMm <= 1e-3 && crossPairs <= 0;
+    const intrusionHardFail = (!COCKPIT_CFG.allowGlassInPlMount) && intrusionMm > 1e-3;
+    const feasible = !hardInvalid && !bflHardFail && !stopInMount && !intrusionHardFail && overlapMm <= 1e-3 && crossPairs <= 0;
     const feasibilityDebt =
       (hardInvalid ? 5000 : 0) +
       (!afOk ? 2800 : 0) +
+      (stopInMount ? 4200 : 0) +
       (bflHardFail ? 2400 : 0) +
       intrusionMm * 1200 +
       overlapMm * 2000 +
@@ -11628,6 +11673,7 @@
       feasibilityDebt,
       hardInvalid,
       intrusionMm,
+      stopInMount,
       overlapMm,
       pinchMm,
       physPenalty,
@@ -12255,6 +12301,7 @@
     const phys = evaluatePhysicalConstraints(work);
     const rearVx = lastPhysicalVertexX(work);
     const plIntrusionMm = Number.isFinite(rearVx) ? (rearVx - (-PL_FFD)) : Infinity;
+    const stopInMount = isStopInsidePlMount(work, Number(COCKPIT_CFG.stopInMountMarginMm || 0));
 
     const centerRays = buildRays(work, 0, Math.max(11, Math.min(31, rays)));
     const centerTraces = centerRays.map((r) => traceRayForward(clone(r), work, wavePreset));
@@ -12271,7 +12318,7 @@
     const parax = estimateEflBflParaxial(work, wavePreset);
     const efl = Number(parax?.efl);
     const bfl = Number(parax?.bfl);
-    const bflShortMm = Number.isFinite(bfl) ? Math.max(0, Number(MERIT_CFG.bflMin || 52) - bfl) : Infinity;
+    const bflShortMm = effectiveBflShortMm(bfl, plIntrusionMm);
     const T = estimateTStopApprox(efl, work);
     const maxFieldDeg = coverageTestMaxFieldDeg(work, wavePreset, sx, {
       sensorW: wMm,
@@ -12385,9 +12432,10 @@
 
     const reasons = [];
     if (stopIdx < 0) reasons.push("stop");
+    if (!!COCKPIT_CFG.stopMustStayOutOfPlMount && stopInMount) reasons.push("stop_pl");
     if (!!phys?.hardFail) reasons.push("physics");
     if (cross?.invalid) reasons.push("xover");
-    if (!(plIntrusionMm <= Number(COCKPIT_CFG.plIntrusionRejectMm || 0.5))) reasons.push("pl");
+    if (!COCKPIT_CFG.allowGlassInPlMount && !(plIntrusionMm <= Number(COCKPIT_CFG.plIntrusionRejectMm || 0.5))) reasons.push("pl");
     if (!(validCenterFrac >= Number(COCKPIT_CFG.hardMinValidCenterFrac || 0.28))) reasons.push("vignette");
     if (!(bflShortMm <= Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0))) reasons.push("bfl");
 
@@ -12399,6 +12447,7 @@
         overlapOk: Number(phys?.worstOverlap || 0) <= 1e-4,
         thicknessOk: Number(phys?.worstPinch || 0) <= 1e-4 && !phys?.hardFail,
         stopOk: stopIdx >= 0,
+        stopInMount,
         validCenterFrac,
         bflShortMm,
         hardPhysics: !!phys?.hardFail,
@@ -12449,8 +12498,9 @@
     if (!Number.isFinite(metrics?.efl) || Number(metrics?.efl) <= 1e-6) reasons.push("efl");
     if (!Number.isFinite(metrics?.T) || Number(metrics?.T) <= 0) reasons.push("t");
     if (!metrics?.feasible?.stopOk) reasons.push("stop");
+    if (!!COCKPIT_CFG.stopMustStayOutOfPlMount && !!metrics?.feasible?.stopInMount) reasons.push("stop_pl");
     if (metrics?.feasible?.hardPhysics) reasons.push("physics");
-    if (!(Number(metrics?.feasible?.plIntrusionMm) <= plLimit)) reasons.push("pl");
+    if (!COCKPIT_CFG.allowGlassInPlMount && !(Number(metrics?.feasible?.plIntrusionMm) <= plLimit)) reasons.push("pl");
     if (!(Number(metrics?.feasible?.validCenterFrac) >= minValid)) reasons.push("valid");
     if (!(Number(metrics?.feasible?.bflShortMm) <= bflLimit)) reasons.push("bfl");
     if (Number(metrics?.feasible?.crossPairs || 0) > 0) reasons.push("xover");
@@ -12640,10 +12690,12 @@
     const rearVxFocused = lastPhysicalVertexX(surfaces);
     const intrusionFocused = Number.isFinite(rearVxFocused) ? (rearVxFocused - (-PL_FFD)) : Infinity;
     const intrusion = Math.max(intrusionNeutral, intrusionFocused);
+    const stopInMount = isStopInsidePlMount(surfaces, Number(COCKPIT_CFG.stopInMountMarginMm || 0));
+    if (!!COCKPIT_CFG.stopMustStayOutOfPlMount && stopInMount) return { ok: false, reason: "stop_pl", intrusion, phys };
     const baseIntr = Number(plBaselineIntrusionMm);
     const plTol = Math.max(0, Number(plWorsenTolMm ?? DIST_OPT_CFG.plWorsenTolMm ?? 0.05));
     const allowRelaxedPl = Number.isFinite(baseIntr) && baseIntr > 1e-3 && intrusion <= (baseIntr + plTol);
-    if (!(intrusion <= 1e-3) && !allowRelaxedPl) return { ok: false, reason: "pl", intrusion, phys };
+    if (!COCKPIT_CFG.allowGlassInPlMount && !(intrusion <= 1e-3) && !allowRelaxedPl) return { ok: false, reason: "pl", intrusion, phys };
 
     const rays = buildRays(surfaces, 0, 13);
     const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
@@ -12652,7 +12704,7 @@
 
     const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
     if (!(Number.isFinite(efl) && efl > 1e-6)) return { ok: false, reason: "efl", phys };
-    const bflShortMm = Number.isFinite(bfl) ? Math.max(0, MERIT_CFG.bflMin - bfl) : Infinity;
+    const bflShortMm = effectiveBflShortMm(bfl, intrusion);
     const baseBflShort = Number(bflBaselineShortMm);
     const bflTol = Math.max(0, Number(bflWorsenTolMm ?? DIST_OPT_CFG.bflWorsenTolMm ?? 0.10));
     const allowRelaxedBfl = Number.isFinite(baseBflShort) && baseBflShort > 1e-6 && bflShortMm <= (baseBflShort + bflTol);
@@ -13108,10 +13160,12 @@
     const rearVxFocused = lastPhysicalVertexX(surfaces);
     const intrusionFocused = Number.isFinite(rearVxFocused) ? (rearVxFocused - (-PL_FFD)) : Infinity;
     const intrusion = Math.max(intrusionNeutral, intrusionFocused);
+    const stopInMount = isStopInsidePlMount(surfaces, Number(COCKPIT_CFG.stopInMountMarginMm || 0));
+    if (!!COCKPIT_CFG.stopMustStayOutOfPlMount && stopInMount) return { ok: false, reason: "stop_pl", intrusion, phys, focus };
     const baseIntr = Number(plBaselineIntrusionMm);
     const plTol = Math.max(0, Number(plWorsenTolMm ?? SHARP_OPT_CFG.plWorsenTolMm ?? 0.05));
     const allowRelaxedPl = Number.isFinite(baseIntr) && baseIntr > 1e-3 && intrusion <= (baseIntr + plTol);
-    if (!(intrusion <= 1e-3) && !allowRelaxedPl) return { ok: false, reason: "pl", intrusion, phys, focus };
+    if (!COCKPIT_CFG.allowGlassInPlMount && !(intrusion <= 1e-3) && !allowRelaxedPl) return { ok: false, reason: "pl", intrusion, phys, focus };
 
     const rays = buildRays(surfaces, 0, 13);
     const traces = rays.map((r) => traceRayForward(clone(r), surfaces, wavePreset));
@@ -13120,7 +13174,7 @@
 
     const { efl, bfl } = estimateEflBflParaxial(surfaces, wavePreset);
     if (!(Number.isFinite(efl) && efl > 1e-6)) return { ok: false, reason: "efl", focus, phys };
-    const bflShortMm = Number.isFinite(bfl) ? Math.max(0, Number(MERIT_CFG.bflMin || 52) - bfl) : Infinity;
+    const bflShortMm = effectiveBflShortMm(bfl, intrusion);
     const baseBflShort = Number(bflBaselineShortMm);
     const bflTol = Math.max(0, Number(bflWorsenTolMm ?? SHARP_OPT_CFG.bflWorsenTolMm ?? 0.10));
     const allowRelaxedBfl = Number.isFinite(baseBflShort) && baseBflShort > 1e-6 && bflShortMm <= (baseBflShort + bflTol);
@@ -14619,7 +14673,10 @@
     };
     const p = buildOptPriority(optBest.eval, targets);
     if (!p.feasible) {
-      return toast("Best is fysiek ongeldig (intrusion/overlap/BFL). Eerst verder optimaliseren.");
+      if (p.stopInMount) {
+        return toast("Best is fysiek ongeldig: iris/STOP staat in de PL-mount zone.");
+      }
+      return toast("Best is fysiek ongeldig (overlap/BFL/crossings). Eerst verder optimaliseren.");
     }
     const usable = scratchMinimumUsableReached({ pri: p, evalRes: optBest.eval }, targets);
     if (!usable) {
