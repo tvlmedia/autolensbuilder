@@ -648,7 +648,8 @@
   }
 
   function intersectSurface(ray, surf) {
-    const INTERSECT_SHEET_TOL = 1e-5;
+    const INTERSECT_SHEET_TOL = 5e-4;
+    const INTERSECT_SHEET_INSIDE_TOL = 1e-7;
     const DEBUG_WRONG_SHEET_HITS = false;
     const vx = surf.vx;
     const R = Number(surf.R || 0);
@@ -685,26 +686,34 @@
       (-B + sdisc) / (2 * A),
     ];
     let best = null;
+    let bestErr = Number.POSITIVE_INFINITY;
     for (const t of candidates) {
       if (!Number.isFinite(t) || t <= 1e-9) continue;
       const hit = add(ray.p, mul(ray.d, t));
-      const expectedX = surfaceXatY(surf, hit.y);
-      if (!Number.isFinite(expectedX)) continue;
-      if (Math.abs(hit.x - expectedX) > INTERSECT_SHEET_TOL) {
-        if (DEBUG_WRONG_SHEET_HITS) {
-          console.log("Rejected wrong-sheet hit", {
-            t,
-            hit,
-            expectedX,
-            R,
-            vx,
-          });
-        }
-        continue;
+      const sign = Math.sign(R) || 1;
+      const inside = rad * rad - hit.y * hit.y;
+      if (inside < -INTERSECT_SHEET_INSIDE_TOL) continue;
+      const expectedX = cx - sign * Math.sqrt(Math.max(0, inside));
+      const err = Math.abs(hit.x - expectedX);
+      if (err < bestErr - 1e-12 || (Math.abs(err - bestErr) <= 1e-12 && (!best || t < best.t))) {
+        bestErr = err;
+        best = { t, hit, expectedX, err };
       }
-      if (!best || t < best.t) best = { t, hit };
     }
     if (!best) return null;
+    if (bestErr > INTERSECT_SHEET_TOL) {
+      if (DEBUG_WRONG_SHEET_HITS) {
+        console.log("Rejected wrong-sheet hit", {
+          t: best.t,
+          hit: best.hit,
+          expectedX: best.expectedX,
+          err: bestErr,
+          R,
+          vx,
+        });
+      }
+      return null;
+    }
 
     const hit = best.hit;
     const vignetted = Math.abs(hit.y) > ap + 1e-9;
