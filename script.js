@@ -9882,6 +9882,8 @@
       }
       const finalHard = failsHardConstraints(bestLens?.surfaces || [], bestMetrics, { strictness: settings.strictness });
       const improved = !finalHard.fail && Number.isFinite(bestMerit) && Number.isFinite(baseMerit) && (bestMerit + 1e-9 < baseMerit);
+      const hasUsableBest = !finalHard.fail && bestIter > 0;
+      const queuedBest = improved || hasUsableBest;
       const bestFocus = {
         focusMode: focus.focusMode,
         sensorX: Number(bestMetrics?.focus?.sensorX ?? focus.sensorX ?? 0),
@@ -9892,9 +9894,9 @@
       // run optimizer -> inspect -> click Apply best.
       // Nested runs (macro) still auto-apply between stages.
       const autoApplyLocal = nested ? true : false;
-      const shouldApply = improved && autoApplyLocal;
+      const shouldApply = queuedBest && autoApplyLocal;
 
-      if (improved) {
+      if (queuedBest) {
         const st = metricsToLocalOptState(bestMetrics, key);
         queueManualBestFromState(bestLens, st, {
           source: key,
@@ -9932,18 +9934,18 @@
         scheduleRenderPreviewIfAvailable();
         scheduleAutosave();
         recordCockpitSnapshot(`${label} • applied`);
-      } else if (improved) {
+      } else if (queuedBest) {
         renderAll();
       }
 
-      const afterMetrics = improved ? bestMetrics : baseMetrics;
+      const afterMetrics = queuedBest ? bestMetrics : baseMetrics;
       const bestIterTxt = bestIter > 0 ? `${bestIter}/${Math.max(1, iters)}` : "baseline (0)";
       setOptLog(
         `${runHeader}\n` +
         `${cockpitStopRequested ? "stopped" : "done"} ${itersRan}/${iters}\n` +
         `best iteration ${bestIterTxt}\n` +
         `${usedValidFallback ? "best valid fallback used\n" : ""}` +
-        `${improved ? (shouldApply ? "APPLIED ✅" : "QUEUED (Apply best)") : "no better candidate"}\n` +
+        `${queuedBest ? (shouldApply ? "APPLIED ✅" : "QUEUED (Apply best)") : "no better candidate"}\n` +
         `before EFL ${Number(baseMetrics?.efl || 0).toFixed(2)}mm • T ${Number(baseMetrics?.T || 0).toFixed(2)} • IC ${Number(baseMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm` +
         `${includeDistortion ? ` • DistRMS ${Number(baseMetrics?.distortion?.rmsPct || 0).toFixed(2)}%` : ""}` +
         `${includeSharpness ? ` • Sharp C/E ${Number(baseMetrics?.sharpness?.rmsCenter || 0).toFixed(3)}/${Number(baseMetrics?.sharpness?.rmsEdge || 0).toFixed(3)}mm` : ""}` +
@@ -9955,13 +9957,13 @@
 
       if (!silent) {
         toast(
-          improved
+          queuedBest
             ? (shouldApply ? `${label}: verbeterd en toegepast` : `${label}: verbeterd (klik Apply best)`)
             : `${label}: geen betere kandidaat binnen constraints`
         );
       }
       if (!nested) setCockpitProgress(1, `${label} • done`);
-      return { ok: true, improved, applied: shouldApply, before: baseMetrics, after: afterMetrics, bestIter, iters };
+      return { ok: true, improved, queuedBest, applied: shouldApply, before: baseMetrics, after: afterMetrics, bestIter, iters };
     } finally {
       if (!nested) {
         cockpitOptRunning = false;
