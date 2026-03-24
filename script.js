@@ -9735,12 +9735,13 @@
       // Merit mode can keep wandering with tiny accepted changes.
       // Stop early when best score has plateaued for too long.
       if (modeKey === "merit") {
-        const minWarmup = Math.max(800, Math.round(iterations * 0.02));
+        const minWarmup = Math.max(450, Math.round(iterations * 0.006));
+        // Stop much earlier on merit plateaus; long "macro merit" runs otherwise waste time.
         const plateauLimit = Math.max(
-          1800,
+          900,
           Math.min(
-            40000,
-            Math.round(iterations * (prof.level === "macro" ? 0.20 : (prof.level === "local" ? 0.14 : 0.10)))
+            6000,
+            Math.round(iterations * (prof.level === "macro" ? 0.015 : (prof.level === "local" ? 0.010 : 0.008)))
           )
         );
         if (itersRan > minWarmup) {
@@ -9755,11 +9756,13 @@
       if ((itersRan % Math.max(20, Number(COCKPIT_CFG.progressBatch || 60))) === 0) {
         const dt = Math.max(1e-6, (performance.now() - t0) / 1000);
         const ips = itersRan / dt;
+        const staleFor = Math.max(0, itersRan - Math.max(0, lastBestUpdateIter));
         setOptLog(
           `${runHeader}\n` +
           `running… ${itersRan}/${iterations} (${ips.toFixed(1)} it/s)\n` +
           `pass ${pass} • profile ${prof.level} • mode ${modeKey}\n` +
           `current score ${curScore.toFixed(5)} • best ${bestScore.toFixed(5)} @${bestIter || 0}\n` +
+          `${modeKey === "merit" ? `stale-best ${staleFor} iters\n` : ""}` +
           `current Focal Length ${Number(curMetrics?.efl || 0).toFixed(2)}mm • T ${Number(curMetrics?.T || 0).toFixed(2)} • IC ${Number(curMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm\n` +
           `current Sharp C/E ${Number(curMetrics?.sharpness?.rmsCenter || 0).toFixed(3)}/${Number(curMetrics?.sharpness?.rmsEdge || 0).toFixed(3)}mm\n` +
           `rejects ${Object.entries(rejects).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, v]) => `${k}:${v}`).join(" • ")}`
