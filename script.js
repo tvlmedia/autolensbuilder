@@ -9361,7 +9361,12 @@
     }
     const stopNow = findStopSurfaceIndex(candidateLens.surfaces);
     if (Number.isFinite(ctx?.stopIdx) && stopNow !== Number(ctx.stopIdx)) return { ok: false, reason: "stop_moved" };
-    const hard = failsHardConstraints(candidateLens.surfaces, candidateMetrics, { strictness });
+    let hard = failsHardConstraints(candidateLens.surfaces, candidateMetrics, { strictness });
+    // Defensive: if glass-in-mount is allowed, never block local candidates on pure "pl".
+    if (!!COCKPIT_CFG.allowGlassInPlMount && Array.isArray(hard?.reasons) && hard.reasons.length) {
+      const keep = hard.reasons.filter((r) => String(r || "").toLowerCase() !== "pl");
+      hard = { fail: keep.length > 0, reasons: keep };
+    }
     if (hard.fail) {
       const allowRelax = !!ctx?.allowBaselineHardRelax;
       const baseHard = ctx?.baseHardEval || { fail: false, reasons: [] };
@@ -9388,7 +9393,9 @@
       if (!(primaryCand + 1e-9 < primaryCur)) return { ok: false, reason: "no_primary" };
     } else {
       // Merit mode: allow tiny non-worsening steps so drift can be paid down while escaping plateaus.
-      const primaryTol = profile?.level === "macro" ? 0.030 : (profile?.level === "local" ? 0.016 : 0.008);
+      const baselineInvalidMerit = !!(baselineMetrics?.feasible && baselineMetrics.feasible.ok === false);
+      const primaryTolBase = profile?.level === "macro" ? 0.060 : (profile?.level === "local" ? 0.030 : 0.014);
+      const primaryTol = baselineInvalidMerit ? (primaryTolBase * 1.9) : primaryTolBase;
       if (primaryCand > primaryCur + primaryTol) return { ok: false, reason: "no_primary" };
     }
 
@@ -9404,10 +9411,11 @@
     const icDrop = Math.max(0, baseIC - Number(candidateMetrics?.usableIC?.diameterMm || 0));
     const covDrop = Math.max(0, baseCov - Number(candidateMetrics?.maxFieldDeg || 0));
     const sharpWorse = Math.max(0, candSharp - curSharp);
+    const baselineInvalid = !!(baselineMetrics?.feasible && baselineMetrics.feasible.ok === false);
 
     const isStrict = String(strictness).toLowerCase() === "strict";
     const meritGuardMul = modeKey === "merit"
-      ? (profile?.level === "macro" ? 3.8 : (profile?.level === "local" ? 2.6 : 1.8))
+      ? ((profile?.level === "macro" ? 4.6 : (profile?.level === "local" ? 3.2 : 2.2)) * (baselineInvalid ? 1.9 : 1.0))
       : 1.0;
     const eflTol = (modeKey === "focal") ? Infinity : (isStrict ? 0.45 : 1.35) * guardScale * meritGuardMul;
     const tTol = (modeKey === "tstop") ? Infinity : (isStrict ? 0.10 : 0.35) * guardScale * meritGuardMul;
@@ -9423,9 +9431,8 @@
 
     const drift = computeDesignDriftPenalty(candidateLens, baselineLens, profile);
     const curDrift = computeDesignDriftPenalty(currentLens, baselineLens, profile);
-    const baselineInvalid = !!(baselineMetrics?.feasible && baselineMetrics.feasible.ok === false);
     const driftMulRaw = modeKey === "merit"
-      ? (profile?.level === "macro" ? 0.05 : (profile?.level === "local" ? 0.08 : 0.14))
+      ? (profile?.level === "macro" ? 0.018 : (profile?.level === "local" ? 0.032 : 0.060))
       : 1.0;
     const driftMul = baselineInvalid ? (driftMulRaw * 0.45) : driftMulRaw;
     const score = primaryCand + driftMul * drift;
@@ -9434,7 +9441,7 @@
       if (!(score + 1e-9 < curScore)) return { ok: false, reason: "drift" };
     } else {
       const strongPrimaryGain = (primaryCand < (primaryCur - 0.004)) || (primaryCur > 1e-9 && primaryCand < (primaryCur * 0.985));
-      const relaxedPass = strongPrimaryGain && score <= (curScore + 0.012);
+      const relaxedPass = strongPrimaryGain && score <= (curScore + (baselineInvalid ? 0.065 : 0.028));
       if (!((score + 1e-9 < curScore) || relaxedPass)) return { ok: false, reason: "drift" };
     }
 
