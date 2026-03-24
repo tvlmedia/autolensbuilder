@@ -9934,10 +9934,58 @@
           usedValidFallback = true;
         }
       }
+      // Merit mode: if best is still invalid, attempt one repair pass to salvage
+      // a physically valid local variant instead of queueing an invalid result.
+      let usedRepairFallback = false;
+      if (key === "merit") {
+        const hardNow = failsHardConstraints(bestLens?.surfaces || [], bestMetrics, { strictness: settings.strictness });
+        if (hardNow?.fail) {
+          const repaired = sanitizeLens(clone(bestLens));
+          localRepairForHardConstraints(repaired.surfaces, { passes: 6 });
+          ensureStopExists(repaired.surfaces);
+          enforceSingleStopSurface(repaired.surfaces);
+          ensureStopInAirBothSides(repaired.surfaces);
+          enforceRearMountStart(repaired.surfaces);
+          quickSanity(repaired.surfaces);
+          const repairedMetrics = computeMetrics({
+            surfaces: repaired.surfaces,
+            wavePreset,
+            focusMode: focus.focusMode,
+            sensorX: focus.sensorX,
+            lensShift: focus.lensShift,
+            sensorW: sensor.w,
+            sensorH: sensor.h,
+            objDist: COCKPIT_CFG.defaultObjDistMm,
+            rayCount: rayCountEval,
+            lutN: lutNEval,
+            includeUsableIC,
+            includeDistortion,
+            includeSharpness,
+            autofocus: autofocusCandidates,
+            autofocusOptions: SHARP_OPT_CFG.autofocus,
+            useCache: false,
+          });
+          const repairedHard = failsHardConstraints(repaired.surfaces, repairedMetrics, { strictness: settings.strictness });
+          if (!repairedHard.fail) {
+            const repairedScore = scoreLocalOptMerit(key, repairedMetrics, baseMetrics, targets, sensor);
+            const repairedPrimary = localPrimaryScore(normalizeLocalMode(key), repairedMetrics, targets, sensor);
+            const basePrimary = localPrimaryScore(normalizeLocalMode(key), baseMetrics, targets, sensor);
+            const primaryTol = 0.10; // allow mild sharpness score drift when recovering feasibility
+            if (Number.isFinite(repairedScore) && Number.isFinite(repairedPrimary) && Number.isFinite(basePrimary) && repairedPrimary <= (basePrimary + primaryTol)) {
+              bestLens = repaired;
+              bestMetrics = repairedMetrics;
+              bestMerit = repairedScore;
+              bestIter = Math.max(1, bestIter);
+              usedRepairFallback = true;
+            }
+          }
+        }
+      }
       const finalHard = failsHardConstraints(bestLens?.surfaces || [], bestMetrics, { strictness: settings.strictness });
       const improved = !finalHard.fail && Number.isFinite(bestMerit) && Number.isFinite(baseMerit) && (bestMerit + 1e-9 < baseMerit);
-      const hasUsableBest = bestIter > 0;
+      const hasUsableBest = bestIter > 0 && !finalHard.fail;
       const queuedBest = improved || hasUsableBest;
+      const invalidBestOnly = bestIter > 0 && finalHard.fail;
       const bestFocus = {
         focusMode: focus.focusMode,
         sensorX: Number(bestMetrics?.focus?.sensorX ?? focus.sensorX ?? 0),
@@ -10000,7 +10048,9 @@
         `${cockpitStopRequested ? "stopped" : "done"} ${itersRan}/${iters}\n` +
         `best iteration ${bestIterTxt}\n` +
         `${usedValidFallback ? "best valid fallback used\n" : ""}` +
-        `${queuedBest ? (shouldApply ? "APPLIED ✅" : (finalHard?.fail ? "QUEUED (Apply best • invalid best)" : "QUEUED (Apply best)")) : "no better candidate"}\n` +
+        `${usedRepairFallback ? "repair fallback used\n" : ""}` +
+        `${invalidBestOnly ? `best candidate invalid (${(finalHard?.reasons || []).join(",") || "hard fail"})\n` : ""}` +
+        `${queuedBest ? (shouldApply ? "APPLIED ✅" : "QUEUED (Apply best)") : "no better candidate"}\n` +
         `before EFL ${Number(baseMetrics?.efl || 0).toFixed(2)}mm • T ${Number(baseMetrics?.T || 0).toFixed(2)} • IC ${Number(baseMetrics?.usableIC?.diameterMm || 0).toFixed(2)}mm` +
         `${includeDistortion ? ` • DistRMS ${Number(baseMetrics?.distortion?.rmsPct || 0).toFixed(2)}%` : ""}` +
         `${includeSharpness ? ` • Sharp C/E ${Number(baseMetrics?.sharpness?.rmsCenter || 0).toFixed(3)}/${Number(baseMetrics?.sharpness?.rmsEdge || 0).toFixed(3)}mm` : ""}` +
