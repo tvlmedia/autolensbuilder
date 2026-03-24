@@ -5021,6 +5021,11 @@
       },
     };
     updateCockpitMetricsTable(cockpitLive);
+    refreshApplyBestUi({
+      targetEfl: targetEflUi,
+      targetIC: targetICUi,
+      targetT: targetTUi,
+    });
 
     resizeCanvasToCSS();
     const r = canvas.getBoundingClientRect();
@@ -7255,6 +7260,7 @@
         stopInMount,
       },
     };
+    refreshApplyBestUi();
     return true;
   }
 
@@ -14603,6 +14609,7 @@
     }
 
     optBest = best;
+    refreshApplyBestUi();
     optRunning = false;
 
     const tEnd = performance.now();
@@ -14664,20 +14671,85 @@
     toast(`Stopping ${parts.join(" + ")} run${parts.length > 1 ? "s" : ""}…`);
   }
 
-  function applyBest(){
-    if (!optBest?.lens) return toast("No best yet");
-    const targets = {
+  function getOptTargetsFromUi() {
+    return {
       targetEfl: num(ui.optTargetFL?.value, 75),
       targetIC: Math.max(0, num(ui.optTargetIC?.value, 0)),
       targetT: num(ui.optTargetT?.value, 2.0),
     };
-    const p = buildOptPriority(optBest.eval, targets);
-    if (!p.feasible) {
-      if (p.stopInMount) {
-        return toast("Best is fysiek ongeldig: iris/STOP staat in de PL-mount zone.");
-      }
-      return toast("Best is fysiek ongeldig (overlap/BFL/crossings). Eerst verder optimaliseren.");
+  }
+
+  function getBestApplyStatus(targets = null) {
+    const t = targets || getOptTargetsFromUi();
+    if (!optBest?.lens || !optBest?.eval) {
+      return { hasBest: false, canApply: false, reasonText: "nog geen best kandidaat" };
     }
+
+    const ev = optBest.eval;
+    const pri = buildOptPriority(ev, t);
+    const reasons = [];
+
+    const stopInMount = isStopInsidePlMount(
+      optBest.lens?.surfaces || [],
+      Number(COCKPIT_CFG.stopInMountMarginMm || 0)
+    );
+    if (!!COCKPIT_CFG.stopMustStayOutOfPlMount && stopInMount) reasons.push("iris/STOP staat in PL-mount");
+
+    const crossPairs = Number(ev?.internalCrossPairs || 0);
+    if (crossPairs > 0) reasons.push(`ray crossings in glas (${crossPairs})`);
+
+    const ov = Number(ev?.worstOverlap || 0);
+    const pinch = Number(ev?.worstPinch || 0);
+    if (ov > 1e-4 || pinch > 1e-4) reasons.push(`overlap/pinch (${ov.toFixed(2)} / ${pinch.toFixed(2)}mm)`);
+
+    const bflShort = effectiveBflShortMm(Number(ev?.bfl), Number(ev?.intrusion || 0));
+    if (!(bflShort <= Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0))) {
+      reasons.push(`BFL tekort ${bflShort.toFixed(2)}mm`);
+    }
+
+    if (!!ev?.realismHardInvalid) reasons.push("OD/envelope boven hard limit");
+    if (!Number.isFinite(Number(ev?.efl)) || Number(ev?.efl) <= 0) reasons.push("focale lengte ongeldig");
+    if (!Number.isFinite(Number(ev?.T)) || Number(ev?.T) <= 0) reasons.push("T-stop ongeldig");
+
+    if (!pri.feasible && reasons.length === 0) reasons.push("fysieke constraints niet gehaald");
+
+    const canApply = pri.feasible && reasons.length === 0;
+    return {
+      hasBest: true,
+      canApply,
+      reasonText: canApply ? "fysiek geldig" : reasons.join(" • "),
+      reasons,
+    };
+  }
+
+  function refreshApplyBestUi(targets = null) {
+    const st = getBestApplyStatus(targets);
+    const setBtn = (btn) => {
+      if (!btn) return;
+      if (!st.hasBest) {
+        btn.textContent = "Apply best";
+        btn.title = "Nog geen best kandidaat";
+        return;
+      }
+      if (st.canApply) {
+        btn.textContent = "Apply best ✅";
+        btn.title = "Best kandidaat is fysiek geldig en kan toegepast worden";
+      } else {
+        btn.textContent = "Apply best ❌";
+        btn.title = `Geblokkeerd: ${st.reasonText}`;
+      }
+    };
+    setBtn(ui.btnOptApply);
+    setBtn(ui.btnOptApplyLocal);
+  }
+
+  function applyBest(){
+    if (!optBest?.lens) return toast("No best yet");
+    const targets = getOptTargetsFromUi();
+    const st = getBestApplyStatus(targets);
+    if (!st.canApply) return toast(`Best is fysiek ongeldig: ${st.reasonText}.`);
+
+    const p = buildOptPriority(optBest.eval, targets);
     const usable = scratchMinimumUsableReached({ pri: p, evalRes: optBest.eval }, targets);
     if (!usable) {
       toast("Waarschuwing: best is nog niet ideaal (focus/scherpte/T/vignette), maar wordt wel toegepast.");
@@ -14705,6 +14777,7 @@
     renderAll();
     recordCockpitSnapshot("Main applied");
     toast(`Applied best${m?.source ? ` (${String(m.source)})` : ""}`);
+    refreshApplyBestUi(targets);
   }
 
   function benchOptimizer(){
