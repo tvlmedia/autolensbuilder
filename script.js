@@ -213,6 +213,8 @@
     "N-BALF4": { nd: 1.57956, Vd: 53.87 },
     "N-BALF5": { nd: 1.54739, Vd: 53.63 },
     "N-BAF4": { nd: 1.60568, Vd: 43.72 },
+    // Legacy barium flint type (historical BaF9/LaF-equivalent usage in classic lens recipes)
+    "N-BAF9": { nd: 1.64328, Vd: 47.9 },
     "N-BAF10": { nd: 1.67003, Vd: 47.11 },
     "N-BAF51": { nd: 1.65224, Vd: 44.96 },
     "N-BAF52": { nd: 1.60863, Vd: 46.6 },
@@ -223,6 +225,8 @@
     "N-SK11": { nd: 1.56384, Vd: 60.8 },
     "N-SK14": { nd: 1.60311, Vd: 60.6 },
     "N-SK16": { nd: 1.62041, Vd: 60.32 },
+    // Legacy heavy-crown type (historical SK22 / LaK2 family values)
+    "N-SK22": { nd: 1.6779, Vd: 55.5 },
     "N-SSK2": { nd: 1.62229, Vd: 53.27 },
     "N-SSK5": { nd: 1.65844, Vd: 50.88 },
     "N-SSK8": { nd: 1.61773, Vd: 49.83 },
@@ -305,10 +309,15 @@
 
   const GLASS_ALIASES = {
     BK7: "N-BK7HT",
+    BAF9: "N-BAF9",
+    BaF9: "N-BAF9",
+    "N-BAF9": "N-BAF9",
     F2: "N-F2",
     LASF35: "N-LASF43",
     LASFN31: "N-LASF43",
     LF5: "N-SF5",
+    SK22: "N-SK22",
+    "N-SK22": "N-SK22",
     "S-LAM3": "N-LAK9",
     "S-BAH11": "N-BAK4",
   };
