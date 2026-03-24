@@ -9532,6 +9532,8 @@
     let itersRan = 0;
     let noImprovePasses = 0;
     let pass = 0;
+    let stoppedByPlateau = false;
+    let lastBestUpdateIter = 0;
     const rejects = Object.create(null);
     const incReject = (r) => { rejects[r] = (rejects[r] || 0) + 1; };
     const t0 = performance.now();
@@ -9634,6 +9636,7 @@
             bestMetrics = curMetrics;
             bestScore = curScore;
             bestIter = accepted.iter;
+            lastBestUpdateIter = accepted.iter;
           }
           if (!accepted.hardFail && curScore + 1e-9 < bestValidScore) {
             bestValidLens = clone(curLens);
@@ -9717,6 +9720,7 @@
             bestMetrics = curMetrics;
             bestScore = curScore;
             bestIter = itersRan;
+            lastBestUpdateIter = itersRan;
           }
           break;
         }
@@ -9726,6 +9730,26 @@
         noImprovePasses++;
       } else {
         noImprovePasses = 0;
+      }
+
+      // Merit mode can keep wandering with tiny accepted changes.
+      // Stop early when best score has plateaued for too long.
+      if (modeKey === "merit") {
+        const minWarmup = Math.max(800, Math.round(iterations * 0.02));
+        const plateauLimit = Math.max(
+          1800,
+          Math.min(
+            40000,
+            Math.round(iterations * (prof.level === "macro" ? 0.20 : (prof.level === "local" ? 0.14 : 0.10)))
+          )
+        );
+        if (itersRan > minWarmup) {
+          const staleFor = itersRan - Math.max(0, lastBestUpdateIter);
+          if (staleFor >= plateauLimit) {
+            stoppedByPlateau = true;
+            break;
+          }
+        }
       }
 
       if ((itersRan % Math.max(20, Number(COCKPIT_CFG.progressBatch || 60))) === 0) {
@@ -9764,6 +9788,7 @@
       modeKey,
       profile: prof,
       baseHardFail: !!baseHardCheck?.fail,
+      stoppedByPlateau,
     };
   }
 
@@ -10046,6 +10071,7 @@
       setOptLog(
         `${runHeader}\n` +
         `${cockpitStopRequested ? "stopped" : "done"} ${itersRan}/${iters}\n` +
+        `${runRes?.stoppedByPlateau ? "stopped on plateau (geen best verbetering voor lange tijd)\n" : ""}` +
         `best iteration ${bestIterTxt}\n` +
         `${usedValidFallback ? "best valid fallback used\n" : ""}` +
         `${usedRepairFallback ? "repair fallback used\n" : ""}` +
