@@ -1814,6 +1814,7 @@
     defaultObjDistMm: Number(DIST_OPT_CFG.objDistMm || 20000),
     defaultLutN: 240,
     defaultRayCount: 21,
+    meritPlateauStopEnabled: false,
     maxCoverageDropNormalDeg: 0.40,
     maxCoverageDropStrictDeg: 0.20,
     maxDistWorsenNormalPct: 0.60,
@@ -9394,7 +9395,7 @@
     } else {
       // Merit mode: allow tiny non-worsening steps so drift can be paid down while escaping plateaus.
       const baselineInvalidMerit = !!(baselineMetrics?.feasible && baselineMetrics.feasible.ok === false);
-      const primaryTolBase = profile?.level === "macro" ? 0.060 : (profile?.level === "local" ? 0.030 : 0.014);
+      const primaryTolBase = profile?.level === "macro" ? 0.160 : (profile?.level === "local" ? 0.080 : 0.040);
       const primaryTol = baselineInvalidMerit ? (primaryTolBase * 1.9) : primaryTolBase;
       if (primaryCand > primaryCur + primaryTol) return { ok: false, reason: "no_primary" };
     }
@@ -9421,7 +9422,7 @@
     const tTol = (modeKey === "tstop") ? Infinity : (isStrict ? 0.10 : 0.35) * guardScale * meritGuardMul;
     const icTol = (modeKey === "imageCircle") ? Infinity : (isStrict ? 0.45 : 1.20) * guardScale * meritGuardMul;
     const covTol = (modeKey === "imageCircle" ? 1.8 : 1.1) * guardScale * (modeKey === "merit" ? 2.3 : 1.0);
-    const sharpTol = (modeKey === "merit" ? 0.05 : 0.22) * guardScale;
+    const sharpTol = (modeKey === "merit" ? 0.22 : 0.22) * guardScale;
 
     if (eflDrift > eflTol) return { ok: false, reason: "guard_efl" };
     if (tDrift > tTol) return { ok: false, reason: "guard_t" };
@@ -9441,11 +9442,11 @@
       if (!(score + 1e-9 < curScore)) return { ok: false, reason: "drift" };
     } else {
       const strongPrimaryGain = (primaryCand < (primaryCur - 0.004)) || (primaryCur > 1e-9 && primaryCand < (primaryCur * 0.985));
-      const relaxedPass = strongPrimaryGain && score <= (curScore + (baselineInvalid ? 0.065 : 0.028));
+      const relaxedPass = strongPrimaryGain && score <= (curScore + (baselineInvalid ? 0.180 : 0.080));
       // Escape hatch for merit local minima: allow a candidate that pays down
       // design drift significantly while keeping sharpness almost unchanged.
-      const driftImproved = Number.isFinite(drift) && Number.isFinite(curDrift) && (drift <= (curDrift * 0.92));
-      const primaryNearlySame = primaryCand <= (primaryCur + (baselineInvalid ? 0.020 : 0.010));
+      const driftImproved = Number.isFinite(drift) && Number.isFinite(curDrift) && (drift <= (curDrift * 0.98));
+      const primaryNearlySame = primaryCand <= (primaryCur + (baselineInvalid ? 0.050 : 0.030));
       const driftEscapePass = driftImproved && primaryNearlySame;
       if (!((score + 1e-9 < curScore) || relaxedPass || driftEscapePass)) return { ok: false, reason: "drift" };
     }
@@ -9737,9 +9738,8 @@
         noImprovePasses = 0;
       }
 
-      // Merit mode can keep wandering with tiny accepted changes.
-      // Stop early when best score has plateaued for too long.
-      if (modeKey === "merit") {
+      // Optional merit plateau-stop (disabled by default).
+      if (modeKey === "merit" && !!COCKPIT_CFG.meritPlateauStopEnabled) {
         const minWarmup = Math.max(180, Math.round(iterations * 0.002));
         // Stop much earlier on merit plateaus; long "macro merit" runs otherwise waste time.
         const plateauLimit = Math.max(
