@@ -648,6 +648,8 @@
   }
 
   function intersectSurface(ray, surf) {
+    const INTERSECT_SHEET_TOL = 1e-5;
+    const DEBUG_WRONG_SHEET_HITS = false;
     const vx = surf.vx;
     const R = Number(surf.R || 0);
     const ap = Math.max(0, Number(surf.ap || 0));
@@ -678,19 +680,36 @@
     if (disc < 0) return null;
 
     const sdisc = Math.sqrt(disc);
-    const t1 = (-B - sdisc) / (2 * A);
-    const t2 = (-B + sdisc) / (2 * A);
+    const candidates = [
+      (-B - sdisc) / (2 * A),
+      (-B + sdisc) / (2 * A),
+    ];
+    let best = null;
+    for (const t of candidates) {
+      if (!Number.isFinite(t) || t <= 1e-9) continue;
+      const hit = add(ray.p, mul(ray.d, t));
+      const expectedX = surfaceXatY(surf, hit.y);
+      if (!Number.isFinite(expectedX)) continue;
+      if (Math.abs(hit.x - expectedX) > INTERSECT_SHEET_TOL) {
+        if (DEBUG_WRONG_SHEET_HITS) {
+          console.log("Rejected wrong-sheet hit", {
+            t,
+            hit,
+            expectedX,
+            R,
+            vx,
+          });
+        }
+        continue;
+      }
+      if (!best || t < best.t) best = { t, hit };
+    }
+    if (!best) return null;
 
-    let t = null;
-    if (t1 > 1e-9 && t2 > 1e-9) t = Math.min(t1, t2);
-    else if (t1 > 1e-9) t = t1;
-    else if (t2 > 1e-9) t = t2;
-    else return null;
-
-    const hit = add(ray.p, mul(ray.d, t));
+    const hit = best.hit;
     const vignetted = Math.abs(hit.y) > ap + 1e-9;
     const Nout = normalize({ x: hit.x - cx, y: hit.y });
-    return { hit, t, vignetted, normal: Nout };
+    return { hit, t: best.t, vignetted, normal: Nout };
   }
 
   function computeVertices(surfaces, lensShift = 0, sensorX = 0) {
