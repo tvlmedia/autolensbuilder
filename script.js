@@ -651,6 +651,7 @@
     const INTERSECT_SHEET_TOL = 5e-4;
     const INTERSECT_SHEET_INSIDE_TOL = 1e-7;
     const DEBUG_WRONG_SHEET_HITS = false;
+    const ALLOW_LEGACY_FALLBACK_IF_NO_SHEET_HIT = true;
     const vx = surf.vx;
     const R = Number(surf.R || 0);
     const ap = Math.max(0, Number(surf.ap || 0));
@@ -700,13 +701,34 @@
         best = { t, hit, expectedX, err };
       }
     }
-    if (!best) return null;
-    if (bestErr > INTERSECT_SHEET_TOL) {
+    if (!best || bestErr > INTERSECT_SHEET_TOL) {
+      if (ALLOW_LEGACY_FALLBACK_IF_NO_SHEET_HIT) {
+        let tLegacy = null;
+        for (const t of candidates) {
+          if (!Number.isFinite(t) || t <= 1e-9) continue;
+          if (tLegacy == null || t < tLegacy) tLegacy = t;
+        }
+        if (tLegacy != null) {
+          const hitLegacy = add(ray.p, mul(ray.d, tLegacy));
+          const vignettedLegacy = Math.abs(hitLegacy.y) > ap + 1e-9;
+          const Nlegacy = normalize({ x: hitLegacy.x - cx, y: hitLegacy.y });
+          if (DEBUG_WRONG_SHEET_HITS) {
+            console.log("Fallback legacy root used", {
+              t: tLegacy,
+              hit: hitLegacy,
+              bestErr,
+              R,
+              vx,
+            });
+          }
+          return { hit: hitLegacy, t: tLegacy, vignetted: vignettedLegacy, normal: Nlegacy };
+        }
+      }
       if (DEBUG_WRONG_SHEET_HITS) {
         console.log("Rejected wrong-sheet hit", {
-          t: best.t,
-          hit: best.hit,
-          expectedX: best.expectedX,
+          t: best?.t,
+          hit: best?.hit,
+          expectedX: best?.expectedX,
           err: bestErr,
           R,
           vx,
