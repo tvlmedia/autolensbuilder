@@ -1002,6 +1002,8 @@
     let worstOverlap = 0;
     let worstPinch = 0;
     let airGapCount = 0;
+    const hardDetails = [];
+    const pairDiagnostics = [];
 
     const stopIdx = findStopSurfaceIndex(surfaces);
     const stopAp = stopIdx >= 0 ? Math.max(0.1, Number(surfaces[stopIdx]?.ap || 0)) : null;
@@ -1083,10 +1085,29 @@
       const mediumAfterA = String(sA.glass || "AIR").toUpperCase();
       if (mediumAfterA === "AIR") airGapCount++;
       const required = mediumAfterA === "AIR" ? PHYS_CFG.minAirGap : PHYS_CFG.minGlassCT;
+      const safeNoOverlap = maxNonOverlappingSemiDiameter(sA, sB, PHYS_CFG.minGlassCT);
+      pairDiagnostics.push({
+        iA: i,
+        iB: i + 1,
+        medium: mediumAfterA,
+        minGap,
+        required,
+        apShared,
+        safeNoOverlap,
+      });
 
       if (!Number.isFinite(minGap)) {
         penalty += 100_000;
         hardFail = true;
+        hardDetails.push({
+          reason: "physics_nan_gap",
+          iA: i,
+          iB: i + 1,
+          minGap,
+          required,
+          apShared,
+          safeNoOverlap,
+        });
         continue;
       }
 
@@ -1104,16 +1125,38 @@
         penalty += PHYS_CFG.thinGlassWeight * d * d;
       }
 
-      if (minGap < -PHYS_CFG.maxNegOverlap) hardFail = true;
+      if (minGap < -PHYS_CFG.maxNegOverlap) {
+        hardFail = true;
+        hardDetails.push({
+          reason: "physics_negative_clearance",
+          iA: i,
+          iB: i + 1,
+          minGap,
+          required,
+          apShared,
+          safeNoOverlap,
+        });
+      }
       if (minGap < 0) worstOverlap = Math.max(worstOverlap, -minGap);
 
       if (mediumAfterA !== "AIR") {
-        const noAp = maxNonOverlappingSemiDiameter(sA, sB, PHYS_CFG.minGlassCT);
+        const noAp = safeNoOverlap;
         if (apShared > noAp + 1e-3) {
           const d = apShared - noAp;
           worstOverlap = Math.max(worstOverlap, d);
           penalty += PHYS_CFG.overlapWeight * d * d;
-          if (d > 0.25) hardFail = true;
+          if (d > 0.25) {
+            hardFail = true;
+            hardDetails.push({
+              reason: "physics_glass_overlap",
+              iA: i,
+              iB: i + 1,
+              minGap,
+              required,
+              apShared,
+              safeNoOverlap: noAp,
+            });
+          }
         }
       }
     }
@@ -1128,10 +1171,22 @@
       if (prevMedium !== "AIR") {
         penalty += PHYS_CFG.stopAirSideWeight;
         hardFail = true;
+        hardDetails.push({
+          reason: "stop_in_glass_left",
+          stopIdx,
+          leftMedium: prevMedium,
+          rightMedium: nextMedium,
+        });
       }
       if (nextMedium !== "AIR") {
         penalty += PHYS_CFG.stopAirSideWeight;
         hardFail = true;
+        hardDetails.push({
+          reason: "stop_in_glass_right",
+          stopIdx,
+          leftMedium: prevMedium,
+          rightMedium: nextMedium,
+        });
       }
 
       const leftGap = stopIdx > 0
@@ -1182,7 +1237,7 @@
       penalty += PHYS_CFG.tooFewAirGapsWeight * d * d;
     }
 
-    return { penalty, hardFail, worstOverlap, worstPinch, airGapCount };
+    return { penalty, hardFail, worstOverlap, worstPinch, airGapCount, hardDetails, pairDiagnostics };
   }
 
   // -------------------- tracing --------------------
@@ -1824,6 +1879,18 @@
     maxTDriftNormal: 0.10,
     maxTDriftStrict: 0.05,
   };
+
+  function normalizeConstraintMode(v) {
+    const s = String(v || "").toLowerCase().trim();
+    if (s === "hard_geometry" || s === "hard-geometry" || s === "hard geometry only") return "hard_geometry";
+    if (s === "geometry_mechanics" || s === "geometry+mechanics" || s === "normal") return "geometry_mechanics";
+    if (s === "strict_full" || s === "strict-full" || s === "strict") return "strict_full";
+    return "geometry_mechanics";
+  }
+
+  function isStrictConstraintMode(v) {
+    return normalizeConstraintMode(v) === "strict_full";
+  }
 
   const SCRATCH_CFG = {
     autoFamilyWideMaxMm: 35,
@@ -4902,15 +4969,27 @@
     if (ui.odTop) ui.odTop.textContent = odBadgeTopText;
     if (ui.realismTop) ui.realismTop.textContent = realismBadgeTopText;
 
-    if (phys.hardFail && ui.footerWarn) {
+    const pHard = Array.isArray(cockpitLive?.feasible?.hardReasons) ? cockpitLive.feasible.hardReasons : [];
+    const pMech = Array.isArray(cockpitLive?.feasible?.mechanicalWarnings) ? cockpitLive.feasible.mechanicalWarnings : [];
+    const pHeur = Array.isArray(cockpitLive?.feasible?.heuristicWarnings) ? cockpitLive.feasible.heuristicWarnings : [];
+    if (pHard.length && ui.footerWarn) {
+      const d0 = Array.isArray(phys?.hardDetails) ? phys.hardDetails[0] : null;
+      if (d0 && Number.isFinite(Number(d0.iA)) && Number.isFinite(Number(d0.iB))) {
+        ui.footerWarn.textContent =
+          `HARD geometry fail: ${String(d0.reason || "physics")} @ pair ${d0.iA}-${d0.iB} • minGap ${Number(d0.minGap || 0).toFixed(3)}mm • required ${Number(d0.required || 0).toFixed(3)}mm • safeNoOverlap ${Number(d0.safeNoOverlap || 0).toFixed(3)}mm.`;
+      } else {
+        ui.footerWarn.textContent =
+          `HARD geometry fail: ${pHard.join(", ")}.`;
+      }
+    } else if (pMech.length && ui.footerWarn) {
       ui.footerWarn.textContent =
-        `INVALID geometry: overlap/clearance issue (overlap ${phys.worstOverlap.toFixed(2)}mm, pinch ${phys.worstPinch.toFixed(2)}mm).`;
-    } else if (rayCross.invalid && ui.footerWarn) {
+        `Mechanical envelope warning: ${pMech.join(", ")}.`;
+    } else if (pHeur.length && ui.footerWarn) {
       ui.footerWarn.textContent =
-        `INVALID optics: ${rayCross.crossPairs} ray crossings inside glass across ${rayCross.crossSegments} segment(s).`;
+        `Heuristic warning: ${pHeur.join(", ")}.`;
     } else if (realismPenaltyRes.hardInvalid && ui.footerWarn) {
       ui.footerWarn.textContent =
-        `INVALID envelope: OD exceeds hard housing limits (${odBadgeTopText}).`;
+        `Mechanical envelope warning: OD exceeds hard housing limits (${odBadgeTopText}).`;
     } else if (phys.airGapCount < PHYS_CFG.minAirGapsPreferred && ui.footerWarn) {
       ui.footerWarn.textContent =
         `Few air gaps (${phys.airGapCount}); aim for >= ${PHYS_CFG.minAirGapsPreferred} for practical designs.`;
@@ -4927,7 +5006,7 @@
         `T-stop eff ${T == null ? "—" : "T" + T.toFixed(2)} • calc ${Tgeom == null ? "—" : "T" + Tgeom.toFixed(2)} • ` +
         `${softIcTxt} • ` +
         `${fovTxt} • ` +
-        `Physical Correct ${(!phys.hardFail && !rayCross.invalid && !realismPenaltyRes.hardInvalid) ? "YES" : "NO"}`;
+        `Physical Correct ${cockpitLive?.feasible?.ok ? "YES" : "NO"}`;
     }
     if (ui.cockpitDiagnostics) {
       const meritFieldTxt = Array.isArray(bd?.meritFieldRms) && bd.meritFieldRms.length
@@ -4942,12 +5021,25 @@
             })
             .join(" • ")
         : "center — • 1/3 — • 2/3 — • corner —";
+      const hardDetailTxt = Array.isArray(phys?.hardDetails) && phys.hardDetails.length
+        ? phys.hardDetails.slice(0, 3).map((d) => {
+            const pairTxt = Number.isFinite(d?.iA) && Number.isFinite(d?.iB) ? `pair ${d.iA}-${d.iB}` : "pair —";
+            const g = Number.isFinite(Number(d?.minGap)) ? Number(d.minGap).toFixed(3) : "—";
+            const rq = Number.isFinite(Number(d?.required)) ? Number(d.required).toFixed(3) : "—";
+            const sn = Number.isFinite(Number(d?.safeNoOverlap)) ? Number(d.safeNoOverlap).toFixed(3) : "—";
+            return `${String(d?.reason || "hard")} ${pairTxt} minGap ${g} req ${rq} safeNoOverlap ${sn}`;
+          }).join(" • ")
+        : "—";
       ui.cockpitDiagnostics.textContent =
         `selected ${selectedIndex}\n` +
         `rays traced ${traces.length} • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} (${vigPct}%) • tir ${tirCount}\n` +
         `merit fields ${meritFieldTxt}\n` +
         `xover pairs ${rayCross.crossPairs} • segments ${rayCross.crossSegments}\n` +
         `rear intrusion ${Number.isFinite(intrusion) ? intrusion.toFixed(2) : "—"}mm • overlap ${Number(phys?.worstOverlap || 0).toFixed(3)}mm • pinch ${Number(phys?.worstPinch || 0).toFixed(3)}mm\n` +
+        `hard reasons ${(Array.isArray(cockpitLive?.feasible?.hardReasons) ? cockpitLive.feasible.hardReasons.join(", ") : "—") || "—"}\n` +
+        `mechanical warnings ${(Array.isArray(cockpitLive?.feasible?.mechanicalWarnings) ? cockpitLive.feasible.mechanicalWarnings.join(", ") : "—") || "—"}\n` +
+        `heuristic warnings ${(Array.isArray(cockpitLive?.feasible?.heuristicWarnings) ? cockpitLive.feasible.heuristicWarnings.join(", ") : "—") || "—"}\n` +
+        `hard details ${hardDetailTxt}\n` +
         `throughput ${(centerTp.goodFrac * 100).toFixed(1)}% • t-loss ${Number.isFinite(tLoss) ? `+${tLoss.toFixed(2)}st` : "—"}\n` +
         `dist chief ${chiefDistBadgeTopText}\n` +
         `dist lut ${distBadgeText}\n` +
@@ -4970,20 +5062,26 @@
     const reqFieldDeg = (Number.isFinite(efl) && efl > 1e-9)
       ? (Math.atan((0.5 * Math.hypot(sensorW, sensorH)) / efl) * 180 / Math.PI)
       : Number.NaN;
-    const cockpitReasons = [];
+    const cockpitHardReasons = [];
+    const cockpitMechanicalWarnings = [];
+    const cockpitHeuristicWarnings = [];
     const stopInMount = isStopInsidePlMount(lens.surfaces, Number(COCKPIT_CFG.stopInMountMarginMm || 0));
     const bflShortMm = effectiveBflShortMm(bfl, intrusion);
-    if (phys.hardFail) cockpitReasons.push("physics");
-    if (rayCross.invalid) cockpitReasons.push("xover");
-    if (!!COCKPIT_CFG.stopMustStayOutOfPlMount && stopInMount) cockpitReasons.push("stop_pl");
-    if (!COCKPIT_CFG.allowGlassInPlMount && !(intrusion <= Number(COCKPIT_CFG.plIntrusionRejectMm || 0.5))) cockpitReasons.push("pl");
-    if (!(bflShortMm <= Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0))) cockpitReasons.push("bfl");
-    if (!Number.isFinite(T) || T <= 0) cockpitReasons.push("t");
-    if (!Number.isFinite(efl) || efl <= 0) cockpitReasons.push("efl");
+    if (phys.hardFail) cockpitHardReasons.push("physics");
+    if (rayCross.invalid) cockpitHardReasons.push("xover");
+    if (!!COCKPIT_CFG.stopMustStayOutOfPlMount && stopInMount) cockpitHardReasons.push("stop_pl");
+    if (!(intrusion <= Number(COCKPIT_CFG.plIntrusionRejectMm || 0.5))) cockpitMechanicalWarnings.push("pl");
+    if (!(bflShortMm <= Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0))) cockpitHeuristicWarnings.push("bfl");
+    if (!Number.isFinite(T) || T <= 0) cockpitHardReasons.push("t");
+    if (!Number.isFinite(efl) || efl <= 0) cockpitHardReasons.push("efl");
+    const cockpitReasons = [...cockpitHardReasons, ...cockpitMechanicalWarnings, ...cockpitHeuristicWarnings];
     const cockpitLive = {
       feasible: {
-        ok: cockpitReasons.length === 0,
+        ok: cockpitHardReasons.length === 0,
         reasons: cockpitReasons,
+        hardReasons: cockpitHardReasons,
+        mechanicalWarnings: cockpitMechanicalWarnings,
+        heuristicWarnings: cockpitHeuristicWarnings,
         plIntrusionMm: intrusion,
         overlapOk: !phys.hardFail && Number(phys.worstOverlap || 0) <= 1e-4,
         thicknessOk: !phys.hardFail && Number(phys.worstPinch || 0) <= 1e-4,
@@ -6920,9 +7018,7 @@
       COCKPIT_CFG.minIterations,
       COCKPIT_CFG.maxIterations
     );
-    const strictness = String(ui.cockpitStrictness?.value || "normal").toLowerCase() === "strict"
-      ? "strict"
-      : "normal";
+    const strictness = normalizeConstraintMode(ui.cockpitStrictness?.value || "geometry_mechanics");
     const surfaceMode = String(ui.cockpitSurfaceMode?.value || "auto").toLowerCase() === "manual"
       ? "manual"
       : "auto";
@@ -7114,7 +7210,9 @@
     const se = Number(metricsObj?.sharpness?.rmsEdge);
     const feasOk = !!metricsObj?.feasible?.ok;
     const intr = Number(metricsObj?.feasible?.plIntrusionMm);
-    const reasons = Array.isArray(metricsObj?.feasible?.reasons) ? metricsObj.feasible.reasons : [];
+    const hardReasons = Array.isArray(metricsObj?.feasible?.hardReasons) ? metricsObj.feasible.hardReasons : [];
+    const mechWarnings = Array.isArray(metricsObj?.feasible?.mechanicalWarnings) ? metricsObj.feasible.mechanicalWarnings : [];
+    const heurWarnings = Array.isArray(metricsObj?.feasible?.heuristicWarnings) ? metricsObj.feasible.heuristicWarnings : [];
 
     if (ui.cockpitValEfl) ui.cockpitValEfl.textContent = Number.isFinite(efl) ? `${efl.toFixed(2)} mm` : "—";
     if (ui.cockpitValBfl) ui.cockpitValBfl.textContent = Number.isFinite(bfl) ? `${bfl.toFixed(2)} mm` : "—";
@@ -7131,8 +7229,8 @@
     }
     if (ui.cockpitValFeas) {
       ui.cockpitValFeas.textContent = feasOk
-        ? `YES • intr ${Number.isFinite(intr) ? intr.toFixed(2) : "—"}mm`
-        : `NO • intr ${Number.isFinite(intr) ? intr.toFixed(2) : "—"}mm${reasons.length ? ` • ${reasons.join(",")}` : ""}`;
+        ? `YES • hard ok${mechWarnings.length || heurWarnings.length ? ` • warn ${[...mechWarnings, ...heurWarnings].join(",")}` : ""}`
+        : `NO • hard ${hardReasons.length ? hardReasons.join(",") : "—"} • intr ${Number.isFinite(intr) ? intr.toFixed(2) : "—"}mm`;
     }
 
     if (!base) {
@@ -7541,25 +7639,10 @@
         const minGap = minGapBetweenSurfaces(sA, sB, apShared, 11);
         if (!Number.isFinite(minGap)) continue;
 
-        // If pair geometry is overfilled, cap both clear apertures to a safe non-overlap value.
-        const safeNoOverlap = maxNonOverlappingSemiDiameter(
-          sA,
-          sB,
-          required + (mediumAfterA === "AIR" ? 0.02 : 0.05)
-        );
-        if (Number.isFinite(safeNoOverlap) && safeNoOverlap > PHYS_CFG.minAperture) {
-          const cap = clamp(safeNoOverlap * 0.98, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
-          if (Number(sA?.ap || 0) > cap + 1e-6) {
-            sA.ap = cap;
-            changed = true;
-          }
-          if (Number(sB?.ap || 0) > cap + 1e-6) {
-            sB.ap = cap;
-            changed = true;
-          }
-        }
-
-        // If still too tight, add small axial clearance.
+        // Repair priority:
+        // 1) try tiny axial spacing repair,
+        // 2) then mild radius relaxation,
+        // 3) only then cap aperture (and only for real overlap risk in glass pairs).
         if (minGap < required - 0.01) {
           const add = clamp((required + 0.04) - minGap, 0.01, 0.35);
           const minT = mediumAfterA === "AIR"
@@ -7570,6 +7653,45 @@
           if (t1 > t0 + 1e-6) {
             sA.t = t1;
             changed = true;
+          }
+        }
+
+        // Mild curvature relaxation around offending pair (keeps aperture intact when possible).
+        if (minGap < required - 0.02) {
+          for (const s of [sA, sB]) {
+            const tt = String(s?.type || "").toUpperCase();
+            if (tt === "OBJ" || tt === "IMS" || tt === "STOP") continue;
+            const R0 = Number(s?.R || 0);
+            if (!Number.isFinite(R0) || Math.abs(R0) < 1e-6) continue;
+            const sign = Math.sign(R0) || 1;
+            const absR = Math.max(PHYS_CFG.minRadius, Math.abs(R0));
+            const grow = 1.0 + (mediumAfterA === "AIR" ? 0.020 : 0.030);
+            const R1 = sign * clamp(absR * grow, PHYS_CFG.minRadius, 1200);
+            if (Math.abs(R1 - R0) > 1e-9) {
+              s.R = R1;
+              changed = true;
+            }
+          }
+        }
+
+        // Last resort aperture cap: only for true glass-pair overlap risk.
+        const safeNoOverlap = maxNonOverlappingSemiDiameter(
+          sA,
+          sB,
+          required + (mediumAfterA === "AIR" ? 0.02 : 0.05)
+        );
+        if (mediumAfterA !== "AIR" && Number.isFinite(safeNoOverlap) && safeNoOverlap > PHYS_CFG.minAperture) {
+          const cap = clamp(safeNoOverlap * 0.985, PHYS_CFG.minAperture, PHYS_CFG.maxAperture);
+          const needCap = Number(sA?.ap || 0) > cap + 1e-6 || Number(sB?.ap || 0) > cap + 1e-6;
+          if (needCap && minGap < required - 0.005) {
+            if (Number(sA?.ap || 0) > cap + 1e-6) {
+              sA.ap = cap;
+              changed = true;
+            }
+            if (Number(sB?.ap || 0) > cap + 1e-6) {
+              sB.ap = cap;
+              changed = true;
+            }
           }
         }
       }
@@ -7817,7 +7939,7 @@
     if (!(Number.isFinite(curEfl) && curEfl > 1e-6 && Number.isFinite(targetEfl) && targetEfl > 1e-6)) {
       return { ok: false, reason: "efl" };
     }
-    const strict = String(ctx?.settings?.strictness || "normal").toLowerCase() === "strict";
+    const strict = isStrictConstraintMode(ctx?.settings?.strictness || "geometry_mechanics");
     const stepUi = clamp(Number(ctx?.settings?.stepSize || COCKPIT_CFG.defaultStepSize), 0.01, 0.20);
     const kGoal = targetEfl / curEfl;
     const errRelSigned = (targetEfl - curEfl) / Math.max(1e-9, curEfl);
@@ -7945,7 +8067,7 @@
     const stopIdx = findStopSurfaceIndex(surfaces);
     if (stopIdx < 0) return { ok: false, reason: "stop" };
     const step = clamp(Number(ctx?.settings?.stepSize || COCKPIT_CFG.defaultStepSize), 0.01, 0.20);
-    const strict = String(ctx?.settings?.strictness || "normal").toLowerCase() === "strict";
+    const strict = isStrictConstraintMode(ctx?.settings?.strictness || "geometry_mechanics");
     const curT = Number(ctx?.currentMetrics?.T);
     const tgtT = Number(ctx?.targets?.targetT);
     if (Number.isFinite(curT) && Number.isFinite(tgtT) && curT <= tgtT + 0.01) {
@@ -8285,13 +8407,13 @@
       return { applied: false, reason: "no_gain", before, after };
     }
 
-    const eflTol = settings?.strictness === "strict"
+    const eflTol = isStrictConstraintMode(settings?.strictness)
       ? COCKPIT_CFG.maxEflDriftStrictMm
       : COCKPIT_CFG.maxEflDriftNormalMm;
-    const tTol = settings?.strictness === "strict"
+    const tTol = isStrictConstraintMode(settings?.strictness)
       ? COCKPIT_CFG.maxTDriftStrict
       : COCKPIT_CFG.maxTDriftNormal;
-    const distTol = settings?.strictness === "strict"
+    const distTol = isStrictConstraintMode(settings?.strictness)
       ? COCKPIT_CFG.maxDistWorsenStrictPct
       : COCKPIT_CFG.maxDistWorsenNormalPct;
     const eflDrift = Math.abs(Number(after?.efl || 0) - Number(before?.efl || 0));
@@ -8901,8 +9023,8 @@
   function localOptRejectReason(mode, candMetrics, baseMetrics) {
     const c = candMetrics?.feasible || {};
     const b = baseMetrics?.feasible || {};
-    const cReasons = Array.isArray(c?.reasons) ? c.reasons.map((r) => String(r || "").toLowerCase()) : [];
-    const bReasons = Array.isArray(b?.reasons) ? b.reasons.map((r) => String(r || "").toLowerCase()) : [];
+    const cReasons = Array.isArray(c?.hardReasons) ? c.hardReasons.map((r) => String(r || "").toLowerCase()) : [];
+    const bReasons = Array.isArray(b?.hardReasons) ? b.hardReasons.map((r) => String(r || "").toLowerCase()) : [];
     const bSet = new Set(bReasons);
     const baselineInvalid = bReasons.length > 0;
 
@@ -9122,7 +9244,7 @@
     const tBase = [0.02, 0.05, 0.10, 0.20];
     if (level !== "micro") tBase.push(level === "macro" ? 0.50 : 0.35);
     const apBase = [0.02, 0.05, 0.10];
-    const strict = String(settings?.strictness || "normal").toLowerCase() === "strict";
+    const strict = isStrictConstraintMode(settings?.strictness || "geometry_mechanics");
     const guardBase = strict ? 0.80 : 1.00;
     const meritStepBoost = modeKey === "merit" ? 1.25 : 1.0;
     return {
@@ -9414,7 +9536,7 @@
     const sharpWorse = Math.max(0, candSharp - curSharp);
     const baselineInvalid = !!(baselineMetrics?.feasible && baselineMetrics.feasible.ok === false);
 
-    const isStrict = String(strictness).toLowerCase() === "strict";
+    const isStrict = isStrictConstraintMode(strictness);
     const meritGuardMul = modeKey === "merit"
       ? ((profile?.level === "macro" ? 4.6 : (profile?.level === "local" ? 3.2 : 2.2)) * (baselineInvalid ? 1.9 : 1.0))
       : 1.0;
@@ -9871,8 +9993,8 @@
         autofocusOptions: SHARP_OPT_CFG.autofocus,
         useCache: false,
       });
-      const baseReasons0 = Array.isArray(baseMetrics?.feasible?.reasons)
-        ? baseMetrics.feasible.reasons.map((r) => String(r || "").toLowerCase())
+      const baseReasons0 = Array.isArray(baseMetrics?.feasible?.hardReasons)
+        ? baseMetrics.feasible.hardReasons.map((r) => String(r || "").toLowerCase())
         : [];
       if (baseReasons0.length) {
         const repaired = sanitizeLens(clone(baseLens));
@@ -11638,6 +11760,8 @@
   }
 
   function buildOptPriority(evalRes, { targetEfl, targetIC, targetT }) {
+    const constraintMode = normalizeConstraintMode(ui.cockpitStrictness?.value || "geometry_mechanics");
+    const strictFull = constraintMode === "strict_full";
     const efl = Number(evalRes?.efl);
     const T = Number(evalRes?.T);
     const bfl = Number(evalRes?.bfl);
@@ -11687,7 +11811,7 @@
     const realismProfileLabel = String(evalRes?.realismProfileLabel ?? evalRes?.breakdown?.realismProfileLabel ?? "");
     const realismLargeSensor = !!(evalRes?.realismLargeSensor ?? evalRes?.breakdown?.realismLargeSensor);
     const afOk = evalRes?.afOk !== false;
-    const hardInvalid = !!evalRes?.hardInvalid || crossPairs > 0 || realismHardInvalid || !afOk;
+    const hardInvalid = !!evalRes?.hardInvalid || crossPairs > 0 || !afOk;
     const intrusionMm = Math.max(0, Number(evalRes?.intrusion || 0));
     const stopInMount = !!evalRes?.stopInMount;
     const overlapMm = Math.max(0, Number(evalRes?.worstOverlap || 0));
@@ -11695,9 +11819,9 @@
     const physPenalty = Math.max(0, Number(evalRes?.physPenalty || 0));
     const bflShortMm = effectiveBflShortMm(bfl, intrusionMm);
     const bflHardShortMm = Math.max(0.1, Number(OPT_STAGE_CFG.bflHardShortMm || 0.8));
-    const bflHardFail = bflShortMm > bflHardShortMm;
+    const bflHardFail = strictFull ? (bflShortMm > bflHardShortMm) : false;
     const bflBad = bflShortMm > 0.5;
-    const intrusionHardFail = (!COCKPIT_CFG.allowGlassInPlMount) && intrusionMm > 1e-3;
+    const intrusionHardFail = strictFull && (!COCKPIT_CFG.allowGlassInPlMount) && intrusionMm > 1e-3;
     const feasible = !hardInvalid && !bflHardFail && !stopInMount && !intrusionHardFail && overlapMm <= 1e-3 && crossPairs <= 0;
     const feasibilityDebt =
       (hardInvalid ? 5000 : 0) +
@@ -11711,7 +11835,7 @@
       crossPairs * 1800 +
       crossSegments * 500 +
       physPenalty * 0.02 +
-      (realismHardInvalid ? (1200 + realismHardOverMm * 1800) : 0) +
+      (strictFull && realismHardInvalid ? (1200 + realismHardOverMm * 1800) : 0) +
       realismPenalty * 0.015;
 
     const eflErrRel = Number.isFinite(efl) && targetEfl > 1e-9
@@ -12316,6 +12440,9 @@
         feasible: {
           ok: false,
           reasons: ["lens"],
+          hardReasons: ["lens"],
+          mechanicalWarnings: [],
+          heuristicWarnings: [],
           plIntrusionMm: Infinity,
           overlapOk: false,
           thicknessOk: false,
@@ -12528,19 +12655,28 @@
       };
     }
 
-    const reasons = [];
-    if (stopIdx < 0) reasons.push("stop");
-    if (!!COCKPIT_CFG.stopMustStayOutOfPlMount && stopInMount) reasons.push("stop_pl");
-    if (!!phys?.hardFail) reasons.push("physics");
-    if (cross?.invalid) reasons.push("xover");
-    if (!COCKPIT_CFG.allowGlassInPlMount && !(plIntrusionMm <= Number(COCKPIT_CFG.plIntrusionRejectMm || 0.5))) reasons.push("pl");
-    if (!(validCenterFrac >= Number(COCKPIT_CFG.hardMinValidCenterFrac || 0.28))) reasons.push("vignette");
-    if (!(bflShortMm <= Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0))) reasons.push("bfl");
+    const hardReasons = [];
+    const mechanicalWarnings = [];
+    const heuristicWarnings = [];
+
+    if (stopIdx < 0) hardReasons.push("stop");
+    if (!!COCKPIT_CFG.stopMustStayOutOfPlMount && stopInMount) hardReasons.push("stop_pl");
+    if (!!phys?.hardFail) hardReasons.push("physics");
+    if (cross?.invalid) hardReasons.push("xover");
+
+    if (!(plIntrusionMm <= Number(COCKPIT_CFG.plIntrusionRejectMm || 0.5))) mechanicalWarnings.push("pl");
+    if (!(validCenterFrac >= Number(COCKPIT_CFG.hardMinValidCenterFrac || 0.28))) heuristicWarnings.push("valid");
+    if (!(bflShortMm <= Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0))) heuristicWarnings.push("bfl");
+
+    const reasons = [...hardReasons, ...mechanicalWarnings, ...heuristicWarnings];
 
     const result = {
       feasible: {
-        ok: reasons.length === 0,
+        ok: hardReasons.length === 0,
         reasons,
+        hardReasons,
+        mechanicalWarnings,
+        heuristicWarnings,
         plIntrusionMm,
         overlapOk: Number(phys?.worstOverlap || 0) <= 1e-4,
         thicknessOk: Number(phys?.worstPinch || 0) <= 1e-4 && !phys?.hardFail,
@@ -12585,11 +12721,9 @@
   }
 
   function failsHardConstraints(surfaces, metrics, opts = {}) {
-    const strict = String(opts?.strictness || "normal").toLowerCase() === "strict";
-    const plLimit = strict ? 0.10 : Number(COCKPIT_CFG.plIntrusionRejectMm || 0.50);
-    const minValid = strict ? 0.35 : Number(COCKPIT_CFG.hardMinValidCenterFrac || 0.28);
-    const bflLimit = strict ? 0.45 : Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0);
+    const mode = normalizeConstraintMode(opts?.strictness || "geometry_mechanics");
     const reasons = [];
+    const warnings = [];
 
     if (!Array.isArray(surfaces) || surfaces.length < 3) reasons.push("lens");
     if (!metrics || typeof metrics !== "object") reasons.push("metrics");
@@ -12598,14 +12732,32 @@
     if (!metrics?.feasible?.stopOk) reasons.push("stop");
     if (!!COCKPIT_CFG.stopMustStayOutOfPlMount && !!metrics?.feasible?.stopInMount) reasons.push("stop_pl");
     if (metrics?.feasible?.hardPhysics) reasons.push("physics");
-    if (!COCKPIT_CFG.allowGlassInPlMount && !(Number(metrics?.feasible?.plIntrusionMm) <= plLimit)) reasons.push("pl");
-    if (!(Number(metrics?.feasible?.validCenterFrac) >= minValid)) reasons.push("valid");
-    if (!(Number(metrics?.feasible?.bflShortMm) <= bflLimit)) reasons.push("bfl");
     if (Number(metrics?.feasible?.crossPairs || 0) > 0) reasons.push("xover");
+
+    const plIntr = Number(metrics?.feasible?.plIntrusionMm);
+    const validFrac = Number(metrics?.feasible?.validCenterFrac);
+    const bflShort = Number(metrics?.feasible?.bflShortMm);
+    const plSoftLimit = Number(COCKPIT_CFG.plIntrusionRejectMm || 0.50);
+    const validSoftMin = Number(COCKPIT_CFG.hardMinValidCenterFrac || 0.28);
+    const bflSoftLimit = Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0);
+
+    if (!(plIntr <= plSoftLimit)) warnings.push("pl");
+    if (!(validFrac >= validSoftMin)) warnings.push("valid");
+    if (!(bflShort <= bflSoftLimit)) warnings.push("bfl");
+
+    // New modes:
+    // - hard_geometry: only true geometry impossibilities are hard.
+    // - geometry_mechanics: geometry hard + mechanics as warnings.
+    // - strict_full: legacy strict behavior; warnings become hard too.
+    if (mode === "strict_full") {
+      reasons.push(...warnings);
+    }
 
     return {
       fail: reasons.length > 0,
       reasons,
+      warnings,
+      mode,
     };
   }
 
@@ -14795,11 +14947,13 @@
     if (ov > 1e-4 || pinch > 1e-4) reasons.push(`overlap/pinch (${ov.toFixed(2)} / ${pinch.toFixed(2)}mm)`);
 
     const bflShort = effectiveBflShortMm(Number(ev?.bfl), Number(ev?.intrusion || 0));
+    const softWarnings = [];
     if (!(bflShort <= Number(COCKPIT_CFG.maxBflShortRejectMm || 1.0))) {
-      reasons.push(`BFL tekort ${bflShort.toFixed(2)}mm`);
+      softWarnings.push(`BFL tekort ${bflShort.toFixed(2)}mm`);
     }
-
-    if (!!ev?.realismHardInvalid) reasons.push("OD/envelope boven hard limit");
+    if (!!ev?.realismHardInvalid) {
+      softWarnings.push("OD/envelope boven hard limit");
+    }
     if (!Number.isFinite(Number(ev?.efl)) || Number(ev?.efl) <= 0) reasons.push("focale lengte ongeldig");
     if (!Number.isFinite(Number(ev?.T)) || Number(ev?.T) <= 0) reasons.push("T-stop ongeldig");
 
@@ -14809,8 +14963,11 @@
     return {
       hasBest: true,
       canApply,
-      reasonText: canApply ? "fysiek geldig" : reasons.join(" • "),
+      reasonText: canApply
+        ? (`fysiek geldig${softWarnings.length ? ` • waarschuwing: ${softWarnings.join(" • ")}` : ""}`)
+        : reasons.join(" • "),
       reasons,
+      softWarnings,
     };
   }
 
